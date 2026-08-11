@@ -18,7 +18,7 @@
 | crate 结构 | 多 crate 拆分 | 边界清晰、可并行编译、可独立测试，客户端 SDK 可单独发布 |
 | 节点发现 | 静态配置 | 开发期 3 节点，节点数可配置 |
 | 数据分片 | multi-raft，按 `hash(stream_id)` 路由 | 单 stream 完整落在一个 Raft group，无需跨分片事务 |
-| 管理 API | 已实现（`RaftAdmin`：Initialize / AddLearner / ChangeMembership / GetRaftState） | 组建集群必须显式调用，见 7.3 |
+| 管理 API | 已实现（`RaftAdmin`：Initialize / AddLearner / ChangeMembership / GetRaftState） | 组建双路径（自动按 peers 配置 / 手动 RaftAdmin），见 7.3 |
 
 ## 2. 依赖验证证据
 
@@ -310,22 +310,36 @@ message RaftAppendEntriesRequest {
 > 注：早期 `proto/raft.proto` 中的 `RaftInternal`（同样载荷方案）已被上述
 > `RaftRpc` 取代且未注册到服务端，属废弃定义，待清理。
 
-### 7.3 集群管理 API
+### 7.3 集群组建与集群管理 API
 
 ```protobuf
 service RaftAdmin {
-  rpc Initialize(InitializeRequest) returns (InitializeResponse);          // 单成员自举
+  rpc Initialize(InitializeRequest) returns (InitializeResponse);          // 初始化集群
   rpc AddLearner(AddLearnerRequest) returns (AddLearnerResponse);          // 学习者追平数据
   rpc ChangeMembership(ChangeMembershipRequest) returns (ChangeMembershipResponse);
   rpc GetRaftState(GetRaftStateRequest) returns (GetRaftStateResponse);
 }
 ```
 
-节点启动后**不会自动组建集群**（自动自举在网络分区时可能形成双集群）。
-须通过 `RaftAdmin` 显式组建，且**每个分片各做一次**：
-先 `Initialize(shard_id, [self])` 单成员自举（立刻成为 leader），再 `AddLearner`
-加入其余节点，追平后 `ChangeMembership` 一次性提升为投票成员。
-不直接 `Initialize([1,2,3])`：三个空节点同时具备投票权会同时竞选，选票分散导致选举活锁。
+组建集群有两条路径，**每个分片各组建一次**（分片间不共享 membership 与 leader）：
+
+**自动组建（推荐，etcd 静态引导语义）**：`node.peers` 非空即触发（见 `es-server/src/bootstrap.rs`）。
+日志为空的节点按分片：随机延迟 0~2s（formation delay）→ 探测所有 peer 的
+`GetRaftState` 判定是否已有集群 → 无则用完整 peers 调用 `initialize` 一步到位，
+有则放弃自举等日志复制加入。并发 `initialize` 因同配置而日志内容一致，openraft
+日志仲裁收敛（官方明确"同配置并发 initialize 安全"）；多节点同时竞选靠
+600~900ms 随机化选举超时收敛（已在多进程测试实测）。已有日志的节点（重启）
+跳过组建，从本地日志恢复。组建不成功不阻塞服务，可经 RaftAdmin 手动接管。
+
+**手动组建（peers 为空时）**：先 `Initialize(shard_id, [self])` 单成员自举（立刻
+成为 leader），再 `AddLearner` 加入其余节点，追平后 `ChangeMembership` 一次性
+提升为投票成员。直接 `Initialize([1,2,3])` 同样收敛（随机化选举超时），单成员
+自举保证全程有 leader，便于排障。
+
+**双集群防护**：同一配置下并发 initialize 的 membership 日志内容一致，raft 仲裁
+收敛，不会形成双集群；不同配置的 split brain 运行时不可解——探测到已初始化
+peer 时对比其 voter_ids 与本节点配置，不一致即告警，且要求全节点配置完全一致
+（与 etcd 相同约束）。
 
 ### 7.4 订阅实现
 
@@ -344,7 +358,8 @@ broadcast 落后（`RecvError::Lagged`）时退回扫描存储补齐，不直接
 id = 1
 listen_addr = "127.0.0.1:50051"   # 三个 gRPC 服务共用一个端口
 
-# 集群节点列表（3 节点示例；见 7.3，实际以 Initialize/AddLearner 写入的地址为准）
+# 集群节点列表（3 节点示例；非空即触发启动时自动组建，见 7.3）
+# 必须包含本节点，且所有节点配置完全一致；addr 可省略 http:// 前缀
 [[node.peers]]
 id = 1
 addr = "127.0.0.1:50051"
@@ -360,8 +375,9 @@ num_shards = 8                    # 运行期不可变；变更需离线 reshard
 ```
 
 客户端、节点间、管理三类 gRPC 服务共用 `listen_addr` 单端口（`server.rs` 同一
-`Server` 注册三个 service）。`node.peers` 为保留配置，节点地址实际来自
-`Initialize` / `AddLearner` 写入 membership 的 `BasicNode.addr`。
+`Server` 注册三个 service）。`node.peers` 在启动时由 `bootstrap` 消费：地址
+normalize（补 `http://`）后随 `initialize` 写入 membership 的 `BasicNode.addr`，
+与网络层回连规则同源（`es_raft::normalize_endpoint`）。
 
 ## 9. 测试策略
 

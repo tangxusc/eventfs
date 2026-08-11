@@ -40,7 +40,7 @@ es-storage（RaftLogStorage + RaftStateMachine + reshard）
 surrealkv（单个 Tree，多分片按 key 前缀隔离）
 ```
 
-集群不自动自举：节点启动后须通过 `RaftAdmin` 显式组建（自动自举在网络分区时可能形成双集群），且**每个分片各做一次**。
+集群组建：`node.peers` 非空时启动后自动组建（etcd 静态引导语义：探测无现存集群的节点用完整成员 `initialize` 一步到位），**每个分片独立组建**；`peers` 为空保留手动 `RaftAdmin` 路径（见下文）。
 
 ## 快速开始
 
@@ -75,9 +75,33 @@ num_shards = 8
 
 `--node-id` 与 `--listen` 可覆盖配置文件对应项。
 
-### 组建集群（必需）
+### 组建集群
 
-启动进程不会自动组集群。需通过 `RaftAdmin` 显式组建，且**每个分片各做一次**（分片间不共享 membership 与 leader）：
+**方式 A：自动组建（推荐）**——配置 `[[node.peers]]` 后启动即可，无需任何额外操作：
+
+```toml
+# node1.toml（node2/node3 除 id、listen_addr、data_dir 外相同）
+[node]
+id = 1
+listen_addr = "127.0.0.1:50051"
+
+# 必须包含本节点，且所有节点配置完全一致（不一致可能形成双集群）
+[[node.peers]]
+id = 1
+addr = "127.0.0.1:50051"
+[[node.peers]]
+id = 2
+addr = "127.0.0.1:50052"
+[[node.peers]]
+id = 3
+addr = "127.0.0.1:50053"
+```
+
+每个节点启动后，日志为空的节点探测 peer 是否已有集群，无则用完整 peers 调用
+`initialize` 一步到位（与 etcd `--initial-cluster` 语义一致）；已有日志的节点
+（重启）自动跳过，从本地日志恢复。每个分片各组建一次（分片间不共享 membership 与 leader）。
+
+**方式 B：手动组建（peers 为空时）**——通过 `RaftAdmin` 显式组建，每个分片各做一次：
 
 ```
 对每个 shard_id in 0..num_shards：
@@ -87,10 +111,8 @@ num_shards = 8
   4. node1.ChangeMembership(shard_id, [1,2,3])                      一次性提升为 3 投票成员
 ```
 
-不直接 `Initialize([1,2,3])`：三个空节点同时具备投票权会同时竞选，
-选票分散导致选举活锁。先单成员自举可保证全程都有 leader。
-
-参考实现见 `es-server/tests/multi_node_test.rs` 的 `form_shard`。
+直接 `Initialize([1,2,3])` 也收敛（随机化选举超时，已实测），单成员自举可保证
+全程有 leader，便于排障。参考实现见 `es-server/tests/multi_node_test.rs` 的 `form_shard`。
 
 ### 客户端
 
@@ -120,11 +142,10 @@ println!("shard={} position={}", resp.shard_id, resp.first_position);
 ## 测试
 
 ```bash
-# 默认套件，85 项
+# 默认套件，90 项
 cargo test --workspace
 
-# 多节点测试：启动 3 个真实进程，需先编译二进制
-cargo build --bin eventstored
+# 多节点测试：11 项（6 手动组建 + 5 自动组建），测试框架自动构建并直接运行二进制
 cargo test -p es-server --test multi_node_test -- --ignored --test-threads=1
 ```
 
@@ -136,7 +157,7 @@ cargo test -p es-server --test multi_node_test -- --ignored --test-threads=1
 | `es-raft/partition_test` | 6 | 网络分区、快照追赶、慢节点（进程内可控网络层） |
 | `es-server/e2e_test` | 19 | 端到端读写、乐观并发、订阅、跨分片 ReadAll、反向读取 |
 | `es-server/server_test` | 1 | 服务器启动与分片初始化 |
-| `es-server/multi_node_test` | 6 | 3 节点真实进程集群（`--ignored` 启用） |
+| `es-server/multi_node_test` | 11 | 3 节点真实进程集群（6 项手动组建 + 5 项自动组建，`--ignored` 启用） |
 
 多节点测试标为 `#[ignore]`：每项要拉起 3 个进程，6 项约 21s，而默认 85 项只需约 7s。串行运行以免争抢端口。
 
@@ -197,8 +218,11 @@ cargo bench -p es-storage
   被隔离的 leader 在自己视角里仍是 leader。客户端必须设写超时。
 - **跨分片非严格全序**：`ReadAll` 按 HLC 归并，只保证分片内严格按 position。
   HLC 由各 leader 的墙上时钟推进，跨分片顺序是近似的。
-- **`node.peers` 配置项当前未被服务端读取**：节点地址实际来自
-  `Initialize` / `AddLearner` 写入 membership 的 `BasicNode.addr`。
+- **自动组建要求所有节点 `node.peers` 配置完全一致**：不一致可能形成双集群
+  （与 etcd 相同，运行时无法自动修复；探测到已初始化 peer 的 voter_ids 与配置
+  不符时节点会告警并放弃自举）。已有节点重启不参与组建，从本地日志恢复。
+- **极端窗口双故障**：节点在"收到选票但日志为空"的子秒级窗口内宕机，且其余
+  节点也宕机，可能卡在无日志有选票状态——清空该节点数据目录重建即可恢复。
 - **reshard 需停机，且尚无命令行工具**：只有 async 库函数，需自行封装调用。
   reshard 后客户端的 position 游标失效，需从头读或用别的方式续读。
 - **快照为全量、未压缩**：每次 `build_snapshot` 用 serde_json 序列化整个分片状态机，
