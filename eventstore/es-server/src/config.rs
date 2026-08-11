@@ -81,6 +81,22 @@ impl TlsConfig {
     }
 }
 
+impl Config {
+    /// 启动期校验。失败即 fail-fast。
+    ///
+    /// `num_shards = 0` 会让路由取模除零 panic（es-core::routing::route），
+    /// 必须在启动时拦截，而不是让分片一个都不建、留到请求时崩溃。
+    pub fn validate(&self) -> Result<(), String> {
+        if self.shards.num_shards == 0 {
+            return Err("[shards] num_shards 必须 ≥ 1".to_string());
+        }
+        if let Some(tls) = &self.tls {
+            tls.validate()?;
+        }
+        Ok(())
+    }
+}
+
 /// 节点配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
@@ -201,5 +217,25 @@ mod tests {
         };
         let err = tls.client_trust().expect_err("ca 读取失败应报错");
         assert!(err.contains("ca_file"), "错误应说明 ca_file: {err}");
+    }
+
+    #[test]
+    fn num_shards为0_validate拒绝() {
+        // 路由取模除零的启动期拦截（es-core::routing::route 对 0 会 panic）
+        let config = Config {
+            shards: ShardConfig { num_shards: 0 },
+            ..Default::default()
+        };
+        let err = config.validate().expect_err("num_shards=0 应报错");
+        assert!(err.contains("num_shards"), "错误应说明 num_shards: {err}");
+    }
+
+    #[test]
+    fn num_shards正常_validate通过() {
+        let config = Config {
+            shards: ShardConfig { num_shards: 8 },
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
     }
 }

@@ -17,10 +17,8 @@ pub struct Server {
 impl Server {
     /// 创建服务器实例
     pub fn new(config: Config) -> Result<Self> {
-        // TLS 配置启动期校验（fail-fast）：cert/key 成对、文件存在非空
-        if let Some(tls) = &config.tls {
-            tls.validate().map_err(anyhow::Error::msg)?;
-        }
+        // 配置启动期校验（fail-fast）：num_shards ≥ 1、TLS cert/key 成对且文件存在
+        config.validate().map_err(anyhow::Error::msg)?;
 
         let shard_manager = Arc::new(ShardManager::new(
             config.node.id,

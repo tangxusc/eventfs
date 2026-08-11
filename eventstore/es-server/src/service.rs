@@ -44,14 +44,28 @@ impl PartialOrd for MergeHead {
 /// - `streams`: 各分片的事件流(已按 position 排序,升序或降序由调用方保证)
 /// - `limit`: 最多返回多少条,0 表示不限量
 /// - `descending`: true 表示降序归并(反向读),false 表示升序归并(正向读)
-fn merge_by_hlc(streams: Vec<Vec<Event>>, limit: u64, descending: bool) -> Vec<Event> {
+///
+/// 返回 `(合并事件, 每路最后消费的 position)`：
+/// 归并可能因 `limit` 全局截断而把某些路已读到的缓冲尾部丢弃，
+/// 游标必须按「消费水位」推进（未消费的路为 None，下一页重读），
+/// 否则被丢弃的数据会永久丢失。
+fn merge_by_hlc(
+    streams: Vec<Vec<Event>>,
+    limit: u64,
+    descending: bool,
+) -> (Vec<Event>, Vec<Option<u64>>) {
+    let mut consumed: Vec<Option<u64>> = vec![None; streams.len()];
+
     // 单路无需归并，直接返回，保持 position 序
     if streams.len() == 1 {
         let mut only = streams.into_iter().next().unwrap_or_default();
         if limit != 0 && only.len() as u64 > limit {
             only.truncate(limit as usize);
         }
-        return only;
+        if let Some(last) = only.last() {
+            consumed[0] = Some(last.position);
+        }
+        return (only, consumed);
     }
 
     use std::cmp::Reverse;
@@ -82,6 +96,7 @@ fn merge_by_hlc(streams: Vec<Vec<Event>>, limit: u64, descending: bool) -> Vec<E
         while let Some(head) = heap.pop() {
             let idx = head.stream_idx;
             let pos = cursors[idx];
+            consumed[idx] = Some(streams[idx][pos].position);
             out.push(streams[idx][pos].clone());
             cursors[idx] += 1;
 
@@ -104,6 +119,7 @@ fn merge_by_hlc(streams: Vec<Vec<Event>>, limit: u64, descending: bool) -> Vec<E
         while let Some(Reverse(head)) = heap.pop() {
             let idx = head.stream_idx;
             let pos = cursors[idx];
+            consumed[idx] = Some(streams[idx][pos].position);
             out.push(streams[idx][pos].clone());
             cursors[idx] += 1;
 
@@ -116,7 +132,7 @@ fn merge_by_hlc(streams: Vec<Vec<Event>>, limit: u64, descending: bool) -> Vec<E
         }
     }
 
-    out
+    (out, consumed)
 }
 
 /// 把 Raft 写入错误映射为 gRPC 状态。
@@ -302,6 +318,7 @@ impl EventStore for EsService {
         tokio::spawn(async move {
             let resp = ReadEventsResponse {
                 events: proto_events,
+                next_positions: Vec::new(), // 单流读不填充，仅 ReadAll 使用
             };
             let _ = tx.send(Ok(resp)).await;
         });
@@ -344,22 +361,22 @@ impl EventStore for EsService {
         // 各取 max_count 条即可保证归并出的首 max_count 条正确。
         let per_shard_limit = req.max_count;
         let mut streams: Vec<Vec<Event>> = Vec::with_capacity(cursors.len());
-        for (shard_id, from) in cursors {
+        for (shard_id, from) in &cursors {
             let shard = self
                 .shard_manager
-                .get_shard(shard_id)
+                .get_shard(*shard_id)
                 .await
                 .map_err(|e| Status::not_found(format!("分片 {shard_id}: {e}")))?;
 
             let events = if desc {
                 shard
                     .storage
-                    .read_all_events_backward(from, per_shard_limit)
+                    .read_all_events_backward(*from, per_shard_limit)
                     .map_err(|e| Status::internal(format!("read_all_events_backward 失败: {e}")))?
             } else {
                 shard
                     .storage
-                    .read_all_events(from, per_shard_limit)
+                    .read_all_events(*from, per_shard_limit)
                     .map_err(|e| Status::internal(format!("read_all_events 失败: {e}")))?
             };
 
@@ -378,19 +395,40 @@ impl EventStore for EsService {
                             logical: e.hlc.logical,
                         }),
                         position: e.position,
-                        shard_id,
+                        shard_id: *shard_id,
                     })
                     .collect(),
             );
         }
 
-        let proto_events = merge_by_hlc(streams, req.max_count, desc);
+        let (proto_events, consumed) = merge_by_hlc(streams, req.max_count, desc);
+
+        // 每分片「下一页的续读起点」= 归并消费水位推进，而非读水位：
+        // 读到但被全局截断丢弃的缓冲尾部必须留在游标之后（下一页重读），
+        // 否则数据永久丢失。服务端驱动游标，客户端翻页原样透传。
+        // 正序 = 最后消费 position + 1；倒序 = 最后消费 position - 1
+        // （消费到 position=0 已到边界，不再续读）；未消费的路 = 起点不变。
+        let mut next_positions: Vec<ShardPosition> = Vec::with_capacity(cursors.len());
+        for ((shard_id, from), consumed_pos) in cursors.iter().zip(consumed.iter()) {
+            let next = match (desc, consumed_pos) {
+                (false, Some(p)) => Some((*shard_id, p.saturating_add(1))),
+                (true, Some(p)) => (*p > 0).then(|| (*shard_id, p.saturating_sub(1))),
+                (_, None) => Some((*shard_id, *from)), // 未消费：起点不变，下一页重读
+            };
+            if let Some((sid, pos)) = next {
+                next_positions.push(ShardPosition {
+                    shard_id: sid,
+                    from_position: pos,
+                });
+            }
+        }
 
         // 流式返回
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         tokio::spawn(async move {
             let resp = ReadEventsResponse {
                 events: proto_events,
+                next_positions,
             };
             let _ = tx.send(Ok(resp)).await;
         });
@@ -432,14 +470,14 @@ impl EventStore for EsService {
                 (Some(sid), shard.id(), from_version)
             }
             Target::All(_) => {
-                // 订阅 $all：当前简化实现只支持查询 shard 0
-                // TODO: 支持多分片订阅（需要在请求里指定 shard_id）
+                // 订阅 $all：按请求指定分片订阅（proto SubscribeRequest.shard_id，
+                // 默认 0）。一次订阅一个分片的 $all，多分片需各自发起订阅。
                 let from_position = if req.from_start {
                     0
                 } else {
                     req.from_exclusive + 1
                 };
-                (None, 0, from_position)
+                (None, req.shard_id, from_position)
             }
         };
 
@@ -596,5 +634,72 @@ impl EventStore for EsService {
                 current_version: 0,
             })),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 构造事件：hlc 相同（wall, logical）时按 shard_id 再按 position 定序
+    fn ev(shard: u64, pos: u64, wall: u64) -> Event {
+        Event {
+            stream_id: format!("s{shard}"),
+            version: pos,
+            event_id: Vec::new(),
+            event_type: "T".into(),
+            data: Vec::new(),
+            metadata: Vec::new(),
+            hlc: Some(Hlc { wall, logical: 0 }),
+            position: pos,
+            shard_id: shard,
+        }
+    }
+
+    /// 消费水位语义：全局截断丢弃的路不推进（None），否则下一页会丢数据
+    #[test]
+    fn 归并截断_未消费路的水位为none() {
+        // 分片 0 的 HLC 最早，limit=2 时两条全来自分片 0；分片 1 被丢弃
+        let streams = vec![
+            vec![ev(0, 1, 100), ev(0, 2, 200), ev(0, 3, 300)],
+            vec![ev(1, 1, 1000)],
+        ];
+        let (events, consumed) = merge_by_hlc(streams, 2, false);
+        assert_eq!(events.len(), 2);
+        assert_eq!(consumed, vec![Some(2), None], "分片 1 未消费应为 None");
+    }
+
+    /// 正序：消费水位 = 最后消费的 position，续读从 +1 开始
+    #[test]
+    fn 正序归并_消费水位推进() {
+        let streams = vec![
+            vec![ev(0, 1, 100), ev(0, 2, 300)],
+            vec![ev(1, 1, 200), ev(1, 2, 400)],
+        ];
+        // 顺序：100(0,1) → 200(1,1) → 300(0,2) → 400(1,2)
+        let (events, consumed) = merge_by_hlc(streams, 0, false);
+        assert_eq!(events.len(), 4);
+        assert_eq!(consumed, vec![Some(2), Some(2)]);
+    }
+
+    /// 倒序：消费水位 = 最后消费（最小）position，续读从 -1 开始
+    #[test]
+    fn 倒序归并_消费水位为最小position() {
+        let streams = vec![
+            vec![ev(0, 9, 100), ev(0, 8, 300), ev(0, 7, 500)],
+            vec![ev(1, 5, 200)],
+        ];
+        // 降序：500(0,7) → 300(0,8) → 200(1,5) → 100(0,9)
+        let (_, consumed) = merge_by_hlc(streams, 0, true);
+        assert_eq!(consumed, vec![Some(7), Some(5)], "倒序水位 = 各路最后输出的最小 position");
+    }
+
+    /// 单路：截断后水位 = 最后输出的 position
+    #[test]
+    fn 单路归并_截断后水位正确() {
+        let streams = vec![vec![ev(0, 1, 1), ev(0, 2, 1), ev(0, 3, 1)]];
+        let (events, consumed) = merge_by_hlc(streams, 2, false);
+        assert_eq!(events.len(), 2);
+        assert_eq!(consumed, vec![Some(2)]);
     }
 }

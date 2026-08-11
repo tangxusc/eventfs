@@ -864,6 +864,7 @@ async fn subscribe_先补齐历史再实时推送() {
             target: Some(subscribe_request::Target::StreamId("sub".to_string())),
             from_exclusive: 0,
             from_start: true,
+            shard_id: 0,
         })
         .await
         .expect("subscribe")
@@ -907,6 +908,7 @@ async fn subscribe_可从中间版本开始() {
             target: Some(subscribe_request::Target::StreamId("submid".to_string())),
             from_exclusive: 2,
             from_start: false,
+            shard_id: 0,
         })
         .await
         .expect("subscribe")
@@ -943,6 +945,7 @@ async fn subscribe_只推送本流事件() {
             target: Some(subscribe_request::Target::StreamId("filter-a".to_string())),
             from_exclusive: 0,
             from_start: true,
+            shard_id: 0,
         })
         .await
         .expect("subscribe")
@@ -995,6 +998,7 @@ async fn subscribe_all订阅分片内全部流() {
             target: Some(subscribe_request::Target::All(Empty {})),
             from_exclusive: 0,
             from_start: true,
+            shard_id: 0,
         })
         .await
         .expect("subscribe")

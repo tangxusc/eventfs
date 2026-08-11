@@ -309,6 +309,7 @@ impl TestCluster {
                 shard_id,
                 voter_ids: vec![1, 2, 3],
                 retain: false,
+                expected_voters: Vec::new(), // 测试直连：不做 CAS 校验
             })
             .await
             .unwrap_or_else(|e| panic!("分片 {shard_id} change_membership 失败: {e}"));
