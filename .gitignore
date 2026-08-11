@@ -3,3 +3,6 @@
 
 # 本地配置（含密钥/地址等敏感信息，提交前必须复制为 config.example.toml）
 /config.toml
+
+# 服务端默认数据目录（config 未指定 data_dir 时的回退位置）
+/data
