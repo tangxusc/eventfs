@@ -14,3 +14,4 @@ pub use shard::Shard;
 
 // 重导出常用类型
 pub use es_storage::TypeConfig;
+pub use es_proto::tls::TlsClientConfig;

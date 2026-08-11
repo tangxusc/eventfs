@@ -14,6 +14,71 @@ pub struct Config {
 
     /// 分片配置
     pub shards: ShardConfig,
+
+    /// TLS 配置（可选）。配置即启用 TLS 监听（cert_file+key_file 成对）；
+    /// 节点间 RPC 与客户端 API 对 https:// 地址应用信任策略：
+    /// ca_file 配置时严格校验，否则默认跳过校验（自签友好）。
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+}
+
+/// TLS 配置
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TlsConfig {
+    /// 服务端证书（PEM）
+    pub cert_file: Option<PathBuf>,
+
+    /// 服务端私钥（PEM）
+    pub key_file: Option<PathBuf>,
+
+    /// 客户端信任的 CA（PEM，可含多张证书）；缺省 = 跳过对端证书校验
+    pub ca_file: Option<PathBuf>,
+}
+
+impl TlsConfig {
+    /// 启动期校验：cert/key 必须成对、三个文件存在且非空。失败即 fail-fast。
+    pub fn validate(&self) -> Result<(), String> {
+        let missing: Vec<&str> = [("cert_file", &self.cert_file), ("key_file", &self.key_file)]
+            .into_iter()
+            .filter(|(_, f)| f.is_none())
+            .map(|(name, _)| name)
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!("[tls] cert_file/key_file 必须成对配置，缺少: {missing:?}"));
+        }
+        for (name, path) in [
+            ("cert_file", self.cert_file.as_ref().unwrap()),
+            ("key_file", self.key_file.as_ref().unwrap()),
+        ] {
+            let bytes = std::fs::read(path)
+                .map_err(|e| format!("[tls] {name} 读取失败（{:?}）: {e}", path))?;
+            if bytes.is_empty() {
+                return Err(format!("[tls] {name} 为空文件（{:?}）", path));
+            }
+        }
+        if let Some(ca) = &self.ca_file {
+            let bytes = std::fs::read(ca)
+                .map_err(|e| format!("[tls] ca_file 读取失败（{:?}）: {e}", ca))?;
+            if bytes.is_empty() {
+                return Err(format!("[tls] ca_file 为空文件（{:?}）", ca));
+            }
+        }
+        Ok(())
+    }
+
+    /// 客户端信任策略：ca_file → 严格校验该 CA；否则跳过校验。
+    ///
+    /// ca_file 读取失败必须返回 Err——绝不静默降级为跳过校验。
+    pub fn client_trust(&self) -> Result<es_proto::tls::TlsClientConfig, String> {
+        match &self.ca_file {
+            Some(ca) => {
+                let pem = std::fs::read(ca)
+                    .map_err(|e| format!("[tls] ca_file 读取失败（{:?}）: {e}", ca))?;
+                Ok(es_proto::tls::TlsClientConfig::Ca(pem))
+            }
+            None => Ok(es_proto::tls::TlsClientConfig::SkipVerify),
+        }
+    }
 }
 
 /// 节点配置
@@ -68,6 +133,73 @@ impl Default for Config {
                 data_dir: PathBuf::from("./data"),
             },
             shards: ShardConfig { num_shards: 8 },
+            tls: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tls_cert_key_必须成对() {
+        let tls = TlsConfig {
+            cert_file: None,
+            key_file: None,
+            ca_file: None,
+        };
+        let err = tls.validate().expect_err("缺 cert/key 应报错");
+        assert!(err.contains("cert_file"), "错误应说明缺少的字段: {err}");
+    }
+
+    #[test]
+    fn tls_文件缺失_报错() {
+        let tls = TlsConfig {
+            cert_file: Some(PathBuf::from("/nonexistent/cert.pem")),
+            key_file: Some(PathBuf::from("/nonexistent/key.pem")),
+            ca_file: None,
+        };
+        assert!(tls.validate().is_err(), "文件不存在应报错");
+    }
+
+    #[test]
+    fn tls_client_trust_两分支() {
+        // 无 ca_file → 跳过校验
+        let tls = TlsConfig {
+            cert_file: None,
+            key_file: None,
+            ca_file: None,
+        };
+        assert!(matches!(
+            tls.client_trust(),
+            Ok(es_proto::tls::TlsClientConfig::SkipVerify)
+        ));
+
+        // ca_file 存在 → 严格校验（PEM 内容透传）
+        // 注意：TempDir 必须持有到断言完成，否则文件被删
+        let dir = tempfile::tempdir().expect("临时目录");
+        let ca_path = dir.path().join("ca.pem");
+        std::fs::write(&ca_path, b"ca-pem").expect("写 CA");
+        let tls = TlsConfig {
+            cert_file: None,
+            key_file: None,
+            ca_file: Some(ca_path),
+        };
+        assert!(matches!(
+            tls.client_trust(),
+            Ok(es_proto::tls::TlsClientConfig::Ca(ref pem)) if pem == b"ca-pem"
+        ));
+    }
+
+    #[test]
+    fn tls_ca文件读取失败_报错不降级() {
+        let tls = TlsConfig {
+            cert_file: None,
+            key_file: None,
+            ca_file: Some(PathBuf::from("/nonexistent/ca.pem")),
+        };
+        let err = tls.client_trust().expect_err("ca 读取失败应报错");
+        assert!(err.contains("ca_file"), "错误应说明 ca_file: {err}");
     }
 }

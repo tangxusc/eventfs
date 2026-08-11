@@ -25,6 +25,7 @@ async fn 服务器能启动并初始化raft节点() {
             data_dir: dir.path().to_path_buf(),
         },
         shards: ShardConfig { num_shards: 2 },
+        tls: None,
     };
 
     let server = Server::new(config).expect("创建服务器");

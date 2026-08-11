@@ -9,6 +9,7 @@ use openraft::raft::{
 use openraft::BasicNode;
 
 use es_proto::eventstore::raft_rpc_client::RaftRpcClient;
+use es_proto::tls::{apply_endpoint_tls, TlsClientConfig};
 use es_storage::TypeConfig;
 
 /// 某分片的网络工厂。
@@ -19,11 +20,15 @@ use es_storage::TypeConfig;
 #[derive(Clone)]
 pub struct GrpcNetwork {
     shard_id: u64,
+    /// 出站 Raft RPC 的客户端信任策略：目标地址为 https:// 时生效
+    /// （缺省跳过校验，自签友好）；http 集群传 None。
+    tls: Option<TlsClientConfig>,
 }
 
 impl GrpcNetwork {
-    pub fn new(shard_id: u64) -> Self {
-        Self { shard_id }
+    /// tls：节点间 Raft RPC 的 TLS 信任策略；明文集群传 None。
+    pub fn new(shard_id: u64, tls: Option<TlsClientConfig>) -> Self {
+        Self { shard_id, tls }
     }
 
     pub fn shard_id(&self) -> u64 {
@@ -37,7 +42,7 @@ impl RaftNetworkFactory<TypeConfig> for GrpcNetwork {
     async fn new_client(&mut self, target: u64, node: &BasicNode) -> Self::Network {
         // 地址取自 openraft 保存的 BasicNode.addr —— 它随 add_learner/initialize
         // 写入 membership 日志并复制到各节点，因此无需另建 node_id → addr 映射表。
-        GrpcConnection::new(self.shard_id, target, node.addr.clone())
+        GrpcConnection::new(self.shard_id, target, node.addr.clone(), self.tls.clone())
     }
 }
 
@@ -58,6 +63,8 @@ pub struct GrpcConnection {
     shard_id: u64,
     target: u64,
     addr: String,
+    /// 出站 TLS 信任策略（https 目标时生效）
+    tls: Option<TlsClientConfig>,
     /// 惰性建立的 gRPC 通道。
     ///
     /// 用 `connect_lazy` 而非 `connect`：后者在对端未就绪时直接失败，
@@ -67,11 +74,12 @@ pub struct GrpcConnection {
 }
 
 impl GrpcConnection {
-    fn new(shard_id: u64, target: u64, addr: String) -> Self {
+    fn new(shard_id: u64, target: u64, addr: String, tls: Option<TlsClientConfig>) -> Self {
         Self {
             shard_id,
             target,
             addr,
+            tls,
             client: None,
         }
     }
@@ -91,6 +99,14 @@ impl GrpcConnection {
         let endpoint = tonic::transport::Endpoint::from_shared(uri.clone()).map_err(|e| {
             RPCError::Network(NetworkError::new(&std::io::Error::other(format!(
                 "节点 {} 地址 {uri} 非法: {e}",
+                self.target
+            ))))
+        })?;
+
+        // https 目标按信任策略装配 TLS（缺省跳过校验）；http 原样
+        let endpoint = apply_endpoint_tls(endpoint, self.tls.as_ref()).map_err(|e| {
+            RPCError::Network(NetworkError::new(&std::io::Error::other(format!(
+                "节点 {} TLS 配置失败（{uri}）: {e}",
                 self.target
             ))))
         })?;

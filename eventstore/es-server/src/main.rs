@@ -51,6 +51,10 @@ async fn main() -> Result<()> {
 
     tracing::info!("Starting EventStore server (node_id={})", config.node.id);
     tracing::info!("Listen address: {}", config.node.listen_addr);
+    tracing::info!(
+        "TLS: {}",
+        if config.tls.is_some() { "https" } else { "disabled" }
+    );
     tracing::info!("Data directory: {:?}", config.storage.data_dir);
     tracing::info!("Number of shards: {}", config.shards.num_shards);
 

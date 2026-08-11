@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use es_proto::eventstore::raft_admin_client::RaftAdminClient;
 use es_proto::eventstore::GetRaftStateRequest;
+use es_proto::tls::{apply_endpoint_tls, TlsClientConfig};
 use es_raft::{normalize_endpoint, Shard, ShardManager};
 
 use crate::config::Config;
@@ -95,8 +96,30 @@ pub async fn run(config: &Config, sm: Arc<ShardManager>) {
         tracing::warn!("部分 peer 端口超时未就绪，继续尝试（openraft 复制/选举自动重试，可自愈）");
     }
 
+    // 客户端信任策略：ca_file 严格校验，缺省跳过校验（自签友好）。
+    // ca_file 读取失败绝不静默降级，直接跳过自动组建（可手动接管）。
+    let tls = match config.tls.as_ref().map(|t| t.client_trust()) {
+        Some(Ok(t)) => Some(t),
+        Some(Err(e)) => {
+            tracing::error!("TLS 客户端配置无效，跳过自动组建：{e}");
+            return;
+        }
+        None => None,
+    };
+    if tls.is_none() && members.values().any(|n| n.addr.starts_with("https://")) {
+        tracing::warn!(
+            "node.peers 含 https:// 地址但未配置 [tls]：将以默认跳过校验方式连接；若为明文部署请检查地址 scheme"
+        );
+    }
+
     // 探测客户端：connect_lazy 无 I/O，各分片共享
-    let clients = Arc::new(build_clients(&members));
+    let clients = match build_clients(&members, tls.as_ref()) {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            tracing::error!("构建探测客户端失败，跳过自动组建：{e}");
+            return;
+        }
+    };
     let self_id = config.node.id;
 
     // 每分片独立探测/自举，分片间并行（分片是独立 Raft group）
@@ -293,20 +316,24 @@ async fn wait_peers_ready(addrs: &[String], timeout: Duration) -> bool {
     }
 }
 
-/// 为每个 peer 构建惰性 gRPC 管理客户端（decide_mode 已校验地址合法）。
+/// 为每个 peer 构建惰性 gRPC 管理客户端。
+///
+/// decide_mode 已校验地址合法；https 目标按信任策略装配 TLS（缺省跳过校验）。
+/// 返回 Err 的场景：地址非法（decide_mode 后不应发生）或 CA PEM 解析失败。
 fn build_clients(
     members: &BTreeMap<u64, BasicNode>,
-) -> BTreeMap<u64, RaftAdminClient<Channel>> {
-    members
-        .iter()
-        .map(|(&id, node)| {
-            let uri = normalize_endpoint(&node.addr);
-            let endpoint = tonic::transport::Endpoint::from_shared(uri)
-                .expect("decide_mode 已校验地址合法");
-            let client = RaftAdminClient::new(endpoint.connect_lazy());
-            (id, client)
-        })
-        .collect()
+    tls: Option<&TlsClientConfig>,
+) -> Result<BTreeMap<u64, RaftAdminClient<Channel>>, String> {
+    let mut out = BTreeMap::new();
+    for (&id, node) in members {
+        let uri = normalize_endpoint(&node.addr);
+        let endpoint = tonic::transport::Endpoint::from_shared(uri.clone())
+            .map_err(|e| format!("节点 {id} 地址 {uri} 非法：{e}"))?;
+        let endpoint = apply_endpoint_tls(endpoint, tls)
+            .map_err(|e| format!("节点 {id} TLS 配置失败（{uri}）: {e}"))?;
+        out.insert(id, RaftAdminClient::new(endpoint.connect_lazy()));
+    }
+    Ok(out)
 }
 
 /// 根据配置决定自举模式（纯函数，可单测）。
@@ -360,6 +387,7 @@ mod tests {
                 data_dir: std::path::PathBuf::from("./data"),
             },
             shards: crate::config::ShardConfig { num_shards: 1 },
+            tls: None,
         }
     }
 
@@ -404,5 +432,36 @@ mod tests {
             }
             other => panic!("应进入 Bootstrap 模式：{other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn build_clients_坏CA不阻塞构建() {
+        let members = BTreeMap::from([(1u64, BasicNode { addr: "https://127.0.0.1:1".into() })]);
+        // tonic 的 Certificate::from_pem 构造时不解析，CA 解析延迟到握手时
+        // （TlsConnector::new）——构建阶段不报错；握手失败由 es-proto tls 测试覆盖
+        let tls = TlsClientConfig::Ca(vec![b'x'; 8]);
+        assert!(build_clients(&members, Some(&tls)).is_ok(), "坏 CA 应延迟到握手报错");
+    }
+
+    #[tokio::test]
+    async fn build_clients_https无策略默认跳过校验() {
+        let members = BTreeMap::from([(1u64, BasicNode { addr: "https://127.0.0.1:1".into() })]);
+        // 无信任策略：https 端点默认跳过校验，构建成功（connect_lazy 无 I/O）
+        let clients = build_clients(&members, None).expect("应成功");
+        assert_eq!(clients.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_tls配置无效_跳过自动组建() {
+        // ca_file 指向不存在文件 → client_trust 失败 → 打 error 日志后跳过组建（不 panic、不降级）
+        let mut cfg = config_with_peers(vec![(1, "127.0.0.1:50051")]);
+        cfg.tls = Some(crate::config::TlsConfig {
+            cert_file: Some(std::path::PathBuf::from("/nonexistent/cert.pem")),
+            key_file: Some(std::path::PathBuf::from("/nonexistent/key.pem")),
+            ca_file: Some(std::path::PathBuf::from("/nonexistent/ca.pem")),
+        });
+        let sm = Arc::new(ShardManager::new(1, 1));
+        // 不 panic 即通过；ca 读取失败绝不静默降级为跳过校验
+        crate::bootstrap::run(&cfg, sm).await;
     }
 }

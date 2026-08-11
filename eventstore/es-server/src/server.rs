@@ -17,6 +17,11 @@ pub struct Server {
 impl Server {
     /// 创建服务器实例
     pub fn new(config: Config) -> Result<Self> {
+        // TLS 配置启动期校验（fail-fast）：cert/key 成对、文件存在非空
+        if let Some(tls) = &config.tls {
+            tls.validate().map_err(anyhow::Error::msg)?;
+        }
+
         let shard_manager = Arc::new(ShardManager::new(
             config.node.id,
             config.shards.num_shards,
@@ -50,6 +55,12 @@ impl Server {
 
         tracing::info!("Opened shared surrealkv tree at {:?}", self.config.storage.data_dir);
 
+        // 节点间 Raft RPC 的客户端信任策略（https 对端生效；明文集群为 None）
+        let client_tls: Option<es_raft::TlsClientConfig> = match &self.config.tls {
+            Some(t) => Some(t.client_trust().map_err(anyhow::Error::msg)?),
+            None => None,
+        };
+
         // 为每个分片创建存储 + Raft 节点
         for shard_id in 0..self.config.shards.num_shards {
             let storage = EsStorage::new(shard_id, tree.clone())?;
@@ -76,7 +87,7 @@ impl Server {
 
             // 每个分片一个独立的 network：RaftNetworkFactory::new_client 只传
             // target 节点不传分片，分片信息必须由工厂自身携带
-            let network = GrpcNetwork::new(shard_id);
+            let network = GrpcNetwork::new(shard_id, client_tls.clone());
 
             let raft = openraft::Raft::new(
                 self.config.node.id,
@@ -115,15 +126,30 @@ impl Server {
     /// 启动 gRPC 服务器。
     ///
     /// 三个服务共用一个端口：客户端 API、Raft 节点间 RPC、集群管理 API。
+    /// 配置 [tls] 时以 TLS（https）监听，否则明文。
     pub async fn serve(&self) -> Result<()> {
-        let addr = self.config.node.listen_addr.parse()?;
+        let addr: std::net::SocketAddr = self.config.node.listen_addr.parse()?;
         let es_service = EsService::new(self.shard_manager.clone());
         let raft_service = es_raft::RaftRpcService::new(self.shard_manager.clone());
         let admin_service = es_raft::RaftAdminService::new(self.shard_manager.clone());
 
-        tracing::info!("gRPC 服务监听 {}", addr);
+        let mut server = tonic::transport::Server::builder();
+        // tls_config 必须在 add_service 之前
+        if let Some(tls) = &self.config.tls {
+            let cert = std::fs::read(tls.cert_file.as_ref().unwrap())?;
+            let key = std::fs::read(tls.key_file.as_ref().unwrap())?;
+            let identity = tonic::transport::Identity::from_pem(cert, key);
+            server = server
+                .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))?;
+        }
 
-        tonic::transport::Server::builder()
+        tracing::info!(
+            "gRPC 服务监听 {}（TLS: {}）",
+            addr,
+            if self.config.tls.is_some() { "https" } else { "http" }
+        );
+
+        server
             .add_service(es_proto::eventstore::event_store_server::EventStoreServer::new(es_service))
             .add_service(es_proto::eventstore::raft_rpc_server::RaftRpcServer::new(raft_service))
             .add_service(es_proto::eventstore::raft_admin_server::RaftAdminServer::new(

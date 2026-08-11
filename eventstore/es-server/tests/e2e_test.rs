@@ -30,6 +30,7 @@ async fn start_test_server() -> (
             data_dir: dir.path().to_path_buf(),
         },
         shards: ShardConfig { num_shards: 2 },
+        tls: None,
     };
 
     let server = Server::new(config).expect("创建服务器");

@@ -5,6 +5,7 @@ use tonic::transport::Channel;
 
 use es_proto::eventstore::event_store_client::EventStoreClient as GrpcClient;
 use es_proto::eventstore::*;
+use es_proto::tls::{apply_endpoint_tls, TlsClientConfig};
 
 /// EventStore 客户端
 ///
@@ -15,14 +16,31 @@ pub struct EventStoreClient {
 
     /// 默认节点地址列表
     nodes: Vec<String>,
+
+    /// https 节点的信任策略；None = 默认跳过校验（自签友好）
+    tls: Option<TlsClientConfig>,
 }
 
 impl EventStoreClient {
-    /// 连接到 EventStore 集群
+    /// 连接到 EventStore 集群。
+    ///
+    /// http 节点走明文；https 节点默认跳过证书校验（自签友好）。
+    /// 需要严格校验时用 [`Self::connect_with_tls`]。
     ///
     /// # 参数
     /// - `nodes`: 集群节点地址列表，如 `vec!["http://127.0.0.1:50051"]`
     pub async fn connect(nodes: Vec<String>) -> Result<Self, ClientError> {
+        Self::connect_with_tls(nodes, None).await
+    }
+
+    /// 连接到 EventStore 集群并指定 https 节点的信任策略。
+    ///
+    /// - `tls`: `Some(Ca(pem))` 严格校验对端证书链；`None` 或
+    ///   `Some(SkipVerify)` 跳过校验。http 节点不受影响。
+    pub async fn connect_with_tls(
+        nodes: Vec<String>,
+        tls: Option<TlsClientConfig>,
+    ) -> Result<Self, ClientError> {
         if nodes.is_empty() {
             return Err(ClientError::InvalidConfig(
                 "nodes list cannot be empty".to_string(),
@@ -33,13 +51,27 @@ impl EventStoreClient {
 
         // 连接到第一个节点（懒加载其他节点）
         let first_node = &nodes[0];
-        let client = GrpcClient::connect(first_node.clone())
-            .await
-            .map_err(|e| ClientError::ConnectionFailed(e.to_string()))?;
+        let client = Self::connect_one(first_node, tls.as_ref()).await?;
 
         clients.insert(first_node.clone(), client);
 
-        Ok(Self { clients, nodes })
+        Ok(Self { clients, nodes, tls })
+    }
+
+    /// 构建到单个节点的连接（显式 Endpoint 构建，https 按信任策略装配 TLS）。
+    async fn connect_one(
+        addr: &str,
+        tls: Option<&TlsClientConfig>,
+    ) -> Result<GrpcClient<Channel>, ClientError> {
+        let endpoint = tonic::transport::Endpoint::from_shared(addr.to_string())
+            .map_err(|e| ClientError::InvalidConfig(format!("非法节点地址 {addr}: {e}")))?;
+        let endpoint = apply_endpoint_tls(endpoint, tls)
+            .map_err(|e| ClientError::InvalidConfig(format!("节点 {addr} TLS 配置失败: {e}")))?;
+        let channel = endpoint
+            .connect()
+            .await
+            .map_err(|e| ClientError::ConnectionFailed(e.to_string()))?;
+        Ok(GrpcClient::new(channel))
     }
 
     /// 追加事件到流
@@ -116,9 +148,7 @@ impl EventStoreClient {
             return Ok(client.clone());
         }
 
-        let client = GrpcClient::connect(addr.to_string())
-            .await
-            .map_err(|e| ClientError::ConnectionFailed(e.to_string()))?;
+        let client = Self::connect_one(addr, self.tls.as_ref()).await?;
 
         self.clients.insert(addr.to_string(), client.clone());
         Ok(client)
