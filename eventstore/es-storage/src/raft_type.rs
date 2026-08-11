@@ -1,7 +1,6 @@
 //! Raft 类型配置与请求响应定义。
 
 use serde::{Deserialize, Serialize};
-use std::io::Cursor;
 
 use es_core::{ExpectedVersion, Hlc, NewEvent};
 
@@ -42,6 +41,8 @@ openraft::declare_raft_types!(
         NodeId = u64,
         Node = openraft::BasicNode,
         Entry = openraft::Entry<TypeConfig>,
-        SnapshotData = Cursor<Vec<u8>>,
+        // 快照数据为文件句柄：openraft 默认分块传输（Chunked）直接流式读文件，
+        // 不再一次性载入内存（docs/snapshot.md）
+        SnapshotData = crate::snapshot::SnapshotFile,
         AsyncRuntime = openraft::TokioRuntime,
 );

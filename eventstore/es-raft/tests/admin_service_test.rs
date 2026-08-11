@@ -84,7 +84,7 @@ async fn make_shard(manager: &ShardManager, id: u64) -> Arc<Shard> {
             .build()
             .expect("开 tree"),
     );
-    let store = EsStorage::new(id, tree).expect("建存储");
+    let store = EsStorage::new(id, tree, Default::default()).expect("建存储");
     store.restore_applied_state().await.expect("恢复状态");
     let cfg = Arc::new(
         Config {

@@ -207,7 +207,12 @@ async fn reopen_keeps_log_and_vote() {
             .with_path(path.clone())
             .build()
             .expect("开 tree");
-        let mut st = crate::EsStorage::new(0, std::sync::Arc::new(tree)).expect("建存储");
+        let mut st = crate::EsStorage::new(
+            0,
+            std::sync::Arc::new(tree),
+            crate::snapshot::SnapshotConfig { dir: dir.path().join("snapshots"), ..Default::default() },
+        )
+        .expect("建存储");
         do_append(&mut st, vec![entry(2, 0, "s"), entry(2, 1, "s")]).await;
         st.save_vote(&Vote::new(2, 3)).await.expect("写 vote");
         // 必须显式 close：Tree::close 是 async，drop 不释放 LOCK 文件
@@ -219,7 +224,12 @@ async fn reopen_keeps_log_and_vote() {
         .with_path(path)
         .build()
         .expect("重开 tree");
-    let mut st = crate::EsStorage::new(0, std::sync::Arc::new(tree)).expect("建存储");
+    let mut st = crate::EsStorage::new(
+            0,
+            std::sync::Arc::new(tree),
+            crate::snapshot::SnapshotConfig { dir: dir.path().join("snapshots"), ..Default::default() },
+        )
+        .expect("建存储");
 
     let state = st.get_log_state().await.expect("读日志状态");
     assert_eq!(state.last_log_id, Some(log_id(2, 1)), "重启后日志须仍在");

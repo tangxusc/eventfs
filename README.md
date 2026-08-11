@@ -265,9 +265,9 @@ cargo bench -p es-storage
 - [ ] 多语言客户端（Python / Go / Java）
 
 **存储与快照**
-- [ ] 快照压缩（zstd / lz4），减小体积与传输量
-- [ ] 快照存独立文件，与业务数据分离；分块传输大快照
-- [ ] 保留多个历史快照，支持时间点恢复
+- [x] 快照压缩（zstd / lz4，配置可选），减小体积与传输量
+- [x] 快照存独立文件（`{data_dir}/snapshots/`），与业务数据分离；分块传输从文件流式读块
+- [x] 保留多个历史快照（`[snapshot] keep`），`esctl snapshot list/restore` 支持时间点恢复
 
 **集群运维**
 - [x] reshard 命令行工具（`esctl reshard`，基于 `es_storage::reshard::reshard()`）
@@ -309,8 +309,13 @@ cargo bench -p es-storage
   `member list` 不含地址列与 learner 行（GetRaftState 不暴露成员地址）。
 - **`esctl watch --all` 单分片订阅**：`--shard <N>` 指定分片（默认 0），多分片 $all
   需各自发起订阅；跨分片聚合订阅尚未实现。
-- **快照为全量、未压缩**：每次 `build_snapshot` 用 serde_json 序列化整个分片状态机，
-  大状态机体积偏大。
+- **快照为全量**：每次 `build_snapshot` 序列化整个分片状态机，大状态机耗时明显
+  （支持 zstd/lz4 压缩与多快照保留，见 docs/snapshot.md）。
+- **install 单事务内存 ≈ 快照未压缩体积**：surrealkv 事务写入全内存缓冲，超大快照
+  不适用（失败时事务原子，旧数据无损）。
+- **快照分块与 append 批量共用 8MB 消息上限**：快照分块（3MiB 默认）有余量；
+  但 append 批量无字节上限（仅 300 条数限制），单事件极大时可能超限被拒，
+  openraft 不重试导致复制停滞——单事件数据应保持合理大小。
 
 ## 技术栈
 

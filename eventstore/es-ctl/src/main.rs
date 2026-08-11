@@ -57,6 +57,14 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Member(a) => commands::member::run(&ctx, &a).await,
         Command::Status(a) => commands::status::run(&ctx, &a).await,
         Command::Reshard(a) => commands::reshard::run(ctx.format, &a).await,
+        Command::Snapshot(a) => match a.action {
+            crate::cli::SnapshotAction::List(args) => {
+                commands::snapshot::list(ctx.format, &args).await
+            }
+            crate::cli::SnapshotAction::Restore(args) => {
+                commands::snapshot::run_restore(ctx.format, &args).await
+            }
+        },
     }
 }
 

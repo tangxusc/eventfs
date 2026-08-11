@@ -26,7 +26,15 @@ fn bench_read_empty_stream(c: &mut Criterion) {
                     .build()
                     .expect("建 tree"),
             );
-            let storage = EsStorage::new(0, tree).expect("建存储");
+            let storage = EsStorage::new(
+                0,
+                tree,
+                es_storage::snapshot::SnapshotConfig {
+                    dir: dir.path().join("snapshots"),
+                    ..Default::default()
+                },
+            )
+            .expect("建存储");
             (dir, storage)
         });
 

@@ -221,6 +221,50 @@ pub enum Command {
     Status(StatusArgs),
     /// 离线重分布：变更分片数（需集群停机，直接操作数据目录）
     Reshard(ReshardArgs),
+    /// 快照管理（离线操作数据目录）
+    Snapshot(SnapshotArgs),
+}
+
+/// 快照子命令（esctl snapshot <list|restore>）
+#[derive(Args, Debug)]
+pub struct SnapshotArgs {
+    #[command(subcommand)]
+    pub action: SnapshotAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SnapshotAction {
+    /// 列出数据目录中的快照文件（分片/快照点/压缩算法/大小）
+    List(SnapshotListArgs),
+    /// 离线恢复：把快照恢复到数据目录（需集群停机）
+    Restore(SnapshotRestoreArgs),
+}
+
+/// `esctl snapshot list`
+#[derive(Args, Debug)]
+pub struct SnapshotListArgs {
+    /// 数据目录（快照位于 {data_dir}/snapshots）
+    pub data_dir: PathBuf,
+    /// 快照目录；缺省 {data_dir}/snapshots。
+    /// 服务端配置了 [snapshot].dir 自定义目录时须显式传入
+    #[arg(long)]
+    pub snapshot_dir: Option<PathBuf>,
+}
+
+/// `esctl snapshot restore`
+#[derive(Args, Debug)]
+pub struct SnapshotRestoreArgs {
+    /// 数据目录（快照位于 {data_dir}/snapshots）
+    pub data_dir: PathBuf,
+    /// 快照文件路径（可由 esctl snapshot list 或直接拷贝获得）
+    pub snapshot_file: PathBuf,
+    /// 快照目录；缺省 {data_dir}/snapshots。
+    /// 服务端配置了 [snapshot].dir 自定义目录时须显式传入
+    #[arg(long)]
+    pub snapshot_dir: Option<PathBuf>,
+    /// 跳过停机确认提示
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Args, Debug)]

@@ -56,7 +56,7 @@ async fn garbage_payload_decode_invalid_argument() {
             .build()
             .expect("开 tree"),
     );
-    let store = es_storage::EsStorage::new(0, tree).expect("建存储");
+    let store = es_storage::EsStorage::new(0, tree, Default::default()).expect("建存储");
     store.restore_applied_state().await.expect("恢复状态");
     let cfg = Arc::new(openraft::Config::default().validate().expect("校验配置"));
     let raft = openraft::Raft::new(

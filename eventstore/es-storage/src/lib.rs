@@ -3,6 +3,7 @@
 pub mod key;
 pub mod raft_type;
 pub mod reshard;
+pub mod snapshot;
 pub mod storage;
 mod log_storage;
 mod state_machine;

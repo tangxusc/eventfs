@@ -80,7 +80,7 @@ async fn make_shard(manager: &ShardManager, id: u64) -> Arc<Shard> {
             .build()
             .expect("开 tree"),
     );
-    let store = EsStorage::new(id, tree).expect("建存储");
+    let store = EsStorage::new(id, tree, Default::default()).expect("建存储");
     store.restore_applied_state().await.expect("恢复状态");
 
     let cfg = Arc::new(
@@ -128,7 +128,7 @@ async fn register_out_of_range_rejected() {
             .build()
             .expect("开 tree"),
     );
-    let store = EsStorage::new(2, tree).expect("建存储");
+    let store = EsStorage::new(2, tree, Default::default()).expect("建存储");
     store.restore_applied_state().await.expect("恢复状态");
     let cfg = Arc::new(Config::default().validate().expect("校验配置"));
     let raft = Raft::new(2, cfg, NoopNet(2), store.clone(), store.clone())
@@ -154,7 +154,7 @@ async fn register_duplicate_rejected() {
             .build()
             .expect("开 tree"),
     );
-    let store = EsStorage::new(0, tree).expect("建存储");
+    let store = EsStorage::new(0, tree, Default::default()).expect("建存储");
     store.restore_applied_state().await.expect("恢复状态");
     let cfg = Arc::new(Config::default().validate().expect("校验配置"));
     let raft = Raft::new(0, cfg, NoopNet(0), store.clone(), store.clone())

@@ -387,6 +387,7 @@ mod tests {
                 data_dir: std::path::PathBuf::from("./data"),
             },
             shards: crate::config::ShardConfig { num_shards: 1 },
+            snapshot: Default::default(),
             tls: None,
         }
     }

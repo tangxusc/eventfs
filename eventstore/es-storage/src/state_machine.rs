@@ -7,7 +7,7 @@
 //!    六者必须同一个 surrealkv 事务提交，否则崩溃会留下版本号回退等不一致状态
 //! 3. 因为在 apply 内持久化状态，快照不要求落盘即可保证正确性
 
-use std::io::Cursor;
+use std::io::Write;
 
 use openraft::storage::{RaftStateMachine, Snapshot};
 use openraft::{
@@ -19,17 +19,9 @@ use surrealkv::LSMIterator;
 use super::EsStorage;
 use crate::key;
 use crate::raft_type::TypeConfig;
+use crate::snapshot;
 use crate::{EsRequest, EsResponse};
 use es_core::{Event, ExpectedVersion, StreamMeta};
-
-/// 快照载荷：状态机的完整可序列化形态
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct SnapshotPayload {
-    last_applied: Option<LogId<u64>>,
-    membership: StoredMembership<u64, openraft::BasicNode>,
-    /// 该分片状态机区的全部 kv（key 与 value 均为原始字节）
-    entries: Vec<(Vec<u8>, Vec<u8>)>,
-}
 
 fn sm_read_err(e: impl std::fmt::Display) -> StorageError<u64> {
     StorageIOError::read_state_machine(&std::io::Error::other(e.to_string())).into()
@@ -140,10 +132,12 @@ impl EsStorage {
 }
 
 /// 已应用状态的持久化形态
+///
+/// pub(crate)：离线 restore（snapshot.rs）需写回同格式的 applied 状态。
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
-struct AppliedState {
-    last_applied: Option<LogId<u64>>,
-    membership: StoredMembership<u64, openraft::BasicNode>,
+pub(crate) struct AppliedState {
+    pub(crate) last_applied: Option<LogId<u64>>,
+    pub(crate) membership: StoredMembership<u64, openraft::BasicNode>,
 }
 
 impl EsStorage {
@@ -151,6 +145,9 @@ impl EsStorage {
     ///
     /// openraft 在启动时调用 `applied_state`，必须返回真实落盘的值，
     /// 否则会从错误的位置重放日志。**必须在第一次调用 `apply` 前调用。**
+    ///
+    /// 顺带执行快照文件化的启动清理：删除旧版快照 key（树内单 key 格式已废弃，
+    /// 快照是可重建缓存，不迁移）与 incoming 残留临时文件。
     pub async fn restore_applied_state(&self) -> es_core::Result<()> {
         let k = key::sm_applied_state(self.shard_id());
         if let Some(bytes) = self.get(&k)? {
@@ -159,6 +156,27 @@ impl EsStorage {
             let mut cache = self.sm_cache().write().await;
             cache.last_applied = st.last_applied;
             cache.membership = st.membership;
+        }
+        self.cleanup_legacy_snapshot().await?;
+        Ok(())
+    }
+
+    /// 启动清理：删除旧版 `snapshot_current` key + incoming 残留临时文件。
+    ///
+    /// 快照是状态机的缓存，旧格式数据可直接丢弃（openraft 会按需重建）；
+    /// 残留临时文件是上次传输中断留下的，启动时无进行中的传输，安全删除。
+    async fn cleanup_legacy_snapshot(&self) -> es_core::Result<()> {
+        let k = key::snapshot_current(self.shard_id());
+        if self.get(&k)?.is_some() {
+            self.delete_batch(&[k]).await?;
+            tracing::info!("已清理旧版快照 key（快照已改为独立文件格式）");
+        }
+        let n = self
+            .snapshot_store()
+            .cleanup_incoming()
+            .map_err(|e| es_core::Error::Storage(format!("清理快照临时文件失败: {e}")))?;
+        if n > 0 {
+            tracing::info!("已清理 {n} 个残留快照临时文件");
         }
         Ok(())
     }
@@ -645,7 +663,13 @@ impl RaftStateMachine<TypeConfig> for EsStorage {
         &mut self,
     ) -> std::result::Result<Box<<TypeConfig as RaftTypeConfig>::SnapshotData>, StorageError<u64>>
     {
-        Ok(Box::new(Cursor::new(Vec::new())))
+        // 传输数据写入 incoming 临时文件而非内存：大快照分块到达时逐块落盘
+        let store = self.snapshot_store();
+        store.ensure_dirs().map_err(sm_write_err)?;
+        let sf = snapshot::SnapshotFile::create_temp(&store.incoming_dir())
+            .await
+            .map_err(|e| sm_write_err(&e))?;
+        Ok(Box::new(sf))
     }
 
     async fn install_snapshot(
@@ -653,10 +677,47 @@ impl RaftStateMachine<TypeConfig> for EsStorage {
         meta: &SnapshotMeta<u64, openraft::BasicNode>,
         snapshot: Box<<TypeConfig as RaftTypeConfig>::SnapshotData>,
     ) -> std::result::Result<(), StorageError<u64>> {
-        let bytes = snapshot.into_inner();
-        let payload: SnapshotPayload = serde_json::from_slice(&bytes).map_err(|e| {
-            StorageIOError::read_snapshot(Some(meta.signature()), &std::io::Error::other(e.to_string()))
-        })?;
+        // 关 tokio 句柄转 std 句柄：安装是同步段（解压流是 std::io::Read），
+        // 且不再持有传输句柄后可对临时文件做转正 rename。
+        // 注意：此处返回的 path/temp 已从 SnapshotFile 中取出（mem::take），
+        // 原对象 Drop 时不会删除已转正的文件。
+        let mut snapshot = snapshot;
+        // 防御：shutdown 刷出 tokio File 内部缓冲（tokio 1.53 的 File 写有
+        // 用户态缓冲，write_all 返回不代表落盘）。openraft Chunked 在传输
+        // 完成时已调用 shutdown（snapshot_transport.rs done 分支），此处
+        // 幂等兜底，防未来链路变化丢数据。
+        {
+            use tokio::io::AsyncWriteExt as _;
+            snapshot.shutdown().await.map_err(sm_write_err)?;
+        }
+        let (mut file, path, is_temp) = snapshot.into_std_file().map_err(sm_read_err)?;
+        // RAII 兜底：错误路径（读/解压/提交失败）删除残留的 temp 文件。
+        // 成功后由转正 rename 接管（guard 置 None），否则文件常驻磁盘
+        // 直到下次启动清理。
+        struct TempGuard(Option<std::path::PathBuf>);
+        impl Drop for TempGuard {
+            fn drop(&mut self) {
+                if let Some(p) = &self.0 {
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+        }
+        let mut temp_guard = TempGuard(if is_temp { Some(path.clone()) } else { None });
+
+        // 头部校验：magic/version/压缩 tag 不符即报错；snapshot_id 必须与
+        // openraft 请求一致（防错文件被当作目标快照安装）
+        let (header, file_meta) = snapshot::read_header(&mut file).map_err(sm_read_err)?;
+        if file_meta.snapshot_id != meta.snapshot_id {
+            return Err(sm_read_err(&std::io::Error::other(format!(
+                "快照文件 snapshot_id 不一致：文件 {} vs 请求 {}",
+                file_meta.snapshot_id, meta.snapshot_id
+            ))));
+        }
+
+        // 定位到 payload 起点（头部与 meta 未压缩）
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(32 + header.meta_len))
+            .map_err(sm_read_err)?;
+        let mut reader = header.compression.reader(file).map_err(sm_read_err)?;
 
         let shard = self.shard_id();
 
@@ -673,13 +734,23 @@ impl RaftStateMachine<TypeConfig> for EsStorage {
         for k in &old_keys {
             txn.delete(k.clone()).map_err(sm_write_err)?;
         }
-        for (k, v) in &payload.entries {
-            txn.set(k.clone(), v.clone()).map_err(sm_write_err)?;
+        // 流式解压逐条灌入（不把整个快照载入内存；txn 缓冲上限见 docs/snapshot.md）
+        let read_bytes = snapshot::for_each_record(&mut reader, |k, v| {
+            txn.set(k, v)
+                .map_err(|e| std::io::Error::other(format!("set 失败: {e}")))?;
+            Ok(())
+        })
+        .map_err(sm_read_err)?;
+        if read_bytes != header.payload_len {
+            return Err(sm_read_err(&std::io::Error::other(format!(
+                "快照 payload 长度不符：实读 {read_bytes} vs 声明 {}",
+                header.payload_len
+            ))));
         }
         // 已应用状态随快照一起写，保持原子
         let applied = AppliedState {
-            last_applied: payload.last_applied,
-            membership: payload.membership.clone(),
+            last_applied: meta.last_log_id,
+            membership: meta.last_membership.clone(),
         };
         txn.set(
             key::sm_applied_state(shard),
@@ -688,26 +759,50 @@ impl RaftStateMachine<TypeConfig> for EsStorage {
         .map_err(sm_write_err)?;
         txn.commit().await.map_err(sm_write_err)?;
 
-        cache.last_applied = payload.last_applied;
-        cache.membership = payload.membership;
+        cache.last_applied = meta.last_log_id;
+        cache.membership = meta.last_membership.clone();
+
+        // 转正：incoming 临时文件 → 规范名。先提交后转正：提交后转正失败
+        // 只损失文件缓存（SM 数据已就位）；反过来会留下"文件在而数据不在"。
+        if is_temp {
+            let final_path = self.snapshot_store().final_path(meta.last_log_id);
+            if let Err(e) = std::fs::rename(&path, &final_path) {
+                tracing::warn!(
+                    "快照文件转正失败（仅损失文件缓存，SM 数据已提交）: {e}"
+                );
+            } else {
+                temp_guard.0 = None; // 转正成功，guard 不再删除
+            }
+        } else {
+            temp_guard.0 = None;
+        }
+        // 保留清理：装快照也计入历史保留
+        let store = self.snapshot_store();
+        if let Err(e) = store.retain(store.keep()) {
+            tracing::warn!("快照保留清理失败: {e}");
+        }
         Ok(())
     }
 
     async fn get_current_snapshot(
         &mut self,
     ) -> std::result::Result<Option<Snapshot<TypeConfig>>, StorageError<u64>> {
-        let k = key::snapshot_current(self.shard_id());
-        match self.get(&k).map_err(sm_read_err)? {
-            None => Ok(None),
-            Some(bytes) => {
-                let (meta, data): (SnapshotMeta<u64, openraft::BasicNode>, Vec<u8>) =
-                    serde_json::from_slice(&bytes).map_err(sm_read_err)?;
-                Ok(Some(Snapshot {
-                    meta,
-                    snapshot: Box::new(Cursor::new(data)),
-                }))
-            }
-        }
+        let store = self.snapshot_store();
+        // 过滤领先于 applied 的快照：restore/崩溃残留的更新文件与状态机不一致
+        let applied = self.sm_cache().read().await.last_applied;
+        let Some(path) = store.latest(applied).map_err(sm_read_err)? else {
+            return Ok(None);
+        };
+        // 读文件头取该文件自己的完整 meta（含 last_membership，供 follower 安装）
+        let mut f = std::fs::File::open(&path).map_err(sm_read_err)?;
+        let (_, meta) = snapshot::read_header(&mut f).map_err(sm_read_err)?;
+        let sf = snapshot::SnapshotFile::open(path)
+            .await
+            .map_err(|e| sm_read_err(&e))?;
+        Ok(Some(Snapshot {
+            meta,
+            snapshot: Box::new(sf),
+        }))
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
@@ -729,17 +824,10 @@ impl RaftSnapshotBuilder<TypeConfig> for EsStorage {
             (cache.last_applied, cache.membership.clone(), entries)
         };
 
-        let payload = SnapshotPayload {
-            last_applied,
-            membership: membership.clone(),
-            entries,
-        };
-        let data = serde_json::to_vec(&payload).map_err(sm_read_err)?;
-
         // snapshot_id 需在同一分片内唯一且可比较。用 last_applied 的
         // term/index 拼接，避免依赖墙上时钟（Date::now 在确定性回放里不可用）。
         let snapshot_id = match last_applied {
-            Some(l) => format!("{}-{}-{}", shard, l.leader_id, l.index),
+            Some(l) => format!("{}-{}-{}", shard, l.leader_id.term, l.index),
             None => format!("{shard}-empty"),
         };
 
@@ -749,15 +837,52 @@ impl RaftSnapshotBuilder<TypeConfig> for EsStorage {
             snapshot_id,
         };
 
-        // 落盘当前快照，供 get_current_snapshot 返回
-        let stored = serde_json::to_vec(&(&meta, &data)).map_err(sm_write_err)?;
-        self.set(&key::snapshot_current(shard), &stored)
-            .await
-            .map_err(sm_write_err)?;
+        // 写临时文件 → 原子 rename 转正：崩溃不会留下半写的正式快照文件。
+        // 头部与 meta 未压缩（裸文件写入），payload 按配置压缩（docs/snapshot.md）。
+        let store = self.snapshot_store();
+        store.ensure_dirs().map_err(sm_write_err)?;
+        let tmp = store.tmp_path();
+        let header = snapshot::SnapshotHeader {
+            version: snapshot::SNAP_VERSION,
+            compression: store.compression(),
+            shard_id: shard,
+            meta_len: serde_json::to_vec(&meta).map_err(sm_write_err)?.len() as u64,
+            payload_len: snapshot::payload_len_for(&entries),
+        };
+        // 写段失败时清理 tmp（不调 finish 的 zstd Encoder Drop 不补帧尾，
+        // 残留的半写文件由本处删除与启动清理兜底）
+        let write_result = (|| -> std::result::Result<(), StorageError<u64>> {
+            let mut f = std::fs::File::create(&tmp).map_err(sm_write_err)?;
+            snapshot::write_header(&mut f, &header, &meta).map_err(sm_write_err)?;
+            let mut w = store.compression().writer(f).map_err(sm_write_err)?;
+            w.write_all(&(entries.len() as u64).to_le_bytes())
+                .map_err(sm_write_err)?;
+            for (k, v) in &entries {
+                snapshot::write_record(&mut w, k, v).map_err(sm_write_err)?;
+            }
+            snapshot::write_end_marker(&mut w).map_err(sm_write_err)?;
+            w.finish().map_err(sm_write_err)?;
+            Ok(())
+        })();
+        if let Err(e) = write_result {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        let final_path = store.final_path(last_applied);
+        std::fs::rename(&tmp, &final_path).map_err(sm_write_err)?;
 
+        // 保留清理：删除超出 keep 的旧快照
+        let removed = store.retain(store.keep()).map_err(sm_write_err)?;
+        for p in &removed {
+            tracing::info!("快照保留策略删除旧快照: {}", p.display());
+        }
+
+        let sf = snapshot::SnapshotFile::open(final_path)
+            .await
+            .map_err(|e| sm_write_err(&e))?;
         Ok(Snapshot {
             meta,
-            snapshot: Box::new(Cursor::new(data)),
+            snapshot: Box::new(sf),
         })
     }
 }

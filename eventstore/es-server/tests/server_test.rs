@@ -25,6 +25,7 @@ async fn server_starts_and_inits_raft() {
             data_dir: dir.path().to_path_buf(),
         },
         shards: ShardConfig { num_shards: 2 },
+        snapshot: Default::default(),
         tls: None,
     };
 
