@@ -25,10 +25,8 @@ impl TlsClientConfig {
     /// 返回 Err 的场景：CA PEM 解析失败（tonic 在 `ca_certificate` 时解析）。
     pub fn apply(&self, endpoint: Endpoint) -> Result<Endpoint, tonic::transport::Error> {
         match self {
-            TlsClientConfig::SkipVerify => endpoint.tls_config_with_verifier(
-                ClientTlsConfig::new(),
-                Arc::new(NoCertVerify::new()),
-            ),
+            TlsClientConfig::SkipVerify => endpoint
+                .tls_config_with_verifier(ClientTlsConfig::new(), Arc::new(NoCertVerify::new())),
             TlsClientConfig::Ca(pem) => endpoint
                 .tls_config(ClientTlsConfig::new().ca_certificate(Certificate::from_pem(pem))),
         }
@@ -172,8 +170,8 @@ mod tests {
     /// 生成一张带 CA:TRUE 约束的自签证书（等价 openssl req -x509 默认行为）
     fn gen_ca_true_cert() -> (String, String) {
         use rcgen::{BasicConstraints, IsCa};
-        let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()])
-            .expect("证书参数");
+        let mut params =
+            rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).expect("证书参数");
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         let key_pair = rcgen::KeyPair::generate().expect("生成密钥");
         let cert = params.self_signed(&key_pair).expect("生成自签证书");
@@ -181,10 +179,16 @@ mod tests {
     }
 
     /// 用给定证书起一个 TLS 的 RaftAdmin 服务，返回 (https 地址, serve 句柄)
-    async fn start_tls_admin_server(cert_pem: &str, key_pem: &str) -> (String, tokio::task::JoinHandle<()>) {
-        let identity = tonic::transport::Identity::from_pem(cert_pem.as_bytes(), key_pem.as_bytes());
+    async fn start_tls_admin_server(
+        cert_pem: &str,
+        key_pem: &str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let identity =
+            tonic::transport::Identity::from_pem(cert_pem.as_bytes(), key_pem.as_bytes());
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("绑定端口");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定端口");
         let addr = listener.local_addr().expect("取地址");
         let service = raft_admin_server::RaftAdminServer::new(StubAdmin);
 
@@ -236,7 +240,9 @@ mod tests {
     async fn https_无策略默认跳过校验() {
         let (cert, key) = gen_cert();
         let (addr, handle) = start_tls_admin_server(&cert, &key).await;
-        probe_https(&addr, None).await.expect("无策略应默认跳过校验");
+        probe_https(&addr, None)
+            .await
+            .expect("无策略应默认跳过校验");
         handle.abort();
     }
 

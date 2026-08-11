@@ -80,7 +80,13 @@ impl TestNet {
     }
 
     async fn get_delay(&self, from: u64, to: u64) -> u64 {
-        self.inner.read().await.delay.get(&(from, to)).copied().unwrap_or(0)
+        self.inner
+            .read()
+            .await
+            .delay
+            .get(&(from, to))
+            .copied()
+            .unwrap_or(0)
     }
 
     async fn raft_of(&self, id: u64) -> Option<Raft<TypeConfig>> {
@@ -444,11 +450,7 @@ async fn 隔离leader后多数派选出新leader且少数派无法提交() {
     eprintln!("✓ 新 leader = node{new}, term={}", c.term(new));
 
     // 关键安全性：被隔离的少数派联系不上多数派，写入不可能提交
-    let err = tokio::time::timeout(
-        Duration::from_secs(5),
-        c.write(old, "p", b"minority"),
-    )
-    .await;
+    let err = tokio::time::timeout(Duration::from_secs(5), c.write(old, "p", b"minority")).await;
     match err {
         // 立即报错，或一直挂到超时，都说明没提交成功；
         // 唯一不可接受的是返回 Ok
@@ -505,7 +507,11 @@ async fn 分区恢复后旧leader追平多数派数据() {
     eprintln!("✓ node{old} 已退位并追平");
 
     // 三个节点数据一致
-    let want: Vec<Vec<u8>> = vec![b"before".to_vec(), b"during-1".to_vec(), b"during-2".to_vec()];
+    let want: Vec<Vec<u8>> = vec![
+        b"before".to_vec(),
+        b"during-1".to_vec(),
+        b"during-2".to_vec(),
+    ];
     for &id in &c.ids {
         let got: Vec<Vec<u8>> = c.read(id, "h").into_iter().map(|e| e.data).collect();
         assert_eq!(got, want, "node{id} 数据应与多数派一致");
@@ -530,9 +536,12 @@ async fn 单向链路中断不影响集群可用性() {
     c.net.inner.write().await.cut.remove(&(cut_to, leader));
     eprintln!("→ 切断 node{leader}→node{cut_to} 单向链路");
 
-    c.write(leader, "u", b"x").await.expect("多数派仍在，写入应成功");
+    c.write(leader, "u", b"x")
+        .await
+        .expect("多数派仍在，写入应成功");
     let applied = c.last_applied(leader);
-    c.wait_applied(ok_node, applied, Duration::from_secs(5)).await;
+    c.wait_applied(ok_node, applied, Duration::from_secs(5))
+        .await;
     eprintln!("✓ 写入成功并复制到 node{ok_node}");
 
     // 可达的那个 follower 数据正确
@@ -541,7 +550,8 @@ async fn 单向链路中断不影响集群可用性() {
 
     // 恢复后被切断的 follower 也应追平
     c.net.heal().await;
-    c.wait_applied(cut_to, applied, Duration::from_secs(15)).await;
+    c.wait_applied(cut_to, applied, Duration::from_secs(15))
+        .await;
     let got: Vec<Vec<u8>> = c.read(cut_to, "u").into_iter().map(|e| e.data).collect();
     assert_eq!(got, vec![b"x".to_vec()], "恢复后应追平");
     eprintln!("✓ node{cut_to} 恢复后追平");
@@ -595,7 +605,6 @@ async fn 单follower慢另一个快则走快路径() {
     c.shutdown().await;
 }
 
-
 #[tokio::test]
 async fn 落后节点通过快照追赶而非重放日志() {
     // 快照策略:每 5 条日志建一次快照,快照后只留 2 条日志。
@@ -619,7 +628,8 @@ async fn 落后节点通过快照追赶而非重放日志() {
     c.write(leader, "snap", b"base").await.expect("基线写入");
     let base_applied = c.last_applied(leader);
     for &o in &others {
-        c.wait_applied(o, base_applied, Duration::from_secs(5)).await;
+        c.wait_applied(o, base_applied, Duration::from_secs(5))
+            .await;
     }
     eprintln!("✓ 基线已同步,applied={base_applied}");
 

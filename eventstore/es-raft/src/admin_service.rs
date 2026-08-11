@@ -124,11 +124,7 @@ impl RaftAdmin for RaftAdminService {
         // metrics 是 watch channel 的快照，读取不阻塞
         let m = shard.raft.metrics().borrow().clone();
 
-        let voter_ids: Vec<u64> = m
-            .membership_config
-            .membership()
-            .voter_ids()
-            .collect();
+        let voter_ids: Vec<u64> = m.membership_config.membership().voter_ids().collect();
 
         Ok(Response::new(GetRaftStateResponse {
             node_id: m.id,

@@ -1,16 +1,20 @@
 //! openraft RaftNetwork 实现：通过 gRPC 做节点间通信。
 
+use openraft::BasicNode;
 use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
-use openraft::BasicNode;
 
 use es_proto::eventstore::raft_rpc_client::RaftRpcClient;
-use es_proto::tls::{apply_endpoint_tls, TlsClientConfig};
+use es_proto::tls::{TlsClientConfig, apply_endpoint_tls};
 use es_storage::TypeConfig;
+
+// 端点归一化规则定义在 es-proto（es-ctl 等客户端共用），此处 re-export 保持原路径 API：
+// `es_raft::network::normalize_endpoint` 与 `es_raft::normalize_endpoint` 均仍可用。
+pub use es_proto::endpoint::normalize_endpoint;
 
 /// 某分片的网络工厂。
 ///
@@ -46,18 +50,6 @@ impl RaftNetworkFactory<TypeConfig> for GrpcNetwork {
     }
 }
 
-/// BasicNode.addr 可能不带 scheme，补上 http:// 才是合法的 tonic endpoint。
-///
-/// 写入 membership 的地址与网络层回连必须遵循同一规则（单一来源），
-/// 启动时按配置自动组建集群（bootstrap）也要用它。
-pub fn normalize_endpoint(addr: &str) -> String {
-    if addr.starts_with("http://") || addr.starts_with("https://") {
-        addr.to_string()
-    } else {
-        format!("http://{}", addr)
-    }
-}
-
 /// 指向单个目标节点的连接。
 pub struct GrpcConnection {
     shard_id: u64,
@@ -85,7 +77,9 @@ impl GrpcConnection {
     }
 
     /// 取出（必要时建立）gRPC 客户端
-    fn client<E>(&mut self) -> Result<RaftRpcClient<tonic::transport::Channel>, RPCError<u64, BasicNode, E>>
+    fn client<E>(
+        &mut self,
+    ) -> Result<RaftRpcClient<tonic::transport::Channel>, RPCError<u64, BasicNode, E>>
     where
         E: std::error::Error,
     {

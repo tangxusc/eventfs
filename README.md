@@ -29,10 +29,12 @@ crate 依赖自上而下单向：
 
 ```
 es-client ──┐
-            ├─→ es-proto（gRPC 协议）
+            ├─→ es-proto（gRPC 协议 + 端点归一化）
 es-server ──┤
    │        └─→ es-core（Event / HLC / 路由）
    ↓
+es-ctl（命令行管理工具，参照 etcdctl）
+   │
 es-raft（ShardManager、GrpcNetwork、Admin/RPC 服务）
    ↓
 es-storage（RaftLogStorage + RaftStateMachine + reshard）
@@ -171,6 +173,39 @@ let mut client = EventStoreClient::connect_with_tls(
 ).await?;
 ```
 
+### esctl 命令行工具
+
+`esctl` 是参照 etcdctl 的管理工具（独立二进制，构建：`cargo build --bin esctl`），
+覆盖数据面读写、订阅、集群组建与管理、端点健康、离线 reshard：
+
+```bash
+# 全局参数：--endpoints（逗号分隔多地址）、--dial-timeout、--timeout、
+#            --cacert / --insecure-skip-tls-verify（https）、-w simple|table|json
+
+# 数据面：写事件、读流、跨分片读 $all、查流元数据
+esctl append orders/1 --event-type OrderPlaced --data '{"qty":1}' --expected-version nostream
+esctl read orders/1 --from-version 0 --max-count 100
+esctl readall --max-count 100          # 取满时输出下一页续读游标提示
+esctl meta orders/1
+
+# 订阅：先追平历史再实时推送；--once 追平即退出（脚本/测试用）
+esctl watch orders/1 --from-start
+esctl watch --all --from-start
+
+# 管理面：初始化分片（每个分片独立 Raft group）、加/删成员、查看状态
+esctl init --all-shards --member 1@127.0.0.1:50051 --member 2@127.0.0.1:50052
+esctl member add --all-shards --member 3@127.0.0.1:50053
+esctl member remove --all-shards --node-id 3
+esctl member list
+esctl status              # 各端点健康与分片归属
+
+# 离线 reshard：变更分片数（需集群停机、先备份数据）
+esctl reshard --src-dir ./data --src-shards 2 --dst-dir ./data-new --dst-shards 4 --yes
+```
+
+退出码：0 成功 / 1 运行时失败（连接失败、无 leader、乐观并发冲突等）/ 2 参数错误。
+完整命令手册见 [docs/esctl.md](docs/esctl.md)。
+
 ## 测试
 
 ```bash
@@ -184,14 +219,23 @@ cargo test -p es-server --test multi_node_test -- --ignored --test-threads=1
 | 套件 | 项数 | 内容 |
 |---|---|---|
 | `es-core` | 9 | HLC 单调性、分片路由 |
-| `es-proto` | 2 | gRPC 代码生成验证 |
+| `es-proto` | 10 | gRPC 代码生成验证、TLS 信任策略、端点归一化 |
 | `es-storage` | 48 | Key 编码排序性质、日志语义、apply、快照、reshard |
 | `es-raft/partition_test` | 6 | 网络分区、快照追赶、慢节点（进程内可控网络层） |
 | `es-server/e2e_test` | 19 | 端到端读写、乐观并发、订阅、跨分片 ReadAll、反向读取 |
 | `es-server/server_test` | 1 | 服务器启动与分片初始化 |
 | `es-server/multi_node_test` | 11 | 3 节点真实进程集群（6 项手动组建 + 5 项自动组建，`--ignored` 启用） |
+| `es-ctl` 单测 | 47 | 参数解析、leader 提示解析、分片探测、输出渲染 |
+| `es-ctl/e2e_test` | 15 | 进程内全链路：读写/订阅/管理面/TLS/双节点成员管理 |
+| `es-ctl/reshard_test` | 5 | 离线 reshard 端到端（数据完整、负例、LOCK 约束） |
+| `es-ctl/multi_node_test` | 2 | esctl 组建三节点真实进程集群（`--ignored` 启用） |
 
-多节点测试标为 `#[ignore]`：每项要拉起 3 个进程，6 项约 21s，而默认 85 项只需约 7s。串行运行以免争抢端口。
+多节点测试标为 `#[ignore]`：每项要拉起 3 个进程。串行运行以免争抢端口：
+
+```bash
+cargo test -p es-server --test multi_node_test -- --ignored --test-threads=1
+cargo test -p es-ctl --test multi_node_test -- --ignored --test-threads=1
+```
 
 ```bash
 # 存储层基准
@@ -204,6 +248,7 @@ cargo bench -p es-storage
 |---|---|
 | [docs/](docs/README.md) | 文档索引（设计 + 专题） |
 | [docs/design.md](docs/design.md) | Key 编码与排序性质证明、写入路径、HLC、全序边界 |
+| [docs/esctl.md](docs/esctl.md) | esctl 完整命令手册（参数、输出格式、leader 发现策略） |
 | [docs/multi_node_testing.md](docs/multi_node_testing.md) | 多节点与分区测试、集群组建流程、踩坑记录 |
 | [docs/snapshot.md](docs/snapshot.md) | 快照四方法实现要点、参数权衡 |
 | [docs/reshard.md](docs/reshard.md) | 分片变更三种方案对比与离线方案设计 |
@@ -224,8 +269,8 @@ cargo bench -p es-storage
 - [ ] 保留多个历史快照，支持时间点恢复
 
 **集群运维**
-- [ ] reshard 命令行工具（当前仅有库函数 `es_storage::reshard::reshard()`）
-- [ ] reshard 含数据完整测试（当前仅空到空用例）
+- [x] reshard 命令行工具（`esctl reshard`，基于 `es_storage::reshard::reshard()`）
+- [x] reshard 含数据完整测试（es-ctl 的 reshard_test：流/事件数一致、version/event_id 不变）
 - [ ] reshard 并行处理与增量重分布（中断后可续跑）
 - [ ] 在线分片变更（方案 B 分裂/合并 或方案 C 虚拟节点，需架构级改动）
 - [ ] 磁盘故障注入测试
@@ -255,8 +300,11 @@ cargo bench -p es-storage
   不符时节点会告警并放弃自举）。已有节点重启不参与组建，从本地日志恢复。
 - **极端窗口双故障**：节点在"收到选票但日志为空"的子秒级窗口内宕机，且其余
   节点也宕机，可能卡在无日志有选票状态——清空该节点数据目录重建即可恢复。
-- **reshard 需停机，且尚无命令行工具**：只有 async 库函数，需自行封装调用。
-  reshard 后客户端的 position 游标失效，需从头读或用别的方式续读。
+- **reshard 需停机**：`esctl reshard` 直接操作数据目录（集群未停时 LOCK 占用会拒绝执行），
+  运行前须备份。reshard 后客户端的 position 游标失效，需从头读或用别的方式续读。
+- **`esctl member remove` 无法移除 learner**：RaftAdmin 无 remove_learner RPC；
+  `member list` 不含地址列与 learner 行（GetRaftState 不暴露成员地址）。
+- **`esctl watch --all` 仅支持分片 0**：服务端 `$all` 订阅的已知限制。
 - **快照为全量、未压缩**：每次 `build_snapshot` 用 serde_json 序列化整个分片状态机，
   大状态机体积偏大。
 

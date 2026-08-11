@@ -663,6 +663,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "es-ctl"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "es-core",
+ "es-proto",
+ "es-raft",
+ "es-server",
+ "es-storage",
+ "rcgen",
+ "serde",
+ "serde_json",
+ "surrealkv",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "uuid",
+]
+
+[[package]]
 name = "es-proto"
 version = "0.1.0"
 dependencies = [

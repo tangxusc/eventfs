@@ -1,0 +1,32 @@
+[package]
+name = "es-ctl"
+description = "EventStore 命令行管理工具（参照 etcdctl）：数据面读写、订阅、集群管理、离线 reshard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "esctl"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tokio-stream = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+surrealkv = { workspace = true }
+es-proto = { workspace = true }
+es-core = { workspace = true }
+es-storage = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+rcgen = { workspace = true }
+es-server = { workspace = true }
+es-raft = { workspace = true }

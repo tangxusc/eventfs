@@ -17,7 +17,10 @@ pub mod raft {
 /// 客户端 TLS 信任策略与端点装配（https 支持）
 pub mod tls;
 
-pub use tls::{apply_endpoint_tls, TlsClientConfig};
+/// 端点地址归一化（裸地址补 http:// 前缀）
+pub mod endpoint;
+
+pub use tls::{TlsClientConfig, apply_endpoint_tls};
 
 #[cfg(test)]
 mod tests {

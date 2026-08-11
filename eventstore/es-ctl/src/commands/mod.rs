@@ -1,0 +1,190 @@
+//! 命令分发上下文与公共工具（事件收集、渲染、续读游标计算）。
+
+use std::collections::HashMap;
+
+use anyhow::Result;
+use es_proto::eventstore::{Event, ReadEventsResponse};
+
+use crate::cli::{Format, GlobalArgs};
+use crate::client::ClusterClient;
+use crate::output;
+use crate::shards::{ShardScope, resolve_shard_scope};
+
+pub mod append;
+pub mod init;
+pub mod member;
+pub mod meta;
+pub mod read;
+pub mod reshard;
+pub mod status;
+pub mod watch;
+
+/// 命令执行上下文：连接、全局参数、分片范围（惰性探测并缓存）。
+pub struct Ctx {
+    pub cluster: ClusterClient,
+    pub global: GlobalArgs,
+    pub format: Format,
+    shard_scope: tokio::sync::Mutex<Option<ShardScope>>,
+}
+
+impl Ctx {
+    pub fn new(cluster: ClusterClient, global: GlobalArgs) -> Self {
+        let format = global.write_out;
+        Self {
+            cluster,
+            global,
+            format,
+            shard_scope: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// 分片范围：首次调用时探测并缓存（探测失败回退默认值并告警）。
+    pub async fn shards(&self) -> Result<ShardScope> {
+        let mut guard = self.shard_scope.lock().await;
+        if let Some(scope) = *guard {
+            return Ok(scope);
+        }
+        let scope = resolve_shard_scope(&self.cluster, &self.global).await?;
+        *guard = Some(scope);
+        Ok(scope)
+    }
+}
+
+/// 把单向流响应收集为事件列表（读流结束即返回）。
+pub async fn collect_events(
+    mut stream: tonic::Streaming<ReadEventsResponse>,
+) -> Result<Vec<Event>> {
+    let mut events = Vec::new();
+    while let Some(resp) = stream.message().await? {
+        events.extend(resp.events);
+    }
+    Ok(events)
+}
+
+/// 事件渲染文本（read/readall 共用；事件已全部收集），调用方负责 println。
+pub fn render_events(format: Format, events: &[Event]) -> String {
+    match format {
+        Format::Simple => events
+            .iter()
+            .map(|ev| output::event_simple_line(ev))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Format::Table => {
+            let rows: Vec<Vec<String>> = events
+                .iter()
+                .map(|ev| {
+                    let hlc = ev
+                        .hlc
+                        .as_ref()
+                        .map(|h| output::hlc_to_rfc3339(h.wall))
+                        .unwrap_or_else(|| "-".into());
+                    vec![
+                        ev.stream_id.clone(),
+                        ev.version.to_string(),
+                        ev.event_type.clone(),
+                        hlc,
+                        ev.position.to_string(),
+                        ev.shard_id.to_string(),
+                        output::event_data_text(&ev.data),
+                    ]
+                })
+                .collect();
+            output::render_table(
+                &["STREAM", "VER", "TYPE", "HLC", "POS", "SHARD", "DATA"],
+                &rows,
+            )
+        }
+        Format::Json => {
+            let events: Vec<serde_json::Value> = events.iter().map(output::event_to_json).collect();
+            serde_json::json!({ "events": events }).to_string()
+        }
+    }
+}
+
+/// 计算续读游标：每分片取（正序）最大 position+1 或（倒序）最小 position-1。
+///
+/// 倒序时 position=0 的分片不再续读（已到边界）。返回按分片升序。
+pub fn next_from_positions(events: &[Event], backward: bool) -> Vec<(u64, u64)> {
+    let mut by_shard: HashMap<u64, Vec<u64>> = HashMap::new();
+    for ev in events {
+        by_shard.entry(ev.shard_id).or_default().push(ev.position);
+    }
+    let mut out: Vec<(u64, u64)> = by_shard
+        .into_iter()
+        .filter_map(|(shard, poss)| {
+            if backward {
+                // 倒序：取最小位置 - 1；position=0 已到边界，不再续读
+                let min = poss.into_iter().min()?;
+                (min > 0).then(|| (shard, min - 1))
+            } else {
+                let max = poss.into_iter().max()?;
+                Some((shard, max + 1))
+            }
+        })
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+/// 续读游标渲染为 `shard:pos,...` 字符串（simple 模式提示用）
+pub fn from_positions_text(positions: &[(u64, u64)]) -> String {
+    positions
+        .iter()
+        .map(|(s, p)| format!("{s}:{p}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(shard: u64, pos: u64) -> Event {
+        Event {
+            stream_id: "s".into(),
+            version: pos,
+            event_id: Vec::new(),
+            event_type: "T".into(),
+            data: Vec::new(),
+            metadata: Vec::new(),
+            hlc: None,
+            position: pos,
+            shard_id: shard,
+        }
+    }
+
+    #[test]
+    fn 正序续读游标_各分片最大位置加一() {
+        let events = vec![event(3, 7), event(3, 9), event(5, 2)];
+        assert_eq!(next_from_positions(&events, false), vec![(3, 10), (5, 3)]);
+    }
+
+    #[test]
+    fn 倒序续读游标_最小位置减一且零不续() {
+        let events = vec![event(3, 7), event(5, 0), event(5, 2)];
+        assert_eq!(next_from_positions(&events, true), vec![(3, 6)]);
+    }
+
+    #[test]
+    fn 空事件无续读游标() {
+        assert_eq!(next_from_positions(&[], false), vec![]);
+    }
+
+    #[test]
+    fn 游标文本格式() {
+        assert_eq!(from_positions_text(&[(3, 10), (5, 3)]), "3:10,5:3");
+        assert_eq!(from_positions_text(&[]), "");
+    }
+
+    #[test]
+    fn 事件表渲染() {
+        let ev = event(1, 2);
+        let table = render_events(Format::Table, &[ev]);
+        assert!(table.contains("STREAM"), "应有表头");
+        assert!(table.contains("T"), "应有事件类型");
+        let json = render_events(Format::Json, &[]);
+        assert_eq!(json, r#"{"events":[]}"#);
+        let empty_simple = render_events(Format::Simple, &[]);
+        assert_eq!(empty_simple, "");
+    }
+}

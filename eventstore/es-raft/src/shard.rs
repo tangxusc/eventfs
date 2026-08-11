@@ -1,7 +1,7 @@
 //! 单个 Raft 分片的封装。
 
-use std::sync::Arc;
 use openraft::Raft;
+use std::sync::Arc;
 
 use es_storage::{EsStorage, TypeConfig};
 
@@ -21,11 +21,7 @@ pub struct Shard {
 
 impl Shard {
     /// 创建新分片
-    pub fn new(
-        shard_id: u64,
-        raft: Raft<TypeConfig>,
-        storage: Arc<EsStorage>,
-    ) -> Self {
+    pub fn new(shard_id: u64, raft: Raft<TypeConfig>, storage: Arc<EsStorage>) -> Self {
         Self {
             shard_id,
             raft,

@@ -15,7 +15,8 @@ EventFS v2 —— 基于 Rust + openraft 的分布式事件存储。本目录收
 |---|---|
 | [multi_node_testing.md](multi_node_testing.md) | 多节点与网络分区测试、集群组建流程、实现要点与踩坑记录 |
 | [snapshot.md](snapshot.md) | 快照四方法实现要点、参数权衡、测试覆盖 |
-| [reshard.md](reshard.md) | 分片数变更三种方案对比、离线重分布设计、实现现状与计划 |
+| [reshard.md](reshard.md) | 分片数变更三种方案对比、离线重分布设计、esctl reshard 用法 |
+| [esctl.md](esctl.md) | esctl 命令行工具完整手册（参数、输出格式、leader 发现策略） |
 | [benchmarks.md](benchmarks.md) | 基准结果（读取延迟、reshard 吞吐）与未覆盖场景 |
 
 ## 归档

@@ -1,0 +1,403 @@
+//! 集群连接管理：端点归一化、TLS 装配、惰性通道缓存、leader 发现与重定向。
+
+use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use anyhow::{Context, anyhow, bail};
+use tonic::transport::{Channel, Endpoint};
+use tonic::{Code, Status};
+
+use es_proto::endpoint::normalize_endpoint;
+use es_proto::eventstore::event_store_client::EventStoreClient;
+use es_proto::eventstore::raft_admin_client::RaftAdminClient;
+use es_proto::eventstore::{GetRaftStateRequest, GetRaftStateResponse};
+use es_proto::tls::{TlsClientConfig, apply_endpoint_tls};
+
+/// 解析服务端返回的 leader 重定向提示。
+///
+/// 格式（es-server/src/service.rs `client_write_to_status`）：
+/// - `"not leader; leader_id=3 leader_addr=http://127.0.0.1:50052"` → 地址
+/// - `"not leader; leader unknown, retry later"` → None（选举中，稍后重试）
+/// - 其它任何文本 → None
+pub fn parse_leader_hint(msg: &str) -> Option<String> {
+    let rest = msg.strip_prefix("not leader;")?.trim();
+    let rest = rest.strip_prefix("leader_id=")?;
+    let (_id, addr) = rest.split_once(" leader_addr=")?;
+    let addr = addr.trim();
+    if addr.is_empty() {
+        None
+    } else {
+        Some(addr.to_string())
+    }
+}
+
+/// 集群客户端。
+///
+/// 通道按端点惰性建立并缓存（克隆廉价）；写操作走 leader 发现，
+/// 读操作任一可达端点即可（服务端读走本地存储，follower 也服务读）。
+pub struct ClusterClient {
+    /// 归一化（补 http:// 前缀）且去重保序的端点列表
+    endpoints: Vec<String>,
+    /// https 端点的信任策略；http 端点不受影响
+    tls: Option<TlsClientConfig>,
+    dial_timeout: Duration,
+    request_timeout: Duration,
+    /// endpoint -> 惰性通道（首次 RPC 时才真正建连）
+    channels: RwLock<HashMap<String, Channel>>,
+    /// 轮询起点游标：逐次调用后移一位，避免每次都先打第一个端点
+    cursor: AtomicUsize,
+}
+
+impl ClusterClient {
+    pub fn new(
+        endpoints: &[String],
+        tls: Option<TlsClientConfig>,
+        dial_timeout: Duration,
+        request_timeout: Duration,
+    ) -> Result<Self, anyhow::Error> {
+        if endpoints.is_empty() {
+            bail!("--endpoints 不能为空");
+        }
+        let mut seen = HashSet::new();
+        let mut normalized = Vec::new();
+        for ep in endpoints {
+            let ep = normalize_endpoint(ep);
+            if seen.insert(ep.clone()) {
+                normalized.push(ep);
+            }
+        }
+        Ok(Self {
+            endpoints: normalized,
+            tls,
+            dial_timeout,
+            request_timeout,
+            channels: RwLock::new(HashMap::new()),
+            cursor: AtomicUsize::new(0),
+        })
+    }
+
+    /// 归一化后的端点列表（只读）
+    pub fn endpoints(&self) -> &[String] {
+        &self.endpoints
+    }
+
+    /// 从轮询游标开始的端点顺序（每次调用起点后移一位，负载分散）。
+    /// pub(crate)：init 等命令需按此顺序逐端点尝试。
+    pub(crate) fn rotated_endpoints(&self) -> Vec<String> {
+        let start = self.cursor.fetch_add(1, Ordering::Relaxed) % self.endpoints.len();
+        (0..self.endpoints.len())
+            .map(|i| self.endpoints[(start + i) % self.endpoints.len()].clone())
+            .collect()
+    }
+
+    /// 取单个端点（订阅等长连接场景：单端点直连，起点轮询分散）
+    pub fn pick_endpoint(&self) -> String {
+        let start = self.cursor.fetch_add(1, Ordering::Relaxed) % self.endpoints.len();
+        self.endpoints[start].clone()
+    }
+
+    /// 获取（或建立）到指定端点的通道。
+    ///
+    /// 显式 `connect()`（含 TLS 握手）而非 `connect_lazy()`：lazy 模式下
+    /// TLS 握手在 hyper 连接池层进行，不受 tower `timeout` 覆盖，握手挂起时
+    /// RPC 会无限等待；显式建连由 `connect_timeout` 兜底，失败立即返回。
+    /// 装配链与 bootstrap 一致：归一化 → 超时 → TLS。
+    async fn channel_for(&self, endpoint: &str) -> Result<Channel, anyhow::Error> {
+        if let Some(ch) = self.channels.read().expect("读锁").get(endpoint) {
+            return Ok(ch.clone());
+        }
+        let ep = Endpoint::from_shared(endpoint.to_string())
+            .with_context(|| format!("非法端点 {endpoint}"))?
+            .connect_timeout(self.dial_timeout)
+            .timeout(self.request_timeout);
+        let ep = apply_endpoint_tls(ep, self.tls.as_ref())
+            .map_err(|e| anyhow!("端点 {endpoint} TLS 装配失败: {e}"))?;
+        let ch = ep
+            .connect()
+            .await
+            .with_context(|| format!("连接端点 {endpoint} 失败"))?;
+        self.channels
+            .write()
+            .expect("写锁")
+            .insert(endpoint.to_string(), ch.clone());
+        Ok(ch)
+    }
+
+    /// 数据面客户端（EventStore 服务）
+    pub async fn event_client(
+        &self,
+        endpoint: &str,
+    ) -> Result<EventStoreClient<Channel>, anyhow::Error> {
+        Ok(EventStoreClient::new(self.channel_for(endpoint).await?))
+    }
+
+    /// 管理面客户端（RaftAdmin 服务）
+    pub async fn admin_client(
+        &self,
+        endpoint: &str,
+    ) -> Result<RaftAdminClient<Channel>, anyhow::Error> {
+        Ok(RaftAdminClient::new(self.channel_for(endpoint).await?))
+    }
+
+    /// 调单个端点的 GetRaftState（NotFound 等状态原样返回）。
+    ///
+    /// pub(crate)：命令层（member list / status / 分片探测）直接复用。
+    pub(crate) async fn get_raft_state_via(
+        &self,
+        endpoint: &str,
+        shard_id: u64,
+    ) -> Result<GetRaftStateResponse, Status> {
+        let mut client = self
+            .admin_client(endpoint)
+            .await
+            .map_err(|e| Status::internal(format!("连接失败: {e}")))?;
+        let resp = client
+            .get_raft_state(GetRaftStateRequest { shard_id })
+            .await?
+            .into_inner();
+        Ok(resp)
+    }
+
+    /// 读操作：在任一可达端点执行。
+    ///
+    /// 依序尝试全部端点（轮询起点后移），第一个成功的返回；全部失败时
+    /// 汇总错误。读操作不可重试（天然幂等），故不解析 leader 提示。
+    pub async fn with_any_endpoint<T, F, Fut>(&self, f: F) -> Result<T, anyhow::Error>
+    where
+        F: Fn(EventStoreClient<Channel>) -> Fut,
+        Fut: Future<Output = Result<T, Status>>,
+    {
+        let mut errors: Vec<String> = Vec::new();
+        for ep in self.rotated_endpoints() {
+            match f(self.event_client(&ep).await?).await {
+                Ok(v) => return Ok(v),
+                Err(status) => errors.push(format!("{ep}: {}", status.message())),
+            }
+        }
+        Err(anyhow!(
+            "所有端点均不可用（{}）：{}",
+            self.endpoints.join(", "),
+            errors.join("；")
+        ))
+    }
+
+    /// 数据面写操作：打 leader。
+    ///
+    /// 组合策略：依序尝试各端点（轮询起点分散负载）→ `Unavailable` 且消息带
+    /// `leader_addr` 时优先重定向到该地址 → `leader unknown`（选举中）退避重试 →
+    /// `FailedPrecondition`（乐观冲突等）原样上抛。全部尝试完仍失败则报无 leader。
+    pub async fn with_leader<T, F, Fut>(&self, shard_id: u64, f: F) -> Result<T, anyhow::Error>
+    where
+        F: Fn(EventStoreClient<Channel>) -> Fut,
+        Fut: Future<Output = Result<T, Status>>,
+    {
+        // 重定向地址可能不在初始端点列表，总预算 = 初始端点 × 2 + 2 轮
+        let budget = self.endpoints.len() * 2 + 2;
+        let mut queue: VecDeque<String> = self.rotated_endpoints().into();
+        let mut tried: HashSet<String> = HashSet::new();
+
+        for _ in 0..budget {
+            let Some(target) = queue.pop_front() else {
+                break;
+            };
+            if !tried.insert(target.clone()) {
+                continue;
+            }
+            match f(self.event_client(&target).await?).await {
+                Ok(v) => return Ok(v),
+                Err(status) if status.code() == Code::Unavailable => {
+                    match parse_leader_hint(status.message()) {
+                        Some(addr) => {
+                            let norm = normalize_endpoint(&addr);
+                            if !tried.contains(&norm) {
+                                queue.push_front(norm); // 重定向优先
+                            }
+                        }
+                        // 提示缺失（选举中 leader unknown，或 leader_addr 为空）：
+                        // 本端点稍后重试，但先把队列里其它端点试完，避免死等
+                        None => {
+                            queue.push_back(target);
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                        }
+                    }
+                }
+                Err(status) if status.code() == Code::FailedPrecondition => {
+                    // 乐观冲突等不可重试错误，原样上抛（命令层据此翻译中文提示）
+                    let msg = status.message().to_string();
+                    return Err(anyhow!(msg));
+                }
+                Err(status) => {
+                    let msg = status.message().to_string();
+                    return Err(anyhow!(msg));
+                }
+            }
+        }
+        Err(anyhow!(
+            "未找到分片 {shard_id} 的 leader：所有端点无响应或集群处于选举中（端点: {}）",
+            self.endpoints.join(", ")
+        ))
+    }
+
+    /// 管理面写操作：先找 leader 端点，再在其上执行 f。
+    ///
+    /// 与数据面不同，管理面错误（admin_service）不带 leader 提示，只能靠
+    /// GetRaftState 主动探测：找到 `is_leader` 的端点即为目标。
+    /// 失败（如 leader 变更）最多重试 3 轮。
+    pub async fn with_admin_leader<T, F, Fut>(
+        &self,
+        shard_id: u64,
+        f: F,
+    ) -> Result<T, anyhow::Error>
+    where
+        F: Fn(RaftAdminClient<Channel>) -> Fut,
+        Fut: Future<Output = Result<T, Status>>,
+    {
+        let mut last_err: Option<String> = None;
+        for _ in 0..3 {
+            let (leader_ep, _) = self.find_leader(shard_id).await?;
+            match f(self.admin_client(&leader_ep).await?).await {
+                Ok(v) => return Ok(v),
+                Err(status) => {
+                    last_err = Some(format!("{leader_ep}: {}", status.message()));
+                    // leader 可能已变更，下一轮重新发现
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+        Err(anyhow!(
+            "分片 {shard_id} 管理操作失败（3 轮重试后）：{}",
+            last_err.unwrap_or_default()
+        ))
+    }
+
+    /// 找某分片的 leader：轮询全部端点取 GetRaftState。
+    ///
+    /// 返回 (leader 端点, leader 节点 ID)。全部端点 NotFound → 分片未初始化；
+    /// 其它错误 → 无 leader（选举中或不可达）。
+    pub async fn find_leader(&self, shard_id: u64) -> Result<(String, u64), anyhow::Error> {
+        let mut any_initialized = false;
+        let mut errors: Vec<String> = Vec::new();
+
+        for ep in self.rotated_endpoints() {
+            match self.get_raft_state_via(&ep, shard_id).await {
+                Ok(state) => {
+                    any_initialized = true;
+                    if state.is_leader {
+                        return Ok((ep, state.node_id));
+                    }
+                }
+                Err(status) if status.code() == Code::NotFound => {
+                    // 该端点未注册此分片：可能是分片数不一致的节点，继续看其它端点
+                }
+                Err(status) => errors.push(format!("{ep}: {}", status.message())),
+            }
+        }
+
+        if !any_initialized {
+            Err(anyhow!(
+                "分片 {shard_id} 未初始化：所有端点均返回 not_found（请先运行 esctl init）"
+            ))
+        } else {
+            Err(anyhow!(
+                "分片 {shard_id} 当前无 leader（选举中或全部端点不可达：{}）",
+                if errors.is_empty() {
+                    "无错误".into()
+                } else {
+                    errors.join("；")
+                }
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 解析leader提示_带地址() {
+        assert_eq!(
+            parse_leader_hint("not leader; leader_id=3 leader_addr=http://127.0.0.1:50052"),
+            Some("http://127.0.0.1:50052".to_string())
+        );
+    }
+
+    #[test]
+    fn 解析leader提示_地址为裸格式() {
+        assert_eq!(
+            parse_leader_hint("not leader; leader_id=1 leader_addr=127.0.0.1:50051"),
+            Some("127.0.0.1:50051".to_string())
+        );
+    }
+
+    #[test]
+    fn 解析leader提示_选举中返回None() {
+        assert_eq!(
+            parse_leader_hint("not leader; leader unknown, retry later"),
+            None
+        );
+    }
+
+    #[test]
+    fn 解析leader提示_噪声文本返回None() {
+        assert_eq!(parse_leader_hint("internal error: boom"), None);
+        assert_eq!(parse_leader_hint(""), None);
+        assert_eq!(
+            parse_leader_hint("not leader; leader_id=3"),
+            None,
+            "缺地址段"
+        );
+        assert_eq!(
+            parse_leader_hint("not leader; leader_id= leader_addr="),
+            None,
+            "空地址"
+        );
+    }
+
+    #[test]
+    fn 端点归一化去重保序() {
+        let client = ClusterClient::new(
+            &[
+                "127.0.0.1:50051".into(),
+                "http://127.0.0.1:50051".into(),
+                "https://n:50052".into(),
+            ],
+            None,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .expect("创建客户端");
+        assert_eq!(
+            client.endpoints(),
+            &[
+                "http://127.0.0.1:50051".to_string(),
+                "https://n:50052".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn 端点列表为空报错() {
+        assert!(
+            ClusterClient::new(&[], None, Duration::from_secs(1), Duration::from_secs(1)).is_err()
+        );
+    }
+
+    #[test]
+    fn 轮询游标逐次后移() {
+        let client = ClusterClient::new(
+            &["a:1".into(), "b:2".into()],
+            None,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .expect("创建客户端");
+        assert_eq!(client.rotated_endpoints(), vec!["http://a:1", "http://b:2"]);
+        assert_eq!(client.rotated_endpoints(), vec!["http://b:2", "http://a:1"]);
+        assert_eq!(client.rotated_endpoints(), vec!["http://a:1", "http://b:2"]);
+    }
+}

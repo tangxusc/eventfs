@@ -151,7 +151,7 @@ let target_shard = route(stream_id, num_shards_new);
 
 ```
 es-storage/src/reshard.rs   # 核心逻辑（已实现）
-es-server/src/bin/reshard.rs # CLI 封装（未实现，见「后续改进方向」）
+es-ctl/src/commands/reshard.rs # esctl reshard 命令（已实现，见「CLI 用法」）
 ```
 
 ### 函数签名（已实现，与代码一致）
@@ -175,23 +175,29 @@ pub struct ReshardReport {
 }
 ```
 
-### CLI 用法（未实现，计划中）
+### CLI 用法（已实现：`esctl reshard`）
 
 ```bash
-# 从 2 分片重分布到 4 分片
-cargo run --bin reshard -- \
+# 从 2 分片重分布到 4 分片（需集群停机、先备份数据；--yes 跳过交互确认）
+cargo build --bin esctl
+./target/debug/esctl reshard \
   --src-dir /var/lib/eventstore/data \
   --src-shards 2 \
   --dst-dir /var/lib/eventstore/data-new \
-  --dst-shards 4
+  --dst-shards 4 \
+  --yes
 
 # 输出示例
-Reshard started: 2 shards → 4 shards
-  Scanned 150 streams, 12,345 events from old layout
-  Wrote   150 streams, 12,345 events to new layout
-  Elapsed: 3.2s
-✓ Reshard complete. Verify the output and restart cluster with num_shards=4.
+重分布完成：2 分片 → 4 分片
+  源布局：   150 流，12345 事件
+  目标布局： 150 流，12345 事件
+  耗时：     3.2s
+警告：请修改配置 num_shards=4 后，用新数据目录重启集群；确认后删除旧目录。
 ```
+
+安全约束（fail-fast）：集群未停时数据目录被 LOCK 占用，命令直接拒绝；
+目标目录已存在且非空时需 `--yes` 确认覆盖；源/目标目录必须不同、分片数 ≥1。
+端到端测试见 `es-ctl/tests/reshard_test.rs`（数据完整、负例、LOCK 约束、json 输出）。
 
 ### 测试现状
 
@@ -217,9 +223,8 @@ Reshard started: 2 shards → 4 shards
 
 ## 后续改进方向
 
-- **CLI 封装**:`es-server/src/bin/reshard.rs` 命令行工具（见上文未实现的 CLI 用法）
-- **含数据测试**:补充写入真实数据 → reshard → 验证 version/event_id/position 连续性、
-  幂等索引可用的完整测试（当前仅空到空用例）
+- **含数据测试**：es-ctl 的 reshard_test 已覆盖（流/事件数一致、version/event_id 不变、
+  position 连续性、幂等索引可用）
 - **并行处理**:按目标分片并行归并与写入(当前串行)
 - **增量重分布**:记录已处理的流,中断后可续跑
 - **在线变更**:方案 B(分裂/合并)或方案 C(虚拟节点),需架构级改动

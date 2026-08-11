@@ -8,10 +8,10 @@ pub mod shard;
 
 pub use admin_service::RaftAdminService;
 pub use manager::ShardManager;
-pub use network::{normalize_endpoint, GrpcConnection, GrpcNetwork};
+pub use network::{GrpcConnection, GrpcNetwork, normalize_endpoint};
 pub use rpc_service::RaftRpcService;
 pub use shard::Shard;
 
 // 重导出常用类型
-pub use es_storage::TypeConfig;
 pub use es_proto::tls::TlsClientConfig;
+pub use es_storage::TypeConfig;
