@@ -169,6 +169,17 @@ mod tests {
         (cert, key)
     }
 
+    /// 生成一张带 CA:TRUE 约束的自签证书（等价 openssl req -x509 默认行为）
+    fn gen_ca_true_cert() -> (String, String) {
+        use rcgen::{BasicConstraints, IsCa};
+        let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()])
+            .expect("证书参数");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let key_pair = rcgen::KeyPair::generate().expect("生成密钥");
+        let cert = params.self_signed(&key_pair).expect("生成自签证书");
+        (cert.pem(), key_pair.serialize_pem())
+    }
+
     /// 用给定证书起一个 TLS 的 RaftAdmin 服务，返回 (https 地址, serve 句柄)
     async fn start_tls_admin_server(cert_pem: &str, key_pem: &str) -> (String, tokio::task::JoinHandle<()>) {
         let identity = tonic::transport::Identity::from_pem(cert_pem.as_bytes(), key_pem.as_bytes());
@@ -248,6 +259,21 @@ mod tests {
         let (other, _) = gen_cert();
         let err = probe_https(&addr, Some(&TlsClientConfig::Ca(other.into_bytes()))).await;
         assert!(err.is_err(), "CA 不匹配必须握手失败");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn https_ca_true自签证书_严格校验握手失败() {
+        // 边界：openssl req -x509 默认生成的证书带 CA:TRUE 约束，rustls 拒绝
+        // CA 证书作为端实体（CaUsedAsEndEntity）——生成证书时须显式 CA:FALSE
+        let (cert, key) = gen_ca_true_cert();
+        let (addr, handle) = start_tls_admin_server(&cert, &key).await;
+        let err = probe_https(&addr, Some(&TlsClientConfig::Ca(cert.into_bytes()))).await;
+        assert!(err.is_err(), "CA:TRUE 证书严格校验必须握手失败");
+        // 跳过校验模式不受影响（自签友好路径）
+        probe_https(&addr, Some(&TlsClientConfig::SkipVerify))
+            .await
+            .expect("跳过校验应成功");
         handle.abort();
     }
 }

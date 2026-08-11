@@ -118,11 +118,13 @@ addr = "127.0.0.1:50053"
 
 配置 `[tls]`（`cert_file` + `key_file`，PEM）即启用 TLS 监听；**TLS 部署时所有节点
 `peers.addr` 必须显式写 `https://` 前缀**（裸地址会被补成 `http://`，节点间会以明文
-直连 TLS 端口而失败）。证书可用 openssl 生成自签：
+直连 TLS 端口而失败）。证书可用 openssl 生成自签——**必须显式 `CA:FALSE`**（默认
+`CA:TRUE` 的证书在严格校验模式下会被 rustls 拒绝，报 `CaUsedAsEndEntity`）：
 
 ```bash
 openssl req -x509 -newkey rsa:2048 -nodes -keyout server.key -out server.crt \
-  -days 365 -subj "/CN=127.0.0.1" -addext "subjectAltName=IP:127.0.0.1"
+  -days 365 -subj "/CN=127.0.0.1" -addext "subjectAltName=IP:127.0.0.1" \
+  -addext "basicConstraints=critical,CA:FALSE"
 ```
 
 信任策略（节点间 RPC、RaftAdmin 探测、客户端 API 统一）：
