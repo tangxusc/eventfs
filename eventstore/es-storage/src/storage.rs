@@ -15,6 +15,7 @@ use es_core::{Error, Event, Result};
 /// EventStore 存储：单个分片的 Raft 日志与状态机
 ///
 /// 多个分片共享同一个 `Arc<surrealkv::Tree>`，通过 key 前缀隔离。
+/// 快照与业务数据分离：存于独立快照目录（snapshot_store）。
 #[derive(Clone)]
 pub struct EsStorage {
     shard_id: u64,
@@ -23,6 +24,8 @@ pub struct EsStorage {
     sm_cache: Arc<RwLock<SmCache>>,
     /// 事件广播通道：apply 成功后发送新事件，供 Subscribe 订阅
     event_tx: tokio::sync::broadcast::Sender<Event>,
+    /// 快照文件存储（独立目录，与业务数据分离）
+    snapshot_store: crate::snapshot::SnapshotStore,
 }
 
 /// 状态机缓存
@@ -37,10 +40,16 @@ impl EsStorage {
     /// 创建或打开存储。
     ///
     /// 注意：调用方需保证同一个 `tree` 上不同分片的 shard_id 互不相同，
-    /// 否则 key 前缀会冲突。
-    pub fn new(shard_id: u64, tree: Arc<surrealkv::Tree>) -> Result<Self> {
+    /// 否则 key 前缀会冲突。`snapshot` 描述快照目录/压缩/保留策略。
+    pub fn new(
+        shard_id: u64,
+        tree: Arc<surrealkv::Tree>,
+        snapshot: crate::snapshot::SnapshotConfig,
+    ) -> Result<Self> {
         // 创建事件广播通道，容量 1000（订阅者慢了会收到 Lagged 错误）
         let (event_tx, _rx) = tokio::sync::broadcast::channel(1000);
+        let snapshot_store = crate::snapshot::SnapshotStore::new(snapshot, shard_id)
+            .map_err(|e| Error::Storage(format!("快照目录初始化失败: {e}")))?;
 
         Ok(Self {
             shard_id,
@@ -50,7 +59,13 @@ impl EsStorage {
                 membership: Default::default(),
             })),
             event_tx,
+            snapshot_store,
         })
+    }
+
+    /// 获取快照存储（目录/保留/传输句柄）
+    pub fn snapshot_store(&self) -> &crate::snapshot::SnapshotStore {
+        &self.snapshot_store
     }
 
     /// 获取分片 ID

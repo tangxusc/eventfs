@@ -116,6 +116,7 @@ async fn start_node(
             data_dir: dir.path().to_path_buf(),
         },
         shards: ShardConfig { num_shards },
+        snapshot: Default::default(),
         tls: tls_config,
     };
 

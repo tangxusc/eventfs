@@ -15,11 +15,37 @@ pub struct Config {
     /// 分片配置
     pub shards: ShardConfig,
 
+    /// 快照配置（可选，可整体缺省）
+    #[serde(default)]
+    pub snapshot: SnapshotSection,
+
     /// TLS 配置（可选）。配置即启用 TLS 监听（cert_file+key_file 成对）；
     /// 节点间 RPC 与客户端 API 对 https:// 地址应用信任策略：
     /// ca_file 配置时严格校验，否则默认跳过校验（自签友好）。
     #[serde(default)]
     pub tls: Option<TlsConfig>,
+}
+
+/// 快照配置（[snapshot] 段）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SnapshotSection {
+    /// 快照压缩算法：zstd / lz4 / none
+    pub compression: es_storage::snapshot::Compression,
+    /// 保留历史快照数（含最新），build/install 后清理超出部分
+    pub keep: usize,
+    /// 快照目录；缺省为 {data_dir}/snapshots
+    pub dir: Option<PathBuf>,
+}
+
+impl Default for SnapshotSection {
+    fn default() -> Self {
+        Self {
+            compression: Default::default(), // zstd
+            keep: 3,
+            dir: None,
+        }
+    }
 }
 
 /// TLS 配置
@@ -90,6 +116,9 @@ impl Config {
         if self.shards.num_shards == 0 {
             return Err("[shards] num_shards 必须 ≥ 1".to_string());
         }
+        if self.snapshot.keep == 0 {
+            return Err("[snapshot] keep 必须 ≥ 1（keep=0 会删光全部快照）".to_string());
+        }
         if let Some(tls) = &self.tls {
             tls.validate()?;
         }
@@ -149,6 +178,7 @@ impl Default for Config {
                 data_dir: PathBuf::from("./data"),
             },
             shards: ShardConfig { num_shards: 8 },
+            snapshot: SnapshotSection::default(),
             tls: None,
         }
     }
@@ -286,5 +316,72 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn snapshot_keep_zero_rejected() {
+        let config = Config {
+            snapshot: SnapshotSection {
+                keep: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = config.validate().expect_err("keep=0 应报错");
+        assert!(err.contains("keep"), "错误应说明 keep: {err}");
+    }
+
+    #[test]
+    fn snapshot_section_deserializes_defaults() {
+        // [snapshot] 段整体缺省时使用默认值（zstd / keep=3 / 无目录覆盖）
+        let config: Config = toml::from_str(
+            r#"
+[node]
+id = 1
+listen_addr = "127.0.0.1:50051"
+
+[storage]
+data_dir = "./data"
+
+[shards]
+num_shards = 8
+"#,
+        )
+        .expect("配置解析");
+        assert_eq!(config.snapshot.compression, Default::default());
+        assert_eq!(config.snapshot.keep, 3);
+        assert!(config.snapshot.dir.is_none());
+    }
+
+    #[test]
+    fn snapshot_section_custom_values() {
+        let config: Config = toml::from_str(
+            r#"
+[node]
+id = 1
+listen_addr = "127.0.0.1:50051"
+
+[storage]
+data_dir = "./data"
+
+[shards]
+num_shards = 8
+
+[snapshot]
+compression = "lz4"
+keep = 5
+dir = "./snapshots"
+"#,
+        )
+        .expect("配置解析");
+        assert_eq!(
+            config.snapshot.compression,
+            es_storage::snapshot::Compression::Lz4
+        );
+        assert_eq!(config.snapshot.keep, 5);
+        assert_eq!(
+            config.snapshot.dir,
+            Some(PathBuf::from("./snapshots"))
+        );
     }
 }

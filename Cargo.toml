@@ -61,6 +61,12 @@ serde_json = "1.0"
 bincode = { version = "2.0", features = ["serde"] }
 toml = "0.9"
 
+# ---- 压缩（快照文件）----
+# zstd：默认快照压缩，压缩率高（绑定 C 的 zstd-sys）
+# lz4_flex：已在依赖树（surrealkv 传递依赖），纯 Rust，压缩速度快
+zstd = "0.13"
+lz4_flex = "0.12"
+
 # ---- 工具 ----
 # xxh3 算法固定，跨版本稳定，可安全用于持久化分片路由
 xxhash-rust = { version = "0.8.18", features = ["xxh3"] }

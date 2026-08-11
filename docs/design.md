@@ -50,7 +50,7 @@
 |---|---|---|
 | `storage-v2` | 启用 | 将 `RaftLogStorage`/`RaftStateMachine` 启用为 v2 存储，log IO 与状态机 IO 可并行；同时禁用 v1 兼容层 `Adapter`（我们直接实现 v2，不需要） |
 | `serde` | 启用 | 为 `Vote`、`Entry`、`AppendEntriesRequest` 等跨存储与网络边界的类型派生序列化，surrealkv 持久化与 gRPC payload 都依赖它 |
-| `generic-snapshot-data` | 不启用 | 保持默认，`SnapshotData` 沿用 `Cursor<Vec<u8>>`（满足 `AsyncRead + AsyncWrite + AsyncSeek + Unpin`），并可复用 openraft 提供的分块 `install_snapshot` 默认实现 |
+| `generic-snapshot-data` | 不启用 | 保持默认，`SnapshotData` 为自定义 `SnapshotFile`（包装 `tokio::fs::File`，满足 `AsyncRead + AsyncWrite + AsyncSeek + Unpin`），复用 openraft 提供的分块 `install_snapshot` 默认实现（Chunked 直接从文件流式读块，见 docs/snapshot.md） |
 | `single-term-leader` | 不启用 | 保持标准 `LogId = (term, node_id, index)` |
 | `loosen-follower-log-revert` | 不启用 | 官方明确警告勿用 |
 
@@ -147,8 +147,8 @@ Raft 日志区（每分片独立）
   [0x02][shard:BE8][0x05][event_id:16B]                   -> 幂等索引，值为 (stream, version)
   [0x02][shard:BE8][0x06]                                 -> next_position 计数器
 
-快照区
-  [0x03][shard:BE8][0x01]                   -> 当前快照元数据 + 数据
+快照区（已废弃：快照改为独立文件，见 docs/snapshot.md）
+  [0x03][shard:BE8][0x01]                   -> 旧版快照 key，启动时检测即删（仅升级清理用）
 ```
 
 ### 4.1 为什么 stream_id 前面要加长度前缀

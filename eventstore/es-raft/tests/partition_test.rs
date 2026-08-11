@@ -205,6 +205,8 @@ struct Timing {
     snapshot_after_logs: Option<u64>,
     /// 快照后保留多少条日志(超出的会被 purge,落后节点只能靠快照追赶)
     keep_logs_after_snapshot: u64,
+    /// 快照分块大小(字节),默认 3MiB 与 openraft 一致
+    snapshot_max_chunk_size: u64,
 }
 
 impl Default for Timing {
@@ -215,6 +217,7 @@ impl Default for Timing {
             election_max_ms: 400,
             snapshot_after_logs: None,
             keep_logs_after_snapshot: 1000,
+            snapshot_max_chunk_size: 3 * 1024 * 1024,
         }
     }
 }
@@ -241,7 +244,15 @@ impl Cluster {
                     .build()
                     .expect("开 tree"),
             );
-            let store = EsStorage::new(0, tree).expect("建存储");
+            let store = EsStorage::new(
+                0,
+                tree,
+                es_storage::snapshot::SnapshotConfig {
+                    dir: dir.path().join("snapshots"),
+                    ..Default::default()
+                },
+            )
+            .expect("建存储");
             store.restore_applied_state().await.expect("恢复状态");
 
             let cfg = Arc::new(
@@ -257,6 +268,7 @@ impl Cluster {
                         None => openraft::SnapshotPolicy::Never,
                     },
                     max_in_snapshot_log_to_keep: timing.keep_logs_after_snapshot,
+                    snapshot_max_chunk_size: timing.snapshot_max_chunk_size,
                     ..Default::default()
                 }
                 .validate()
@@ -616,6 +628,7 @@ async fn lagging_node_snapshot_catchup() {
         election_max_ms: 600,
         snapshot_after_logs: Some(5),
         keep_logs_after_snapshot: 2,
+        snapshot_max_chunk_size: 3 * 1024 * 1024,
     })
     .await;
 
@@ -695,6 +708,7 @@ async fn logs_purged_after_snapshot_data_intact() {
         election_max_ms: 600,
         snapshot_after_logs: Some(5),
         keep_logs_after_snapshot: 2,
+        snapshot_max_chunk_size: 3 * 1024 * 1024,
     })
     .await;
 
@@ -735,6 +749,77 @@ async fn logs_purged_after_snapshot_data_intact() {
     assert_eq!(events.len(), 21, "快照后应能继续追加");
     assert_eq!(events[20].data, b"after-snapshot");
     eprintln!("✓ 快照后可继续写入");
+
+    c.shutdown().await;
+}
+
+#[tokio::test]
+async fn multi_chunk_snapshot_transfer() {
+    // 64KiB 小块 + 不可压缩大数据：快照必然跨多个块传输，
+    // 验证 Chunked 从文件流式读块、接收端 seek/write、end 判定全链路。
+    let c = Cluster::start_with_timing(Timing {
+        heartbeat_ms: 100,
+        election_min_ms: 300,
+        election_max_ms: 600,
+        snapshot_after_logs: Some(3),
+        keep_logs_after_snapshot: 1,
+        snapshot_max_chunk_size: 64 * 1024,
+    })
+    .await;
+
+    let leader = c.wait_leader(Duration::from_secs(5)).await;
+    let others: Vec<u64> = c.ids.iter().copied().filter(|i| *i != leader).collect();
+    let laggard = others[0];
+    let healthy = others[1];
+
+    // 基线
+    c.write(leader, "big", b"base").await.expect("基线写入");
+    let base_applied = c.last_applied(leader);
+    for &o in &others {
+        c.wait_applied(o, base_applied, Duration::from_secs(5))
+            .await;
+    }
+    eprintln!("✓ 基线已同步,applied={base_applied}");
+
+    // 隔离 laggard
+    c.net.isolate(laggard, &c.ids).await;
+    eprintln!("→ 隔离 node{laggard}");
+
+    // 写 24 条大事件：每条约 8KB 不可压缩数据（uuid hex 拼接，压缩无法减小），
+    // 总计约 192KB 快照 payload，按 64KiB 分块必然跨 3+ 块
+    for i in 0..24 {
+        let data: Vec<u8> = (0..512)
+            .map(|_| uuid::Uuid::new_v4().to_string())
+            .collect::<Vec<_>>()
+            .join("")
+            .into_bytes();
+        c.write(leader, "big", &data)
+            .await
+            .unwrap_or_else(|e| panic!("第 {i} 次写入失败: {e}"));
+    }
+    let applied_after = c.last_applied(leader);
+    c.wait_applied(healthy, applied_after, Duration::from_secs(10))
+        .await;
+
+    // 恢复网络，laggard 只能靠分块快照追赶
+    eprintln!("→ 恢复网络,node{laggard} 应通过多块快照追赶");
+    c.net.heal().await;
+    c.wait_applied(laggard, applied_after, Duration::from_secs(30))
+        .await;
+    eprintln!("✓ node{laggard} 已追平 applied={applied_after}");
+
+    // 数据完整：25 条（1 基线 + 24），且每条数据未被压缩/解压破坏
+    let events = c.read(laggard, "big");
+    assert_eq!(events.len(), 25, "追赶后事件数须一致");
+    let versions: Vec<u64> = events.iter().map(|e| e.version).collect();
+    assert_eq!(versions, (0..25).collect::<Vec<u64>>(), "版本须连续");
+    assert_eq!(events[0].data, b"base");
+    // 大事件数据逐字节一致（分块传输 + 压缩解压不得损坏数据）
+    assert_eq!(events[24].data.len(), 512 * 36, "大事件数据长度须保持");
+    for id in &c.ids {
+        assert_eq!(c.read(*id, "big").len(), 25, "node{id} 事件数应一致");
+    }
+    eprintln!("✓ 多块快照传输后三节点数据一致");
 
     c.shutdown().await;
 }

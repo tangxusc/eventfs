@@ -35,6 +35,7 @@ async fn start_server() -> (String, Server, tempfile::TempDir) {
             data_dir: dir.path().to_path_buf(),
         },
         shards: ShardConfig { num_shards: 2 },
+        snapshot: Default::default(),
         tls: None,
     };
     let server = Server::new(config).expect("创建服务器");
@@ -572,7 +573,17 @@ async fn make_reshard_src(dir: &Path) -> (Vec<es_storage::EsStorage>, tempfile::
             .expect("建 src tree"),
     );
     let mut sts = (0..2u64)
-        .map(|id| es_storage::EsStorage::new(id, tree.clone()).expect("建存储"))
+        .map(|id| {
+            es_storage::EsStorage::new(
+                id,
+                tree.clone(),
+                es_storage::snapshot::SnapshotConfig {
+                    dir: dir.join("snapshots"),
+                    ..Default::default()
+                },
+            )
+            .expect("建存储")
+        })
         .collect::<Vec<_>>();
 
     let entry = |term: u64, index: u64, stream: &str, data: &[u8]| Entry {

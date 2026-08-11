@@ -53,6 +53,20 @@ impl Server {
 
         tracing::info!("Opened shared surrealkv tree at {:?}", self.config.storage.data_dir);
 
+        // 快照目录：缺省 {data_dir}/snapshots，独立于 surrealkv 业务数据文件
+        let snap_dir = self
+            .config
+            .snapshot
+            .dir
+            .clone()
+            .unwrap_or_else(|| self.config.storage.data_dir.join("snapshots"));
+        std::fs::create_dir_all(&snap_dir)?;
+        let snap_cfg = es_storage::snapshot::SnapshotConfig {
+            dir: snap_dir,
+            compression: self.config.snapshot.compression,
+            keep: self.config.snapshot.keep,
+        };
+
         // 节点间 Raft RPC 的客户端信任策略（https 对端生效；明文集群为 None）
         let client_tls: Option<es_raft::TlsClientConfig> = match &self.config.tls {
             Some(t) => Some(t.client_trust().map_err(anyhow::Error::msg)?),
@@ -61,7 +75,7 @@ impl Server {
 
         // 为每个分片创建存储 + Raft 节点
         for shard_id in 0..self.config.shards.num_shards {
-            let storage = EsStorage::new(shard_id, tree.clone())?;
+            let storage = EsStorage::new(shard_id, tree.clone(), snap_cfg.clone())?;
 
             // 恢复已应用状态（openraft 启动前必须调用，否则会从错误位置重放）
             storage.restore_applied_state().await?;
@@ -147,12 +161,24 @@ impl Server {
             if self.config.tls.is_some() { "https" } else { "http" }
         );
 
+        // 消息上限放宽到 8MB：快照分块默认 3MiB/块 + bincode 头，超出 tonic 默认
+        // 4MB 时 openraft 对 PayloadTooLarge 直接失败不重试（快照传输中断）。
+        // tonic 0.14 中该限制在服务级配置。
+        let event_store = es_proto::eventstore::event_store_server::EventStoreServer::new(
+            es_service,
+        )
+        .max_decoding_message_size(8 * 1024 * 1024);
+        let raft_rpc = es_proto::eventstore::raft_rpc_server::RaftRpcServer::new(raft_service)
+            .max_decoding_message_size(8 * 1024 * 1024);
+        let raft_admin = es_proto::eventstore::raft_admin_server::RaftAdminServer::new(
+            admin_service,
+        )
+        .max_decoding_message_size(8 * 1024 * 1024);
+
         server
-            .add_service(es_proto::eventstore::event_store_server::EventStoreServer::new(es_service))
-            .add_service(es_proto::eventstore::raft_rpc_server::RaftRpcServer::new(raft_service))
-            .add_service(es_proto::eventstore::raft_admin_server::RaftAdminServer::new(
-                admin_service,
-            ))
+            .add_service(event_store)
+            .add_service(raft_rpc)
+            .add_service(raft_admin)
             .serve(addr)
             .await?;
 

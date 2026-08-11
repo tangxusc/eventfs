@@ -103,6 +103,26 @@ esctl status [--shards <N>]
 对每个端点遍历全部分片探测 `GetRaftState`，输出可达性、leader 归属（leader_of /
 following_of）与 term。全部端点不可达时退出码 1。
 
+### 离线快照（snapshot list / restore）
+
+```
+esctl snapshot list <data_dir> [--snapshot-dir <DIR>]
+esctl snapshot restore <data_dir> <snapshot_file> [--snapshot-dir <DIR>] [--yes]
+```
+
+快照存独立文件（`{data_dir}/snapshots/snap-{shard}-{term}-{index}.esnap`，zstd/lz4 压缩）。
+`--snapshot-dir` 缺省 `{data_dir}/snapshots`；服务端配置了 `[snapshot].dir`
+自定义目录时须显式传入（否则 CLI 与服务器的快照视图不一致）。
+
+- **list**：列出全部快照文件（分片 / term / index / snapshot_id / 压缩算法 / 体积），
+  只读文件头不解压 payload；损坏文件标记「损坏」不中断。目录不存在时报错。
+- **restore**：把快照恢复到数据目录中对应分片（快照头记录分片号）。
+  **离线操作**：要求集群完全停机（LOCK 安全网，在线执行直接拒绝，退出码 1）；
+  非 `--yes` 时交互确认。恢复语义：该分片回到快照时刻——清空日志与状态机
+  （保留 vote），`raft_last_purged`/`raft_committed` 写回快照点，重启后以快照点
+  继续参与集群（单节点直接恢复领导；多节点由 leader 复制快照点之后的日志或新快照）。
+  与 etcd `snapshot restore` 等价但作用于单分片。
+
 ### 离线 reshard
 
 ```
@@ -156,7 +176,8 @@ SHARD  NODE  STATE     TERM  LEADER  LAST_APPLIED  VOTER
 | `--endpoints` / `-w` / `--dial-timeout` | 同左 | 全局参数对齐 |
 | `member list` / `member add/remove` | `member list` / `member add/remove` | 成员管理（esctl 按分片） |
 | `endpoint health` / `endpoint status` | `status` | 端点健康视图 |
-| `snapshot save/restore` | `reshard` | 离线数据操作（eventstore 无快照 RPC，以 reshard 对应） |
+| `snapshot save` | `snapshot list` | 快照已存独立文件，list 查看后可自行备份/拷贝 |
+| `snapshot restore` | `snapshot restore` | 离线恢复到快照点（作用于单分片，需停机） |
 | `auth enable` / `user add` 等 | — | eventstore 无认证机制 |
 
 ## 测试

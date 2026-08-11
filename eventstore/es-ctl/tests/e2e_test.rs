@@ -31,6 +31,7 @@ async fn start_server() -> (
             data_dir: dir.path().to_path_buf(),
         },
         shards: ShardConfig { num_shards: 2 },
+        snapshot: Default::default(),
         tls: None,
     };
 
@@ -92,6 +93,7 @@ async fn start_server_uninitialized(num_shards: u64) -> (
             data_dir: dir.path().to_path_buf(),
         },
         shards: ShardConfig { num_shards },
+        snapshot: Default::default(),
         tls: None,
     };
 
@@ -403,6 +405,7 @@ async fn https_self_signed_cert() {
             data_dir: dir.path().to_path_buf(),
         },
         shards: ShardConfig { num_shards: 1 },
+        snapshot: Default::default(),
         tls: None,
     };
     let server = Server::new(config).expect("创建服务器");
@@ -556,6 +559,7 @@ async fn start_two_nodes() -> (
                 data_dir: dir.path().to_path_buf(),
             },
             shards: ShardConfig { num_shards: 1 },
+            snapshot: Default::default(),
             tls: None,
         };
         let server = Server::new(config).expect("创建服务器");

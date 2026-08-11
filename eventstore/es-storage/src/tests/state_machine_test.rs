@@ -272,7 +272,12 @@ async fn applied_state_advances_and_recovers() {
             .with_path(path.clone())
             .build()
             .expect("开 tree");
-        let mut st = crate::EsStorage::new(0, std::sync::Arc::new(tree)).expect("建存储");
+        let mut st = crate::EsStorage::new(
+            0,
+            std::sync::Arc::new(tree),
+            crate::snapshot::SnapshotConfig { dir: dir.path().join("snapshots"), ..Default::default() },
+        )
+        .expect("建存储");
         st.apply(vec![append_entry(
             3,
             "s1",
@@ -292,7 +297,12 @@ async fn applied_state_advances_and_recovers() {
         .with_path(path)
         .build()
         .expect("重开 tree");
-    let mut st = crate::EsStorage::new(0, std::sync::Arc::new(tree)).expect("建存储");
+    let mut st = crate::EsStorage::new(
+            0,
+            std::sync::Arc::new(tree),
+            crate::snapshot::SnapshotConfig { dir: dir.path().join("snapshots"), ..Default::default() },
+        )
+        .expect("建存储");
     st.restore_applied_state().await.expect("恢复已应用状态");
 
     let (la, _) = st.applied_state().await.expect("读已应用状态");
@@ -583,5 +593,464 @@ async fn conflict_apply_no_broadcast() {
     assert!(
         rx.try_recv().is_err(),
         "乐观并发冲突时不能广播事件，否则订阅者会收到不存在的数据"
+    );
+}
+
+// ---- 快照文件化：压缩 / 保留 / 清理 / 损坏 ----
+
+/// 三种压缩算法下 build→get_current→install 全链路往返一致
+#[tokio::test]
+async fn snapshot_roundtrip_all_compressions() {
+    use openraft::RaftSnapshotBuilder;
+    use crate::snapshot::Compression;
+
+    for c in [Compression::Zstd, Compression::Lz4, Compression::None] {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let (mut src, _) = new_storage_cfg(
+            0,
+            crate::snapshot::SnapshotConfig {
+                dir: dir.path().join("snapshots"),
+                compression: c,
+                keep: 3,
+            },
+            dir,
+        );
+        for i in 0..5u64 {
+            src.apply(vec![append_entry(
+                i,
+                "s1",
+                ExpectedVersion::Any,
+                vec![new_event("E", &[i as u8])],
+            )])
+            .await
+            .expect("apply");
+        }
+
+        let snap = src.build_snapshot().await.expect("建快照");
+        assert_eq!(snap.meta.last_log_id, Some(log_id(1, 4)));
+        // 快照文件确实写在快照目录里（独立于业务数据 tree）
+        let snap_dir = src.snapshot_store().dir().to_path_buf();
+        assert!(snap_dir.join("..").join("snapshots").exists());
+
+        let cur = src.get_current_snapshot().await.expect("读当前快照");
+        let cur = cur.expect("建完快照后应有当前快照");
+        assert_eq!(cur.meta.snapshot_id, snap.meta.snapshot_id);
+
+        let (mut dst, _d2) = new_storage(0);
+        dst.install_snapshot(&cur.meta, cur.snapshot)
+            .await
+            .expect("装快照");
+
+        let evs = dst.read_stream_events("s1", 0, 0).expect("读流");
+        assert_eq!(evs.len(), 5, "快照恢复后事件数须一致（压缩 {:?}）", c);
+        let (la, _) = dst.applied_state().await.expect("读已应用状态");
+        assert_eq!(la, Some(log_id(1, 4)));
+    }
+}
+
+/// 多快照保留：build 超出 keep 时自动清理最旧快照文件
+#[tokio::test]
+async fn snapshot_retention_cleans_oldest() {
+    use openraft::RaftSnapshotBuilder;
+
+    let dir = tempfile::tempdir().expect("临时目录");
+    let (mut src, _) = new_storage_cfg(
+        0,
+        crate::snapshot::SnapshotConfig {
+            dir: dir.path().join("snapshots"),
+            compression: crate::snapshot::Compression::None,
+            keep: 2,
+        },
+        dir,
+    );
+
+    // 连续 apply + build 3 次，产生 (term=1, index=0/1/2) 三个快照
+    for i in 0..3u64 {
+        src.apply(vec![append_entry(
+            i,
+            "s1",
+            ExpectedVersion::Any,
+            vec![new_event("E", &[i as u8])],
+        )])
+        .await
+        .expect("apply");
+        src.build_snapshot().await.expect("建快照");
+    }
+
+    let files: Vec<_> = src.snapshot_store().list_entries().unwrap();
+    assert_eq!(files.len(), 2, "keep=2 应只保留最近 2 个快照");
+    // 保留的应是 index=1 与 index=2（最旧 index=0 被清理）
+    for f in &files {
+        let m = f.meta.as_ref().expect("meta");
+        let idx = m.last_log_id.expect("last_log_id").index;
+        assert!(idx >= 1, "最旧快照应被清理，残留 index={idx}");
+    }
+}
+
+/// 安装快照后保留策略同样生效（接收的快照计入历史）
+#[tokio::test]
+async fn snapshot_install_respects_retention() {
+    use openraft::RaftSnapshotBuilder;
+
+    let dir = tempfile::tempdir().expect("临时目录");
+    // 目标存储已有 2 个历史快照文件（index=0/1）。
+    // 注意：必须持有 TempDir（解构丢弃会立即删目录）。
+    let (mut dst, _dst_dir) = new_storage_cfg(
+        0,
+        crate::snapshot::SnapshotConfig {
+            dir: dir.path().join("snapshots"),
+            compression: crate::snapshot::Compression::None,
+            keep: 2,
+        },
+        dir,
+    );
+    for i in 0..2u64 {
+        dst.apply(vec![append_entry(
+            i,
+            "s1",
+            ExpectedVersion::Any,
+            vec![new_event("E", &[i as u8])],
+        )])
+        .await
+        .expect("apply");
+        dst.build_snapshot().await.expect("建快照");
+    }
+
+    // 源存储生成 index=2 的快照，安装到目标。
+    // 用真实接收路径模拟：begin_receiving_snapshot 创建 temp 文件 → 写入
+    // 快照内容（openraft Chunked 的行为）→ install（转正 + 保留清理）。
+    let (mut src, _d2) = new_storage(0);
+    for i in 0..3u64 {
+        src.apply(vec![append_entry(
+            i,
+            "s1",
+            ExpectedVersion::Any,
+            vec![new_event("E", &[i as u8])],
+        )])
+        .await
+        .expect("apply");
+    }
+    let snap = src.build_snapshot().await.expect("建快照");
+    let src_bytes = std::fs::read(snap.snapshot.path()).expect("读快照内容");
+    let mut recv = dst.begin_receiving_snapshot().await.expect("开始接收");
+    {
+        use tokio::io::AsyncWriteExt;
+        recv.write_all(&src_bytes).await.expect("写入接收文件");
+        // shutdown 刷出 tokio File 内部缓冲（openraft Chunked 在传输完成时
+        // 同样调用 shutdown，见 snapshot_transport.rs done 分支）——缺了它
+        // 数据停留在 tokio 用户态缓冲，文件系统里仍是空的
+        recv.shutdown().await.expect("刷出缓冲");
+        // 确认接收文件确实写入了完整内容
+        let written = std::fs::metadata(recv.path())
+            .expect("接收文件应存在")
+            .len();
+        assert_eq!(
+            written as usize,
+            src_bytes.len(),
+            "接收文件应写入完整快照内容"
+        );
+    }
+    dst.install_snapshot(&snap.meta, recv).await.expect("装快照");
+
+    let files: Vec<_> = dst.snapshot_store().list_entries().unwrap();
+    assert_eq!(files.len(), 2, "install 后仍应只保留 keep 个");
+    for f in &files {
+        let m = f.meta.as_ref().expect("meta");
+        let idx = m.last_log_id.expect("last_log_id").index;
+        assert!(idx >= 1, "install 后最旧快照应被清理，残留 index={idx}");
+    }
+    // 转正成功：接收的快照文件进入 dst 快照目录
+    assert!(
+        files.iter().any(|f| f.meta.as_ref().unwrap().last_log_id.unwrap().index == 2),
+        "接收的快照应转正为正式文件"
+    );
+}
+
+/// 启动清理：旧版 snapshot_current key 与 incoming 残留临时文件一并删除
+#[tokio::test]
+async fn snapshot_startup_cleanup_legacy() {
+    let (st, _dir) = new_storage(0);
+    let shard = st.shard_id();
+
+    // 预置旧版快照 key（旧格式数据，可丢弃）与残留临时文件
+    let old_key = crate::key::snapshot_current(shard);
+    st.set(&old_key, b"legacy-format").await.expect("写旧 key");
+    let incoming = st.snapshot_store().incoming_dir();
+    std::fs::create_dir_all(&incoming).expect("建 incoming");
+    std::fs::write(incoming.join("stale.tmp"), b"partial").expect("写残留");
+    assert!(st.get(&old_key).unwrap().is_some(), "旧 key 应存在");
+
+    // 启动恢复路径执行清理
+    st.restore_applied_state().await.expect("恢复状态");
+
+    assert!(st.get(&old_key).unwrap().is_none(), "旧版快照 key 应被删除");
+    assert!(!incoming.join("stale.tmp").exists(), "残留临时文件应被清理");
+}
+
+/// 损坏的最新快照被跳过：get_current_snapshot 返回仍有效的快照
+#[tokio::test]
+async fn snapshot_corrupted_latest_skipped() {
+    use openraft::RaftSnapshotBuilder;
+    use crate::snapshot::Compression;
+
+    let dir = tempfile::tempdir().expect("临时目录");
+    let (mut src, _) = new_storage_cfg(
+        0,
+        crate::snapshot::SnapshotConfig {
+            dir: dir.path().join("snapshots"),
+            compression: Compression::None,
+            keep: 3,
+        },
+        dir,
+    );
+    src.apply(vec![append_entry(
+        0,
+        "s1",
+        ExpectedVersion::Any,
+        vec![new_event("E", b"a")],
+    )])
+    .await
+    .expect("apply");
+    src.build_snapshot().await.expect("建快照");
+
+    // 写一个损坏的"更新"快照文件（index=99，内容不是合法快照）
+    let bad = src.snapshot_store().final_path(Some(log_id(1, 99)));
+    std::fs::write(&bad, b"corrupted").expect("写坏文件");
+
+    // latest 跳过损坏文件，返回 index=0 的有效快照
+    let cur = src.get_current_snapshot().await.expect("读当前快照");
+    let cur = cur.expect("应有有效快照");
+    assert_eq!(
+        cur.meta.last_log_id.expect("last_log_id").index,
+        0,
+        "损坏的最新快照应被跳过，返回有效快照"
+    );
+}
+
+/// 空快照（无数据 build）可建可装
+#[tokio::test]
+async fn snapshot_empty_build_install() {
+    use openraft::RaftSnapshotBuilder;
+
+    let (mut src, _) = new_storage(0);
+    let snap = src.build_snapshot().await.expect("建空快照");
+    assert_eq!(snap.meta.last_log_id, None, "空快照 last_log_id 为 None");
+    // 文件名用哨兵 term=0/index=0
+    let fname = src
+        .snapshot_store()
+        .final_path(None)
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(fname.ends_with("-00000000000000000000-00000000000000000000.esnap"));
+
+    let (mut dst, _d2) = new_storage(0);
+    dst.install_snapshot(&snap.meta, snap.snapshot)
+        .await
+        .expect("装空快照");
+    let evs = dst.read_stream_events("s1", 0, 0).expect("读流");
+    assert!(evs.is_empty(), "空快照装完无数据");
+}
+
+/// 离线 restore：恢复到快照点，清空日志与后续数据
+#[tokio::test]
+async fn snapshot_restore_to_point_in_time() {
+    use openraft::RaftSnapshotBuilder;
+    use openraft::storage::RaftLogStorage;
+    use crate::snapshot::restore;
+
+    // 源：apply 5 条（index 0..4）后建快照，再 apply 3 条（恢复点之后的数据）
+    let (mut src, _d1) = new_storage(0);
+    for i in 0..5u64 {
+        src.apply(vec![append_entry(
+            i,
+            "s1",
+            ExpectedVersion::Any,
+            vec![new_event("E", &[i as u8])],
+        )])
+        .await
+        .expect("apply");
+    }
+    let snap = src.build_snapshot().await.expect("建快照");
+    for i in 5..8u64 {
+        src.apply(vec![append_entry(
+            i,
+            "s1",
+            ExpectedVersion::Any,
+            vec![new_event("E", &[i as u8])],
+        )])
+        .await
+        .expect("apply");
+    }
+
+    // 目标：先有"被清掉"的数据与日志
+    let dir = tempfile::tempdir().expect("临时目录");
+    let tree_path = dir.path().to_path_buf();
+    let snap_dir = dir.path().join("snapshots");
+    let tree = Arc::new(
+        surrealkv::TreeBuilder::new()
+            .with_path(tree_path.clone())
+            .build()
+            .expect("打开 tree"),
+    );
+    {
+        let dst_dir = tempfile::tempdir().expect("临时目录");
+        let (mut dst, _dst_dir) = new_storage_cfg(
+            0,
+            crate::snapshot::SnapshotConfig {
+                dir: snap_dir.clone(),
+                ..Default::default()
+            },
+            dst_dir,
+        );
+        dst.apply(vec![append_entry(
+            0,
+            "stale",
+            ExpectedVersion::Any,
+            vec![new_event("E", b"stale")],
+        )])
+        .await
+        .expect("apply");
+        dst.set(&crate::key::raft_vote(0), b"{\"term\":9}").await.unwrap();
+        dst.close().await.expect("关闭");
+    }
+
+    // 离线 restore（cluster 停机后操作）
+    let report = restore(tree.clone(), 0, snap.snapshot.path(), &snap_dir)
+        .await
+        .expect("restore");
+    assert_eq!(report.shard_id, 0);
+    assert_eq!(report.events, 5, "恢复 5 条事件");
+    assert_eq!(report.term, 1);
+    assert_eq!(report.index, 4);
+
+    // 收尾：关闭 tree 释放 LOCK，才能重开验证（esctl 同样先关再收尾）
+    tree.flush_wal(true).expect("flush");
+    tree.close().await.expect("关闭 tree");
+
+    // 重启存储验证：数据回到快照点，日志清空，基线一致
+    let tree2 = Arc::new(
+        surrealkv::TreeBuilder::new()
+            .with_path(tree_path)
+            .build()
+            .expect("重开 tree"),
+    );
+    let mut st2 = crate::EsStorage::new(
+        0,
+        tree2,
+        crate::snapshot::SnapshotConfig {
+            dir: snap_dir,
+            ..Default::default()
+        },
+    )
+    .expect("建存储");
+
+    // 旧流被清掉
+    assert!(st2.read_stream_events("stale", 0, 0).unwrap().is_empty());
+    // 快照点数据在
+    let evs = st2.read_stream_events("s1", 0, 0).unwrap();
+    assert_eq!(evs.len(), 5, "恢复到快照点，5 条事件");
+    let vs: Vec<u64> = evs.iter().map(|e| e.version).collect();
+    assert_eq!(vs, vec![0, 1, 2, 3, 4]);
+    // 日志区清空 + 基线写回：get_log_state 回落 last_purged = 快照点
+    st2.restore_applied_state().await.unwrap();
+    let log_state = st2.get_log_state().await.expect("读日志状态");
+    assert_eq!(
+        log_state.last_log_id,
+        Some(log_id(1, 4)),
+        "日志基线应回到快照点"
+    );
+    assert_eq!(
+        st2.read_committed().await.unwrap(),
+        Some(log_id(1, 4)),
+        "committed 应写回快照点"
+    );
+    let (la, _) = st2.applied_state().await.unwrap();
+    assert_eq!(la, Some(log_id(1, 4)), "applied 应回到快照点");
+}
+
+/// restore 分片不匹配必须拒绝
+#[tokio::test]
+async fn snapshot_restore_shard_mismatch_rejected() {
+    use openraft::RaftSnapshotBuilder;
+    use crate::snapshot::restore;
+
+    let (mut src, _d1) = new_storage(0);
+    src.apply(vec![append_entry(
+        0,
+        "s1",
+        ExpectedVersion::Any,
+        vec![new_event("E", b"x")],
+    )])
+    .await
+    .expect("apply");
+    let snap = src.build_snapshot().await.expect("建快照");
+
+    let dir = tempfile::tempdir().expect("临时目录");
+    let tree = Arc::new(
+        surrealkv::TreeBuilder::new()
+            .with_path(dir.path().to_path_buf())
+            .build()
+            .expect("打开 tree"),
+    );
+    let err = restore(tree.clone(), 1, snap.snapshot.path(), &dir.path().join("snapshots"))
+        .await
+        .expect_err("分片不匹配应报错");
+    assert!(
+        err.to_string().contains("分片"),
+        "错误应说明分片不匹配: {err}"
+    );
+}
+
+/// restore 后快照目录只剩恢复的快照（旧文件被清除）
+#[tokio::test]
+async fn snapshot_restore_replaces_snapshot_dir() {
+    use openraft::RaftSnapshotBuilder;
+    use crate::snapshot::restore;
+
+    let (mut src, _d1) = new_storage(0);
+    for i in 0..3u64 {
+        src.apply(vec![append_entry(
+            i,
+            "s1",
+            ExpectedVersion::Any,
+            vec![new_event("E", &[i as u8])],
+        )])
+        .await
+        .expect("apply");
+    }
+    let snap = src.build_snapshot().await.expect("建快照");
+
+    let dir = tempfile::tempdir().expect("临时目录");
+    // 目标快照目录里预置一个合法但陈旧的分片 0 快照文件（恢复后必须被清除）。
+    // 用合法文件而非 junk：清理按文件头分片过滤，损坏文件无法判断分片会被保留
+    let snap_dir = dir.path().join("snapshots");
+    std::fs::create_dir_all(&snap_dir).unwrap();
+    let stale = snap_dir.join("snap-00000000-00000000000000000099-00000000000000000099.esnap");
+    std::fs::copy(snap.snapshot.path(), &stale).unwrap();
+
+    let tree = Arc::new(
+        surrealkv::TreeBuilder::new()
+            .with_path(dir.path().to_path_buf())
+            .build()
+            .expect("打开 tree"),
+    );
+    let report = restore(tree, 0, snap.snapshot.path(), &snap_dir)
+        .await
+        .expect("restore");
+
+    // 目录只剩恢复的快照文件（旧假文件被清）
+    let entries: Vec<_> = std::fs::read_dir(&snap_dir).unwrap().collect();
+    let names: Vec<String> = entries
+        .into_iter()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".esnap"))
+        .collect();
+    assert_eq!(names.len(), 1, "恢复后只应有当前快照: {names:?}");
+    assert_eq!(
+        report.snapshot_file.file_name().unwrap().to_str().unwrap(),
+        names[0]
     );
 }

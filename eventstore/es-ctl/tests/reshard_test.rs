@@ -25,6 +25,7 @@ async fn start_and_write() -> (tempfile::TempDir, Server, usize) {
             data_dir: dir.path().to_path_buf(),
         },
         shards: ShardConfig { num_shards: 2 },
+        snapshot: Default::default(),
         tls: None,
     };
 
@@ -318,6 +319,7 @@ async fn reshard_lock_held_rejected() {
             data_dir: dir.path().to_path_buf(),
         },
         shards: ShardConfig { num_shards: 1 },
+        snapshot: Default::default(),
         tls: None,
     };
     let server = Server::new(config).expect("创建服务器");

@@ -14,6 +14,7 @@ pub mod member;
 pub mod meta;
 pub mod read;
 pub mod reshard;
+pub mod snapshot;
 pub mod status;
 pub mod watch;
 

@@ -73,7 +73,7 @@ pub async fn reshard(
     let mut streams_by_new_shard: BTreeMap<u64, Vec<(String, StreamMeta)>> = BTreeMap::new();
 
     for old_shard in 0..src_num_shards {
-        let store = EsStorage::new(old_shard, src_tree.clone())?;
+        let store = EsStorage::new(old_shard, src_tree.clone(), Default::default())?;
         let streams = store.list_streams()?;
         src_streams_total += streams.len();
 
@@ -138,7 +138,7 @@ async fn process_shard(
     let mut all_events: Vec<Event> = Vec::new();
     for (stream_id, _meta) in &streams {
         let old_shard = es_core::route(stream_id, src_num_shards);
-        let old_store = EsStorage::new(old_shard, src_tree.clone())?;
+        let old_store = EsStorage::new(old_shard, src_tree.clone(), Default::default())?;
         let events = old_store.read_stream_events(stream_id, 0, 0)?;
         all_events.extend(events);
     }
@@ -350,7 +350,7 @@ mod tests {
         assert_eq!(report.dst_events, 3, "目标应写入 3 条事件");
 
         // 流 B 必须迁移成功（旧实现从分片 1 读 B → 事件丢失）
-        let dst_store = EsStorage::new(es_core::route(&b, 2), dst).expect("目标存储");
+        let dst_store = EsStorage::new(es_core::route(&b, 2), dst, Default::default()).expect("目标存储");
         let evs = dst_store.read_stream_events(&b, 0, 0).expect("读流 B");
         assert_eq!(evs.len(), 1, "流 B 的事件不应丢失");
         assert_eq!(evs[0].data, b"b1");

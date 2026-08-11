@@ -12,17 +12,34 @@ use std::sync::Arc;
 use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
 
 use crate::raft_type::TypeConfig;
+use crate::snapshot::SnapshotConfig;
 use crate::{EsRequest, EsStorage};
 use es_core::{ExpectedVersion, NewEvent};
 
 /// 在临时目录建一个存储实例。TempDir 必须由调用方持有，drop 即删目录。
 pub(crate) fn new_storage(shard_id: u64) -> (EsStorage, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("建临时目录");
+    new_storage_cfg(
+        shard_id,
+        SnapshotConfig {
+            dir: dir.path().join("snapshots"),
+            ..Default::default()
+        },
+        dir,
+    )
+}
+
+/// 用指定快照配置建存储（压缩/保留参数化测试用）
+pub(crate) fn new_storage_cfg(
+    shard_id: u64,
+    snap: SnapshotConfig,
+    dir: tempfile::TempDir,
+) -> (EsStorage, tempfile::TempDir) {
     let tree = surrealkv::TreeBuilder::new()
         .with_path(dir.path().to_path_buf())
         .build()
         .expect("打开 tree");
-    let st = EsStorage::new(shard_id, Arc::new(tree)).expect("建存储");
+    let st = EsStorage::new(shard_id, Arc::new(tree), snap).expect("建存储");
     (st, dir)
 }
 
@@ -39,7 +56,13 @@ pub(crate) fn new_shared_storages(
     );
     let sts = shard_ids
         .iter()
-        .map(|&id| EsStorage::new(id, tree.clone()).expect("建存储"))
+        .map(|&id| {
+            let snap = SnapshotConfig {
+                dir: dir.path().join("snapshots"),
+                ..Default::default()
+            };
+            EsStorage::new(id, tree.clone(), snap).expect("建存储")
+        })
         .collect();
     (sts, dir)
 }

@@ -39,5 +39,15 @@ ca_file = "./certs/ca.crt"   # 可选；删掉本行则跳过校验
 [storage]
 data_dir = "./data/node1"
 
+# 快照配置（可选，可整体缺省；缺省值见注释）
+# compression：快照压缩算法，zstd（压缩率高）/ lz4（速度快）/ none（不压缩）；
+#              快照文件头记录算法，读取时自动识别，节点间可混用不同算法
+# keep：保留历史快照数（含最新），超出部分自动清理；默认 3
+# dir：快照目录，缺省为 {data_dir}/snapshots（独立于业务数据文件）
+[snapshot]
+compression = "zstd"
+keep = 3
+# dir = "./data/node1/snapshots"
+
 [shards]
 num_shards = 8
