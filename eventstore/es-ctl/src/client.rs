@@ -106,14 +106,22 @@ impl ClusterClient {
     /// TLS 握手在 hyper 连接池层进行，不受 tower `timeout` 覆盖，握手挂起时
     /// RPC 会无限等待；显式建连由 `connect_timeout` 兜底，失败立即返回。
     /// 装配链与 bootstrap 一致：归一化 → 超时 → TLS。
+    ///
+    /// 超时值 0 = 不设超时：tonic 的 `.timeout()`/`.connect_timeout()` 不接受
+    /// 禁用开关，`Duration::ZERO` 会让 GrpcTimeout 的 sleep(0) 首次 poll 即到期，
+    /// 所有 RPC 立即失败——只能条件装配。
     async fn channel_for(&self, endpoint: &str) -> Result<Channel, anyhow::Error> {
         if let Some(ch) = self.channels.read().expect("读锁").get(endpoint) {
             return Ok(ch.clone());
         }
-        let ep = Endpoint::from_shared(endpoint.to_string())
-            .with_context(|| format!("非法端点 {endpoint}"))?
-            .connect_timeout(self.dial_timeout)
-            .timeout(self.request_timeout);
+        let mut ep = Endpoint::from_shared(endpoint.to_string())
+            .with_context(|| format!("非法端点 {endpoint}"))?;
+        if !self.dial_timeout.is_zero() {
+            ep = ep.connect_timeout(self.dial_timeout);
+        }
+        if !self.request_timeout.is_zero() {
+            ep = ep.timeout(self.request_timeout);
+        }
         let ep = apply_endpoint_tls(ep, self.tls.as_ref())
             .map_err(|e| anyhow!("端点 {endpoint} TLS 装配失败: {e}"))?;
         let ch = ep
@@ -165,7 +173,7 @@ impl ClusterClient {
     /// 读操作：在任一可达端点执行。
     ///
     /// 依序尝试全部端点（轮询起点后移），第一个成功的返回；全部失败时
-    /// 汇总错误。读操作不可重试（天然幂等），故不解析 leader 提示。
+    /// 汇总错误（含建连失败）。读操作不可重试（天然幂等），故不解析 leader 提示。
     pub async fn with_any_endpoint<T, F, Fut>(&self, f: F) -> Result<T, anyhow::Error>
     where
         F: Fn(EventStoreClient<Channel>) -> Fut,
@@ -173,7 +181,15 @@ impl ClusterClient {
     {
         let mut errors: Vec<String> = Vec::new();
         for ep in self.rotated_endpoints() {
-            match f(self.event_client(&ep).await?).await {
+            let client = match self.event_client(&ep).await {
+                Ok(c) => c,
+                // 建连失败：本端点不可用，继续尝试下一个（故障转移）
+                Err(e) => {
+                    errors.push(format!("{ep}: 连接失败: {e:#}"));
+                    continue;
+                }
+            };
+            match f(client).await {
                 Ok(v) => return Ok(v),
                 Err(status) => errors.push(format!("{ep}: {}", status.message())),
             }
@@ -199,6 +215,7 @@ impl ClusterClient {
         let budget = self.endpoints.len() * 2 + 2;
         let mut queue: VecDeque<String> = self.rotated_endpoints().into();
         let mut tried: HashSet<String> = HashSet::new();
+        let mut errors: Vec<String> = Vec::new();
 
         for _ in 0..budget {
             let Some(target) = queue.pop_front() else {
@@ -207,19 +224,30 @@ impl ClusterClient {
             if !tried.insert(target.clone()) {
                 continue;
             }
-            match f(self.event_client(&target).await?).await {
+            let client = match self.event_client(&target).await {
+                Ok(c) => c,
+                // 建连失败：本端点不可用，继续试下一个（不重入队，避免空转）
+                Err(e) => {
+                    errors.push(format!("{target}: 连接失败: {e:#}"));
+                    continue;
+                }
+            };
+            match f(client).await {
                 Ok(v) => return Ok(v),
                 Err(status) if status.code() == Code::Unavailable => {
                     match parse_leader_hint(status.message()) {
                         Some(addr) => {
                             let norm = normalize_endpoint(&addr);
-                            if !tried.contains(&norm) {
-                                queue.push_front(norm); // 重定向优先
-                            }
+                            // 重定向地址即使已试过也值得重试：它可能正处于选举中
+                            // （返回 unknown），重试有界（预算 2N+2）
+                            queue.push_front(norm); // 重定向优先
                         }
                         // 提示缺失（选举中 leader unknown，或 leader_addr 为空）：
-                        // 本端点稍后重试，但先把队列里其它端点试完，避免死等
+                        // 本端点稍后重试，但先把队列里其它端点试完，避免死等。
+                        // tried.remove 是关键：否则 push_back 后再次 pop 时会被
+                        // tried 集合挡下，重试永远不会发生（死代码）。
                         None => {
+                            tried.remove(&target);
                             queue.push_back(target);
                             tokio::time::sleep(Duration::from_millis(200)).await;
                         }
@@ -237,8 +265,13 @@ impl ClusterClient {
             }
         }
         Err(anyhow!(
-            "未找到分片 {shard_id} 的 leader：所有端点无响应或集群处于选举中（端点: {}）",
-            self.endpoints.join(", ")
+            "未找到分片 {shard_id} 的 leader：所有端点无响应或集群处于选举中（端点: {}{}）",
+            self.endpoints.join(", "),
+            if errors.is_empty() {
+                String::new()
+            } else {
+                format!("；详情: {}", errors.join("；"))
+            }
         ))
     }
 
@@ -246,7 +279,8 @@ impl ClusterClient {
     ///
     /// 与数据面不同，管理面错误（admin_service）不带 leader 提示，只能靠
     /// GetRaftState 主动探测：找到 `is_leader` 的端点即为目标。
-    /// 失败（如 leader 变更）最多重试 3 轮。
+    /// leader 探测失败（选举中/端点不可达）与 RPC 失败都纳入 3 轮重试；
+    /// 只有「分片未初始化」是永久错误，直接返回。
     pub async fn with_admin_leader<T, F, Fut>(
         &self,
         shard_id: u64,
@@ -258,12 +292,34 @@ impl ClusterClient {
     {
         let mut last_err: Option<String> = None;
         for _ in 0..3 {
-            let (leader_ep, _) = self.find_leader(shard_id).await?;
-            match f(self.admin_client(&leader_ep).await?).await {
+            let (leader_ep, _) = match self.try_find_leader(shard_id).await {
+                Ok(v) => v,
+                Err(LeaderLookupError::NotInitialized) => {
+                    // 永久错误：重试无意义（消息与 find_leader 一致，命令层据此翻译）
+                    return Err(anyhow!(
+                        "分片 {shard_id} 未初始化：所有端点均返回 not_found（请先运行 esctl init）"
+                    ));
+                }
+                Err(LeaderLookupError::NoLeader { detail }) => {
+                    last_err = Some(format!("leader 探测失败：{detail}"));
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            let client = match self.admin_client(&leader_ep).await {
+                Ok(c) => c,
+                // 建连失败：瞬态，下一轮重新探测
+                Err(e) => {
+                    last_err = Some(format!("{leader_ep}: 连接失败: {e:#}"));
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            match f(client).await {
                 Ok(v) => return Ok(v),
                 Err(status) => {
                     last_err = Some(format!("{leader_ep}: {}", status.message()));
-                    // leader 可能已变更，下一轮重新发现
+                    // leader 可能已变更或 CAS 冲突，下一轮重新发现并重试
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
@@ -276,9 +332,21 @@ impl ClusterClient {
 
     /// 找某分片的 leader：轮询全部端点取 GetRaftState。
     ///
-    /// 返回 (leader 端点, leader 节点 ID)。全部端点 NotFound → 分片未初始化；
-    /// 其它错误 → 无 leader（选举中或不可达）。
+    /// 返回 (leader 端点, leader 节点 ID)。
     pub async fn find_leader(&self, shard_id: u64) -> Result<(String, u64), anyhow::Error> {
+        match self.try_find_leader(shard_id).await {
+            Ok(v) => Ok(v),
+            Err(LeaderLookupError::NotInitialized) => Err(anyhow!(
+                "分片 {shard_id} 未初始化：所有端点均返回 not_found（请先运行 esctl init）"
+            )),
+            Err(LeaderLookupError::NoLeader { detail }) => Err(anyhow!(
+                "分片 {shard_id} 当前无 leader（选举中或全部端点不可达：{detail}）"
+            )),
+        }
+    }
+
+    /// 结构化版本的 find_leader：错误按可重试性分类，供 with_admin_leader 使用。
+    async fn try_find_leader(&self, shard_id: u64) -> Result<(String, u64), LeaderLookupError> {
         let mut any_initialized = false;
         let mut errors: Vec<String> = Vec::new();
 
@@ -298,20 +366,25 @@ impl ClusterClient {
         }
 
         if !any_initialized {
-            Err(anyhow!(
-                "分片 {shard_id} 未初始化：所有端点均返回 not_found（请先运行 esctl init）"
-            ))
+            Err(LeaderLookupError::NotInitialized)
         } else {
-            Err(anyhow!(
-                "分片 {shard_id} 当前无 leader（选举中或全部端点不可达：{}）",
-                if errors.is_empty() {
+            Err(LeaderLookupError::NoLeader {
+                detail: if errors.is_empty() {
                     "无错误".into()
                 } else {
                     errors.join("；")
-                }
-            ))
+                },
+            })
         }
     }
+}
+
+/// leader 探测失败的原因：区分永久错误与瞬态错误，调用方决定是否重试。
+enum LeaderLookupError {
+    /// 分片未初始化：所有端点均 not_found，重试无意义
+    NotInitialized,
+    /// 选举中或全部端点不可达：瞬态，可重试
+    NoLeader { detail: String },
 }
 
 #[cfg(test)]

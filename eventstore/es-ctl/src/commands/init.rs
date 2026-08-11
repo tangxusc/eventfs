@@ -33,8 +33,17 @@ pub async fn run(ctx: &Ctx, args: &InitArgs) -> Result<()> {
         })
         .collect();
 
+    // --all-shards 部分初始化场景：已初始化的分片逐片告警（init_shard 内）并
+    // 继续补完其余分片，全部尝试完后若有失败再整体报错——不能用 `?` 在第一个
+    // 已初始化分片处中断，否则其余分片永远不会被初始化。
+    let mut failures: Vec<String> = Vec::new();
     for shard_id in shards {
-        init_shard(ctx, shard_id, &members).await?;
+        if let Err(e) = init_shard(ctx, shard_id, &members).await {
+            failures.push(format!("分片 {shard_id}: {e:#}"));
+        }
+    }
+    if !failures.is_empty() {
+        return Err(anyhow!("部分分片初始化失败：{}", failures.join("；")));
     }
     Ok(())
 }

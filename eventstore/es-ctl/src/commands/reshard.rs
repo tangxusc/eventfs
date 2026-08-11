@@ -19,9 +19,27 @@ fn validate(args: &ReshardArgs) -> Result<()> {
     if args.src_shards == 0 || args.dst_shards == 0 {
         bail!("源/目标分片数必须 ≥ 1");
     }
-    // 库要求 src/dst 必须是不同 tree
+    // 库要求 src/dst 必须是不同 tree。
     let src = std::fs::canonicalize(&args.src_dir).context("解析源目录")?;
-    let dst = std::fs::canonicalize(&args.dst_dir).context("解析目标目录")?;
+    // dst 可能尚不存在（TreeBuilder 会创建，docs/reshard.md 示例正是新路径）：
+    // canonicalize 对不存在路径报 NotFound，不能让它破坏流程。
+    // src 存在而 dst 不存在时两者必然不同；父目录可解析时再做词法比较兜底。
+    let dst = match std::fs::canonicalize(&args.dst_dir) {
+        Ok(p) => p,
+        Err(_) if !args.dst_dir.exists() => {
+            let parent = args
+                .dst_dir
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("/"));
+            match std::fs::canonicalize(parent) {
+                Ok(p) => p.join(args.dst_dir.file_name().unwrap_or_default()),
+                // 父目录也不存在：路径必然与 src 不同（src 存在）
+                Err(_) => return Ok(()),
+            }
+        }
+        Err(e) => return Err(e).context("解析目标目录"),
+    };
     if src == dst {
         bail!("源目录与目标目录必须不同");
     }
@@ -100,23 +118,47 @@ pub async fn run(format: Format, args: &ReshardArgs) -> Result<()> {
     }
     confirm(args)?;
 
-    // 3. 打开 src/dst tree（dst 不存在时由 TreeBuilder 创建）
+    // 3. 打开 src tree。从打开第一个 tree 起，任何后续失败都必须把已打开的
+    //    tree 全部 flush+close（否则 LOCK 不释放、部分写入不落盘）。
     let src_tree = open_tree(&args.src_dir)?;
-    let dst_tree = open_tree(&args.dst_dir)?;
 
-    // 4. 执行重分布
+    // 校验 --src-shards 与目录实际布局一致：少报分片数时，哈希落在枚举范围
+    // （0..src_shards）之外的分片数据会被静默跳过，且 src/dst 计数来自同一
+    // 枚举子集（自洽），完整性校验拦不住——必须在执行前拒绝。
+    let actual_shards = es_storage::reshard::infer_shard_count(&src_tree)
+        .context("推断源目录分片数")?;
+    if actual_shards != args.src_shards {
+        close_tree(&args.src_dir, src_tree).await.ok();
+        bail!(
+            "--src-shards {} 与数据目录实际分片数 {} 不一致（按数据中出现的最大分片 ID 推断；\
+             部分分片无数据的稀疏布局会低估，请以集群配置为准）。\
+             分片数不匹配会漏读或读错分片，请更正后重试",
+            args.src_shards, actual_shards
+        );
+    }
+
+    // 4. 打开 dst tree（不存在时由 TreeBuilder 创建）
+    let dst_tree = match open_tree(&args.dst_dir) {
+        Ok(t) => t,
+        Err(e) => {
+            close_tree(&args.src_dir, src_tree).await.ok();
+            return Err(e);
+        }
+    };
+
+    // 5. 执行重分布（无论成败都收尾关闭）
     let started = std::time::Instant::now();
-    let report = es_storage::reshard::reshard(
+    let result = es_storage::reshard::reshard(
         src_tree.clone(),
         args.src_shards,
         dst_tree.clone(),
         args.dst_shards,
     )
     .await
-    .context("重分布失败")?;
-    let elapsed = started.elapsed();
+    .context("重分布失败");
 
-    // 5. 关闭（失败也要关；错误合并上报）
+    // 6. 收尾：失败也要关（先 flush_wal 落盘再 close，与 EsStorage::close 语义一致），
+    //    错误合并上报——残留未关闭的 tree 会占用 LOCK 且留下未落盘脏数据。
     let mut close_errs = Vec::new();
     if let Err(e) = close_tree(&args.src_dir, src_tree).await {
         close_errs.push(e);
@@ -124,12 +166,14 @@ pub async fn run(format: Format, args: &ReshardArgs) -> Result<()> {
     if let Err(e) = close_tree(&args.dst_dir, dst_tree).await {
         close_errs.push(e);
     }
+    let report = result?;
     if let Some(e) = close_errs.pop() {
         for extra in close_errs {
             eprintln!("警告：{extra:#}");
         }
         return Err(e);
     }
+    let elapsed = started.elapsed();
 
     // 6. 输出
     let elapsed_ms = elapsed.as_millis() as u64;

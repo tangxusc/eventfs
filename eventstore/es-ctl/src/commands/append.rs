@@ -1,6 +1,6 @@
 //! `esctl append`：追加事件到流（乐观并发）。
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use es_proto::eventstore::*;
 use uuid::Uuid;
 
@@ -57,8 +57,13 @@ pub async fn run(ctx: &Ctx, args: &AppendArgs) -> Result<()> {
         None => Uuid::new_v4(),
     };
 
-    // 预显示路由分片（仅供提示，实际以服务端落盘分片为准）
+    // 预显示路由分片（仅供提示，实际以服务端落盘分片为准）。
+    // count=0 时 route 取模除零会 panic：clap 已拒绝显式 --shards 0，
+    // 但探测路径（集群未初始化、探测到 0 分片）也可能返回 0，这里兜底。
     let scope = ctx.shards().await?;
+    if scope.count == 0 {
+        bail!("分片数为 0（集群未初始化或探测失败），无法路由：请用 --shards 指定分片数");
+    }
     let route_shard = es_core::routing::route(&args.stream, scope.count);
 
     let new_event = NewEvent {

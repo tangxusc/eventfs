@@ -139,6 +139,20 @@ impl FromStr for ShardIds {
     }
 }
 
+/// --shards 解析：拒绝 0。
+///
+/// `route(stream, 0)` 是取模除零（es-core::routing），会 panic 而不是报错；
+/// 且服务端配置也拒绝 num_shards=0。0 分片没有任何合法含义。
+fn parse_shards(s: &str) -> Result<u64, String> {
+    let v: u64 = s
+        .parse()
+        .map_err(|_| format!("非法分片数 {s:?}：应为数字"))?;
+    if v == 0 {
+        return Err("分片数必须 ≥ 1".into());
+    }
+    Ok(v)
+}
+
 /// 全局参数（必须位于子命令之前，同 etcdctl 约定）
 #[derive(Args, Debug, Clone)]
 pub struct GlobalArgs {
@@ -169,7 +183,7 @@ pub struct GlobalArgs {
     pub write_out: Format,
 
     /// 分片总数；缺省时自动探测（GetRaftState 扫描 0..N），探测失败回退默认 8
-    #[arg(long)]
+    #[arg(long, value_parser = parse_shards)]
     pub shards: Option<u64>,
 }
 

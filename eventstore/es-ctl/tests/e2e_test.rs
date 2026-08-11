@@ -75,7 +75,7 @@ async fn start_server() -> (
 }
 
 /// 启动测试服务器但不对分片自举（esctl init 用例）。
-async fn start_server_uninitialized() -> (
+async fn start_server_uninitialized(num_shards: u64) -> (
     String,
     tokio::task::JoinHandle<()>,
     Server,
@@ -91,7 +91,7 @@ async fn start_server_uninitialized() -> (
         storage: StorageConfig {
             data_dir: dir.path().to_path_buf(),
         },
-        shards: ShardConfig { num_shards: 1 },
+        shards: ShardConfig { num_shards },
         tls: None,
     };
 
@@ -337,7 +337,7 @@ async fn status与member_list_单节点视图() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn init_初始化未自举节点() {
-    let (addr, handle, _server, _dir) = start_server_uninitialized().await;
+    let (addr, handle, _server, _dir) = start_server_uninitialized(1).await;
 
     // 未自举时 status 显示可达但没有 leader
     let out = esctl(&addr, &["status"]);
@@ -775,10 +775,284 @@ async fn watch_all订阅() {
         &["append", "s/all", "--event-type", "T", "--data", "x"],
     );
 
-    // $all 订阅（服务端当前仅支持 shard 0）：追平后退出
+    // $all 订阅（默认分片 0）：追平后退出
     let out = esctl(&addr, &["watch", "--all", "--once", "--from-start"]);
     assert!(out.status.success(), "watch --all 失败: {}", stderr(&out));
     assert!(stdout(&out).contains("已追平"), "{}", stdout(&out));
+
+    handle.abort();
+}
+
+/// 发现 1：readall 翻页续读游标必须覆盖全部分片（偏斜数据场景），
+/// 多页续读全量到达且 (shard, position) 无重复
+#[tokio::test(flavor = "multi_thread")]
+async fn readall_偏斜数据翻页_续读覆盖全部分片无重复() {
+    let (addr, handle, _server, _dir) = start_server().await;
+
+    // 找两个路由到不同分片的流名（2 分片集群）
+    let s0 = (0..100u64)
+        .map(|i| format!("bulk/0/{i}"))
+        .find(|n| es_core::route(n, 2) == 0)
+        .expect("应有路由到分片 0 的流名");
+    let s1 = (0..100u64)
+        .map(|i| format!("bulk/1/{i}"))
+        .find(|n| es_core::route(n, 2) == 1)
+        .expect("应有路由到分片 1 的流名");
+    for _ in 0..6 {
+        let out = esctl(&addr, &["append", &s0, "--event-type", "T", "--data", "x"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+    }
+    for _ in 0..2 {
+        let out = esctl(&addr, &["append", &s1, "--event-type", "T", "--data", "x"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+    }
+
+    // 自动翻页到读完：每页用上一页返回的 next_from_positions 续读。
+    // 结束条件 = 页不满（各分片数据已尽）或续读游标为空（倒序到边界）。
+    // 注意：服务端对空分片返回「游标不动」（next=from），游标列表可能始终非空，
+    // 必须靠页不满终止，否则空分片会让翻页永不停止。
+    let mut all: Vec<serde_json::Value> = Vec::new();
+    let mut first_next: Option<Vec<(u64, u64)>> = None;
+    let mut cursor: Option<String> = None;
+    let mut pages = 0;
+    for _ in 0..10 {
+        let out = match &cursor {
+            None => esctl(&addr, &["-w", "json", "readall", "--max-count", "3"]),
+            Some(c) => esctl(
+                &addr,
+                &["-w", "json", "readall", "--max-count", "3", "--from-positions", c],
+            ),
+        };
+        assert!(out.status.success(), "{}", stderr(&out));
+        let page: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("json");
+        let count = page["events"].as_array().expect("events").len();
+        let next = page["next_from_positions"].as_array().map(|arr| {
+            arr.iter()
+                .map(|v| {
+                    let s = v.as_str().expect("游标文本");
+                    let (a, b) = s.split_once(':').expect("shard:pos");
+                    (a.parse().expect("shard"), b.parse().expect("pos"))
+                })
+                .collect::<Vec<_>>()
+        });
+        if first_next.is_none() {
+            first_next = next.clone();
+        }
+        all.extend(page["events"].as_array().expect("events").clone());
+        pages += 1;
+        // 页不满 = 没有更多数据；页满但游标空 = 倒序到边界
+        if count < 3 || next.is_none() {
+            break;
+        }
+        cursor = next.map(|v| {
+            v.iter()
+                .map(|(s, p)| format!("{s}:{p}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        });
+    }
+    assert!(pages >= 3, "偏斜数据应翻页至少 3 次，实际 {pages} 次");
+
+    // 核心修复点：第一页的续读游标必须覆盖两个分片（旧实现只含本页有事件的分片，
+    // 未产出事件的分片在续读中永久消失）
+    let first = first_next.expect("第一页应有续读游标");
+    assert!(
+        first.iter().any(|(s, _)| *s == 0) && first.iter().any(|(s, _)| *s == 1),
+        "续读游标必须覆盖两个分片: {first:?}"
+    );
+
+    // 全量到达且无重复
+    let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+    for ev in &all {
+        let key = (
+            ev["shard_id"].as_u64().expect("shard_id"),
+            ev["position"].as_u64().expect("position"),
+        );
+        assert!(seen.insert(key), "翻页出现重复事件: {key:?}");
+    }
+    assert_eq!(seen.len(), 8, "应读到全部 8 条事件，实际 {} 条", seen.len());
+    handle.abort();
+}
+
+/// 发现 6：readall --backward 默认 from-position=0 时必须以 u64::MAX 起读
+/// （旧缺陷：默认反向读只返回每分片 position=0 的最旧事件/空）
+#[tokio::test(flavor = "multi_thread")]
+async fn readall_反向默认从最新读() {
+    let (addr, handle, _server, _dir) = start_server().await;
+
+    for i in 0..3 {
+        let out = esctl(
+            &addr,
+            &[
+                "append",
+                "s/revall",
+                "--event-type",
+                "T",
+                "--data",
+                &i.to_string(),
+            ],
+        );
+        assert!(out.status.success(), "{}", stderr(&out));
+    }
+
+    let out = esctl(&addr, &["readall", "--backward"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert_eq!(text.matches("[T]").count(), 3, "应读到全部 3 条: {text}");
+    handle.abort();
+}
+
+/// 发现 14：watch --all --shard N 订阅指定分片的 $all（旧缺陷：参数被静默忽略，
+/// 服务端硬编码分片 0）
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_all_按分片订阅() {
+    let (addr, handle, _server, _dir) = start_server().await;
+
+    let s1 = (0..100u64)
+        .map(|i| format!("watch/shard1/{i}"))
+        .find(|n| es_core::route(n, 2) == 1)
+        .expect("应有路由到分片 1 的流名");
+    let out = esctl(&addr, &["append", &s1, "--event-type", "T", "--data", "x"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    // 指定 --shard 1：收到分片 1 的事件（json 模式，simple 行不含流名）
+    let out = esctl(
+        &addr,
+        &["-w", "json", "watch", "--all", "--shard", "1", "--once", "--from-start"],
+    );
+    assert!(
+        out.status.success(),
+        "watch --shard 1 失败: {}",
+        stderr(&out)
+    );
+    assert!(
+        stdout(&out).contains(&s1),
+        "应收到分片 1 的事件: {}",
+        stdout(&out)
+    );
+
+    // 默认 shard 0：收不到分片 1 的事件
+    let out = esctl(
+        &addr,
+        &["-w", "json", "watch", "--all", "--once", "--from-start"],
+    );
+    assert!(out.status.success(), "watch 默认失败: {}", stderr(&out));
+    assert!(
+        !stdout(&out).contains(&s1),
+        "默认订阅 shard 0 不应收到分片 1 事件"
+    );
+    handle.abort();
+}
+
+/// 发现 9：member list 全部端点不可达必须报错（旧缺陷：输出"未初始化"退出码 0，
+/// 网络故障伪装成"需要 init"）
+#[tokio::test(flavor = "multi_thread")]
+async fn member_list_全部端点不可达_退出码1() {
+    let out = esctl("http://127.0.0.1:59999", &["member", "list"]);
+    assert_eq!(out.status.code(), Some(1), "应退出码 1: {}", stderr(&out));
+    assert!(stderr(&out).contains("不可达"), "{}", stderr(&out));
+}
+
+/// 发现 11：init --all-shards 部分初始化集群上必须补完其余分片
+/// （旧缺陷：在第一个已初始化分片处中止，其余分片永远无 leader）
+#[tokio::test(flavor = "multi_thread")]
+async fn init_all_shards_部分初始化_补完其余分片() {
+    let (addr, handle, _server, _dir) = start_server_uninitialized(2).await;
+
+    // 先只初始化分片 0
+    let out = esctl(
+        &addr,
+        &["init", "--shard", "0", "--member", "1@127.0.0.1:50051"],
+    );
+    assert!(out.status.success(), "init 分片 0 失败: {}", stderr(&out));
+
+    // --all-shards：分片 0 已初始化告警，但分片 1 必须被补完
+    let out = esctl(
+        &addr,
+        &["init", "--all-shards", "--member", "1@127.0.0.1:50051"],
+    );
+    assert_eq!(out.status.code(), Some(1), "有分片失败应退出码 1");
+    assert!(stderr(&out).contains("已初始化"), "{}", stderr(&out));
+
+    // 分片 1 应已被初始化并选出 leader
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let out = esctl(&addr, &["-w", "json", "status"]);
+    let json: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("status json");
+    let leader_of = json["endpoints"][0]["leader_of"]
+        .as_array()
+        .expect("leader_of");
+    assert!(
+        leader_of.iter().any(|v| v.as_u64() == Some(1)),
+        "分片 1 应已被补完并成为 leader: {json}"
+    );
+    handle.abort();
+}
+
+/// 发现 7/10：--timeout 0 = 不设超时；--shards 0 是参数错误（退出码 2，
+/// 旧缺陷：--shards 0 直接除零 panic 退出 101）
+#[tokio::test(flavor = "multi_thread")]
+async fn timeout0与shards0参数语义() {
+    let (addr, handle, _server, _dir) = start_server().await;
+
+    // --timeout 0 = 不设超时，RPC 应正常成功（旧缺陷：Duration::ZERO 使所有 RPC 立即失败）
+    let out = Command::new(env!("CARGO_BIN_EXE_esctl"))
+        .args(["--endpoints", &addr, "--timeout", "0", "status"])
+        .output()
+        .expect("运行 esctl");
+    assert!(
+        out.status.success(),
+        "--timeout 0 应成功: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // --shards 0：clap 参数错误退出码 2
+    let out = Command::new(env!("CARGO_BIN_EXE_esctl"))
+        .args(["--endpoints", &addr, "--shards", "0", "status"])
+        .output()
+        .expect("运行 esctl");
+    assert_eq!(out.status.code(), Some(2), "应退出码 2");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("≥ 1"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    handle.abort();
+}
+
+/// 发现 15：change_membership CAS——陈旧 voters 快照必须拒绝（FailedPrecondition），
+/// 正确快照成功（旧缺陷：无校验，并发变更被后到者静默覆盖）
+#[tokio::test(flavor = "multi_thread")]
+async fn member_cas_陈旧快照拒绝() {
+    use es_proto::eventstore::raft_admin_client::RaftAdminClient;
+    use es_proto::eventstore::*;
+    let (addr, handle, _server, _dir) = start_server().await;
+
+    let mut client = RaftAdminClient::connect(addr.clone()).await.expect("连接");
+
+    // 正确快照（当前 voters=[1]）：成功（幂等提交，不改变状态）
+    let ok = client
+        .change_membership(ChangeMembershipRequest {
+            shard_id: 0,
+            voter_ids: vec![1],
+            expected_voters: vec![1],
+            retain: false,
+        })
+        .await;
+    assert!(ok.is_ok(), "正确快照应成功: {ok:?}");
+
+    // 陈旧快照：FailedPrecondition
+    let err = client
+        .change_membership(ChangeMembershipRequest {
+            shard_id: 0,
+            voter_ids: vec![1],
+            expected_voters: vec![2],
+            retain: false,
+        })
+        .await
+        .expect_err("陈旧快照应被拒绝");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("成员集合已变更"), "{}", err.message());
 
     handle.abort();
 }

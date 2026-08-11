@@ -36,6 +36,8 @@ pub async fn run(ctx: &Ctx, args: &WatchArgs) -> Result<()> {
         target: Some(target),
         from_exclusive: args.from_exclusive,
         from_start: args.from_start,
+        // 仅 --all 时生效：订阅哪个分片的 $all（proto 默认 0）
+        shard_id: args.shard,
     };
 
     // 订阅是长连接，选一个端点直连（失败即退出，不做端点间重试）
@@ -64,7 +66,12 @@ pub async fn run(ctx: &Ctx, args: &WatchArgs) -> Result<()> {
         }
     }
 
-    // 流正常结束但未追平：服务端关闭（如订阅者落后被 Lagged 踢出）
+    // 流正常结束但未追平：服务端关闭（如订阅者落后被 Lagged 踢出）。
+    // --once 的退出码 0 语义前提是「已追平」，未追平必须非零退出，
+    // 否则依赖退出码判断历史已消费完的脚本会静默缺失数据。
+    if args.once && !caught_up {
+        return Err(anyhow!("订阅流在收到 caught_up 信号前关闭（可能因落后被服务端断开）"));
+    }
     if !caught_up {
         eprintln!("订阅流已关闭（可能因落后被服务端断开）");
     }

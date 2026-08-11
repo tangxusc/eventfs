@@ -88,34 +88,43 @@ pub async fn run_add(ctx: &Ctx, args: &MemberAddArgs) -> Result<()> {
             continue;
         }
 
-        // 第二步：提升为投票成员（当前 voters ∪ 新节点）
-        let (leader_ep, _) = ctx.cluster.find_leader(shard_id).await?;
-        let state = ctx
+        // 第二步：提升为投票成员（CAS 读-改-写）。
+        // 读 voters → 提交「期望 = 刚读到的快照」整体放在闭包内：
+        // CAS 冲突（FailedPrecondition）时 with_admin_leader 重试闭包并重读 voters，
+        // 并发变更不会被后到者静默覆盖。
+        let voters_text = ctx
             .cluster
-            .get_raft_state_via(&leader_ep, shard_id)
-            .await
-            .map_err(|e| anyhow!("查询分片 {shard_id} 状态失败：{}", e.message()))?;
-
-        let mut voters: BTreeSet<u64> = state.voter_ids.into_iter().collect();
-        voters.insert(args.member.node_id);
-
-        ctx.cluster
             .with_admin_leader(shard_id, |mut client| {
-                let req = ChangeMembershipRequest {
-                    shard_id,
-                    voter_ids: voters.iter().copied().collect(),
-                    retain: false,
-                };
-                async move { client.change_membership(req).await.map(|r| r.into_inner()) }
+                let node_id = args.member.node_id;
+                async move {
+                    // admin client 已指向 leader 端点，直接读当前 voters 作 CAS 期望
+                    let state = client
+                        .get_raft_state(GetRaftStateRequest { shard_id })
+                        .await?
+                        .into_inner();
+                    let mut voters: BTreeSet<u64> = state.voter_ids.iter().copied().collect();
+                    voters.insert(node_id);
+                    let voters_list = voters.iter().copied().collect::<Vec<_>>();
+                    let req = ChangeMembershipRequest {
+                        shard_id,
+                        voter_ids: voters_list.clone(),
+                        expected_voters: state.voter_ids,
+                        retain: false,
+                    };
+                    client
+                        .change_membership(req)
+                        .await
+                        .map(|r| (r.into_inner(), voters_list))
+                }
             })
             .await
-            .map_err(|e| anyhow!("分片 {shard_id} 提升成员失败：{e:#}"))?;
-
-        let voters_text = voters
+            .map_err(|e| anyhow!("分片 {shard_id} 提升成员失败：{e:#}"))?
+            .1
             .iter()
             .map(|v| v.to_string())
             .collect::<Vec<_>>()
             .join(",");
+
         print_change(
             shard_id,
             args.member.node_id,
@@ -138,7 +147,7 @@ pub async fn run_remove(ctx: &Ctx, args: &MemberRemoveArgs) -> Result<()> {
             .await
             .map_err(|e| anyhow!("查询分片 {shard_id} 状态失败：{}", e.message()))?;
 
-        let voters: BTreeSet<u64> = state.voter_ids.into_iter().collect();
+        let voters: BTreeSet<u64> = state.voter_ids.iter().copied().collect();
         if !voters.contains(&args.node_id) {
             bail!(
                 "分片 {shard_id} 的投票成员为 [{}]，节点 {} 不在其中（learner 无法移除，无对应 RPC）",
@@ -151,6 +160,8 @@ pub async fn run_remove(ctx: &Ctx, args: &MemberRemoveArgs) -> Result<()> {
             );
         }
 
+        // 变更带 CAS：闭包内重读当前 voters 作期望快照，防止外部校验读到
+        // 的集合与提交之间被并发变更（与 run_add 第二步同一模式）
         let remain: Vec<u64> = voters
             .iter()
             .copied()
@@ -158,12 +169,27 @@ pub async fn run_remove(ctx: &Ctx, args: &MemberRemoveArgs) -> Result<()> {
             .collect();
         ctx.cluster
             .with_admin_leader(shard_id, |mut client| {
-                let req = ChangeMembershipRequest {
-                    shard_id,
-                    voter_ids: remain.clone(),
-                    retain: args.retain,
-                };
-                async move { client.change_membership(req).await.map(|r| r.into_inner()) }
+                let node_id = args.node_id;
+                let retain = args.retain;
+                async move {
+                    let state = client
+                        .get_raft_state(GetRaftStateRequest { shard_id })
+                        .await?
+                        .into_inner();
+                    let current: BTreeSet<u64> = state.voter_ids.iter().copied().collect();
+                    let remain: Vec<u64> = current
+                        .iter()
+                        .copied()
+                        .filter(|v| *v != node_id)
+                        .collect();
+                    let req = ChangeMembershipRequest {
+                        shard_id,
+                        voter_ids: remain,
+                        expected_voters: state.voter_ids,
+                        retain,
+                    };
+                    client.change_membership(req).await.map(|r| r.into_inner())
+                }
             })
             .await
             .map_err(|e| anyhow!("分片 {shard_id} 移除成员失败：{e:#}"))?;
@@ -187,17 +213,39 @@ pub async fn run_list(ctx: &Ctx, _args: &MemberListArgs) -> Result<()> {
     let scope = ctx.shards().await?;
     let shard_ids = scope.all_ids();
 
-    // 遍历 0..N × 端点聚合 GetRaftState；voter_ids 取首个可达端点的响应
+    // 遍历 0..N × 端点聚合 GetRaftState；voter_ids 取首个可达端点的响应。
+    // NotFound = 该端点无此分片（未初始化），合法跳过；其它错误收集。
+    // 全部端点均不可达时整体报错——把网络故障伪装成"未初始化"会误导运维
+    // （仿 status 命令的兜底护栏）。
     let mut per_shard: Vec<(u64, Vec<GetRaftStateResponse>)> = Vec::new();
+    let mut lookup_errors: Vec<String> = Vec::new();
+    let mut any_reachable = false;
     for shard_id in shard_ids {
         let mut nodes = Vec::new();
         for ep in ctx.cluster.endpoints() {
             match ctx.cluster.get_raft_state_via(ep, shard_id).await {
-                Ok(state) => nodes.push(state),
-                Err(_) => continue, // 该端点无此分片或不可达，跳过
+                Ok(state) => {
+                    any_reachable = true;
+                    nodes.push(state);
+                }
+                Err(status) if status.code() == tonic::Code::NotFound => {
+                    // 该端点未注册此分片：未初始化，跳过
+                }
+                Err(status) => lookup_errors.push(format!("{ep}: {}", status.message())),
             }
         }
         per_shard.push((shard_id, nodes));
+    }
+
+    if !any_reachable {
+        return Err(anyhow!(
+            "所有端点均不可达，无法查询成员状态（{}）",
+            if lookup_errors.is_empty() {
+                "无错误".into()
+            } else {
+                lookup_errors.join("；")
+            }
+        ));
     }
 
     match ctx.format {

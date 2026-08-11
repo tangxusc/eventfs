@@ -395,3 +395,86 @@ async fn reshard_json输出格式() {
     assert_eq!(json["dst_shards"], 4);
     assert_eq!(json["src_streams"], json["dst_streams"], "流数应一致");
 }
+
+/// 发现 4：目标目录是全新路径（不存在）时无需预先 mkdir，
+/// TreeBuilder 会创建（旧缺陷：canonicalize 对不存在路径报错，
+/// 文档示例流程直接失败）
+#[tokio::test(flavor = "multi_thread")]
+async fn reshard_全新目标目录无需预建() {
+    let (dir, _server, total) = start_and_write().await;
+
+    // dst 路径不存在：validate 的 canonicalize 曾对它报 NotFound
+    let dst_dir = dir.path().join("dst-new");
+    assert!(!dst_dir.exists(), "前置：目标目录必须不存在");
+
+    let out = esctl_offline(&[
+        "reshard",
+        "--src-dir",
+        dir.path().to_str().unwrap(),
+        "--src-shards",
+        "2",
+        "--dst-dir",
+        dst_dir.to_str().unwrap(),
+        "--dst-shards",
+        "4",
+        "--yes",
+    ]);
+    assert!(
+        out.status.success(),
+        "全新目标目录应直接创建并成功: {}",
+        err(&out)
+    );
+
+    // 数据完整
+    let (dst_streams, dst_events, _) = verify_dst(&dst_dir, 4).await;
+    assert_eq!(dst_streams, 6, "目标流数应为 6");
+    assert_eq!(dst_events, total, "目标事件数应等于写入数 {total}");
+}
+
+/// 发现 2：--src-shards 与数据目录实际布局不一致必须拒绝
+/// （旧缺陷：少报分片数时，哈希落在枚举范围之外的分片数据被静默跳过，
+/// 且 src/dst 计数来自同一枚举子集，完整性校验拦不住）
+#[tokio::test(flavor = "multi_thread")]
+async fn reshard_src分片数不匹配_拒绝() {
+    let (dir, _server, _) = start_and_write().await;
+    let dst_dir = tempfile::tempdir().expect("目标临时目录");
+
+    // 数据是 2 分片布局（start_and_write 写满两个分片），少报为 1
+    let out = esctl_offline(&[
+        "reshard",
+        "--src-dir",
+        dir.path().to_str().unwrap(),
+        "--src-shards",
+        "1",
+        "--dst-dir",
+        dst_dir.path().to_str().unwrap(),
+        "--dst-shards",
+        "4",
+        "--yes",
+    ]);
+    assert_eq!(out.status.code(), Some(1), "分片数不匹配应拒绝");
+    assert!(err(&out).contains("不一致"), "{}", err(&out));
+
+    // 目标目录不应被写入脏数据（拒绝发生在打开 dst 之前）
+    assert_eq!(stdout(&out).len(), 0, "拒绝路径不应有 stdout");
+
+    // 发现 13：失败路径必须 flush+close 已打开的 src tree——
+    // 若 LOCK 未释放，紧接着的正确命令会因"LOCK 被占用"再次失败
+    let out = esctl_offline(&[
+        "reshard",
+        "--src-dir",
+        dir.path().to_str().unwrap(),
+        "--src-shards",
+        "2",
+        "--dst-dir",
+        dst_dir.path().to_str().unwrap(),
+        "--dst-shards",
+        "4",
+        "--yes",
+    ]);
+    assert!(
+        out.status.success(),
+        "失败后 LOCK 应已释放、正确命令可直接执行: {}",
+        err(&out)
+    );
+}

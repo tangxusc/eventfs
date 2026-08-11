@@ -1,9 +1,7 @@
-//! 命令分发上下文与公共工具（事件收集、渲染、续读游标计算）。
-
-use std::collections::HashMap;
+//! 命令分发上下文与公共工具（事件收集、渲染、续读游标透传）。
 
 use anyhow::Result;
-use es_proto::eventstore::{Event, ReadEventsResponse};
+use es_proto::eventstore::{Event, ReadEventsResponse, ShardPosition};
 
 use crate::cli::{Format, GlobalArgs};
 use crate::client::ClusterClient;
@@ -61,6 +59,25 @@ pub async fn collect_events(
     Ok(events)
 }
 
+/// 收集 ReadAll 单页响应：事件 + 服务端返回的续读游标（每分片下一页起点）。
+///
+/// 游标必须由服务端驱动：本页被归并丢弃的分片也会推进游标，
+/// 客户端翻页时把 next_positions 原样透传为 from_positions，
+/// 缺失分片的事件不会在续读中永久消失。
+pub async fn collect_page(
+    mut stream: tonic::Streaming<ReadEventsResponse>,
+) -> Result<(Vec<Event>, Vec<ShardPosition>)> {
+    let mut events = Vec::new();
+    let mut next_positions = Vec::new();
+    while let Some(resp) = stream.message().await? {
+        events.extend(resp.events);
+        if !resp.next_positions.is_empty() {
+            next_positions = resp.next_positions;
+        }
+    }
+    Ok((events, next_positions))
+}
+
 /// 事件渲染文本（read/readall 共用；事件已全部收集），调用方负责 println。
 pub fn render_events(format: Format, events: &[Event]) -> String {
     match format {
@@ -101,31 +118,6 @@ pub fn render_events(format: Format, events: &[Event]) -> String {
     }
 }
 
-/// 计算续读游标：每分片取（正序）最大 position+1 或（倒序）最小 position-1。
-///
-/// 倒序时 position=0 的分片不再续读（已到边界）。返回按分片升序。
-pub fn next_from_positions(events: &[Event], backward: bool) -> Vec<(u64, u64)> {
-    let mut by_shard: HashMap<u64, Vec<u64>> = HashMap::new();
-    for ev in events {
-        by_shard.entry(ev.shard_id).or_default().push(ev.position);
-    }
-    let mut out: Vec<(u64, u64)> = by_shard
-        .into_iter()
-        .filter_map(|(shard, poss)| {
-            if backward {
-                // 倒序：取最小位置 - 1；position=0 已到边界，不再续读
-                let min = poss.into_iter().min()?;
-                (min > 0).then(|| (shard, min - 1))
-            } else {
-                let max = poss.into_iter().max()?;
-                Some((shard, max + 1))
-            }
-        })
-        .collect();
-    out.sort_unstable();
-    out
-}
-
 /// 续读游标渲染为 `shard:pos,...` 字符串（simple 模式提示用）
 pub fn from_positions_text(positions: &[(u64, u64)]) -> String {
     positions
@@ -151,23 +143,6 @@ mod tests {
             position: pos,
             shard_id: shard,
         }
-    }
-
-    #[test]
-    fn 正序续读游标_各分片最大位置加一() {
-        let events = vec![event(3, 7), event(3, 9), event(5, 2)];
-        assert_eq!(next_from_positions(&events, false), vec![(3, 10), (5, 3)]);
-    }
-
-    #[test]
-    fn 倒序续读游标_最小位置减一且零不续() {
-        let events = vec![event(3, 7), event(5, 0), event(5, 2)];
-        assert_eq!(next_from_positions(&events, true), vec![(3, 6)]);
-    }
-
-    #[test]
-    fn 空事件无续读游标() {
-        assert_eq!(next_from_positions(&[], false), vec![]);
     }
 
     #[test]
