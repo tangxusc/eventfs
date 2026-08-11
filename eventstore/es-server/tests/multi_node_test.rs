@@ -33,18 +33,17 @@ struct NodeHandle {
 }
 
 /// 启动一个 eventstored 子进程
+///
+/// 直接运行已编译的二进制（cargo 在测试编译时注入路径），而不是 `cargo run`：
+/// 后者是 cargo → 二进制的两层进程，测试 kill 掉 cargo 会留下孤儿二进制进程。
+/// 日志级别默认 warn，可用 RUST_LOG 环境变量覆盖（自动组建等测试排障用）。
 fn spawn_node(config_path: &std::path::Path) -> Child {
-    Command::new("cargo")
+    Command::new(env!("CARGO_BIN_EXE_eventstored"))
         .args([
-            "run",
-            "--quiet",
-            "--bin",
-            "eventstored",
-            "--",
             "--config",
             config_path.to_str().expect("配置路径非 UTF-8"),
         ])
-        .env("RUST_LOG", "warn")
+        .env("RUST_LOG", std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".to_string()))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -66,18 +65,39 @@ async fn wait_for_port(port: u16, timeout: Duration) -> bool {
 }
 
 impl TestCluster {
-    /// 启动 3 节点单分片集群
+    /// 启动 3 节点单分片集群，配置不含 peers（手动组建路径）
     async fn start() -> Self {
-        Self::start_with_shards(1).await
+        Self::start_with_shards(1, false).await
     }
 
-    /// 启动 3 节点集群，指定分片数（未初始化 Raft 成员关系）
-    async fn start_with_shards(num_shards: u64) -> Self {
+    /// 启动 3 节点集群，指定分片数。
+    ///
+    /// `write_peers=true` 时每个节点写入**完整 peers（含自己）**——与
+    /// config.example.toml 的 etcd 语义一致，节点启动后自动组建集群；
+    /// `false` 时不写 peers 字段，保持手动组建路径。
+    async fn start_with_shards(num_shards: u64, write_peers: bool) -> Self {
+        Self::start_n(3, num_shards, &[1, 2, 3], write_peers).await
+    }
+
+    /// 启动 3 节点单分片集群并自动组建（完整 peers，含自己）。
+    ///
+    /// `order` 指定节点启动顺序（如 `&[2, 1, 3]` 验证乱序启动）。
+    async fn start_auto(order: &[u64]) -> Self {
+        Self::start_n(order.len() as u64, 1, order, true).await
+    }
+
+    /// 启动单节点集群：peers 只含自己，启动后自动单成员自举
+    async fn start_single() -> Self {
+        Self::start_n(1, 1, &[1], true).await
+    }
+
+    /// 启动 n 个节点（id = 1..=n），按 `order` 指定的顺序启动。
+    async fn start_n(n: u64, num_shards: u64, order: &[u64], write_peers: bool) -> Self {
         let mut nodes = HashMap::new();
         let mut dirs = Vec::new();
 
-        // 为 3 个节点分配端口
-        let ports: Vec<u16> = (0..3)
+        // 为节点分配端口（节点 id 与端口一一对应，id i 用 ports[i-1]）
+        let ports: Vec<u16> = (0..n)
             .map(|_| {
                 let listener =
                     std::net::TcpListener::bind("127.0.0.1:0").expect("绑定临时端口");
@@ -89,32 +109,32 @@ impl TestCluster {
             })
             .collect();
 
-        // 构建 peers 列表（不包含自己）
-        let build_peers = |exclude_idx: usize| -> Vec<serde_json::Value> {
-            ports
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| *i != exclude_idx)
-                .map(|(i, p)| {
-                    serde_json::json!({
-                        "id": (i + 1) as u64,
-                        "addr": format!("127.0.0.1:{}", p),
-                    })
+        // 完整成员列表（含自己）——启动时自动组建的配置依据
+        let all_peers: Vec<serde_json::Value> = ports
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                serde_json::json!({
+                    "id": (i + 1) as u64,
+                    "addr": format!("127.0.0.1:{}", p),
                 })
-                .collect()
-        };
+            })
+            .collect();
 
-        for (i, &port) in ports.iter().enumerate() {
-            let node_id = (i + 1) as u64;
+        for &node_id in order {
+            let port = ports[(node_id - 1) as usize];
             let dir = tempfile::tempdir().expect("创建临时目录");
 
             // 创建配置文件
+            let mut node_json = serde_json::json!({
+                "id": node_id,
+                "listen_addr": format!("127.0.0.1:{}", port),
+            });
+            if write_peers {
+                node_json["peers"] = serde_json::Value::Array(all_peers.clone());
+            }
             let config = serde_json::json!({
-                "node": {
-                    "id": node_id,
-                    "listen_addr": format!("127.0.0.1:{}", port),
-                    "peers": build_peers(i),
-                },
+                "node": node_json,
                 "storage": {
                     "data_dir": dir.path().to_str().unwrap(),
                 },
@@ -148,7 +168,7 @@ impl TestCluster {
             dirs.push(dir);
         }
 
-        eprintln!("✓ 全部 3 个节点已启动（{num_shards} 个分片）");
+        eprintln!("✓ 全部 {} 个节点已启动（{num_shards} 个分片）", order.len());
 
         Self {
             nodes,
@@ -322,8 +342,7 @@ impl TestCluster {
     }
 
     /// 轮询直到某节点的 last_applied 追上目标值
-    async fn wait_applied(&self, node_id: u64, want: u64, timeout: Duration) {
-        let deadline = tokio::time::Instant::now() + timeout;
+    async fn wait_applied(&self, node_id: u64, want: u64, timeout: Duration) {        let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let s = self.raft_state(node_id).await;
             if s.has_last_applied && s.last_applied >= want {
@@ -339,9 +358,62 @@ impl TestCluster {
         }
     }
 
+    /// 重启全部节点（复用各自配置与数据目录）
+    async fn restart_all(&mut self) {
+        let ids: Vec<u64> = self.nodes.keys().copied().collect();
+        for id in ids {
+            self.restart_node(id).await;
+        }
+    }
+
+    /// 轮询直到集群自动组建完成：全部节点 voter_ids 数 == want_voters 且存在 leader。
+    /// 返回 leader 的 node_id。
+    async fn wait_cluster_formed(&self, want_voters: usize, timeout: Duration) -> u64 {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let mut formed = true;
+            let mut leader = None;
+            for id in self.nodes.keys() {
+                // 节点可能仍在启动，失败即视为未形成，下轮再查
+                let mut a = match RaftAdminClient::connect(self.addr_of(*id)).await {
+                    Ok(a) => a,
+                    Err(_) => {
+                        formed = false;
+                        break;
+                    }
+                };
+                let s = match a
+                    .get_raft_state(GetRaftStateRequest { shard_id: SHARD })
+                    .await
+                {
+                    Ok(resp) => resp.into_inner(),
+                    Err(_) => {
+                        formed = false;
+                        break;
+                    }
+                };
+                if s.voter_ids.len() != want_voters {
+                    formed = false;
+                    break;
+                }
+                if s.is_leader {
+                    leader = Some(s.node_id);
+                }
+            }
+            if formed {
+                if let Some(l) = leader {
+                    return l;
+                }
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!("等待集群自动组建超时（{timeout:?}），want_voters={want_voters}");
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
     /// 杀掉指定节点，模拟进程崩溃
-    fn kill_node(&mut self, node_id: u64) {
-        let node = self.nodes.get_mut(&node_id).expect("节点不存在");
+    fn kill_node(&mut self, node_id: u64) {        let node = self.nodes.get_mut(&node_id).expect("节点不存在");
         let _ = node.process.kill();
         let _ = node.process.wait();
         eprintln!("✗ 已杀掉 node{node_id}");
@@ -791,7 +863,7 @@ async fn append_to(
 async fn 多分片各自选主且互不影响() {
     const SHARDS: u64 = 3;
     eprintln!("\n=== 启动 3 节点 × {SHARDS} 分片 ===");
-    let cluster = TestCluster::start_with_shards(SHARDS).await;
+    let cluster = TestCluster::start_with_shards(SHARDS, false).await;
     cluster.form_cluster().await;
 
     eprintln!("\n=== 校验每个分片各自选出 leader ===");
@@ -1003,6 +1075,182 @@ async fn 节点重启后能重新加入并追平落后的数据() {
     let versions: Vec<u64> = events.iter().map(|e| e.version).collect();
     assert_eq!(versions, vec![0, 1, 2, 3, 4], "版本应连续");
     eprintln!("✓ 重启节点数据完整且版本连续");
+
+    cluster.shutdown();
+}
+
+// ============ 自动组建集群（etcd 静态引导语义）============
+
+#[tokio::test]
+#[ignore = "需启动多个进程，耗时较长"]
+async fn 三节点配置peers自动组建并复制数据() {
+    eprintln!("\n=== 启动 3 节点集群（配置完整 peers，自动组建）===");
+    let cluster = TestCluster::start_auto(&[1, 2, 3]).await;
+
+    eprintln!("\n=== 等待自动组建完成（不调用任何组建 API）===");
+    // 不调 form_cluster：三个节点同时竞选，验证随机化选举超时收敛
+    let leader = cluster
+        .wait_cluster_formed(3, Duration::from_secs(60))
+        .await;
+    eprintln!("✓ 自动组建完成，leader = node{leader}");
+
+    // 恰好一个 leader，三个节点都认同
+    let mut leaders = Vec::new();
+    for id in 1..=3u64 {
+        let s = cluster.raft_state(id).await;
+        assert!(s.has_leader, "node{id} 应已知 leader");
+        assert_eq!(s.current_leader, leader, "node{id} 认同的 leader 应一致");
+        assert_eq!(s.voter_ids.len(), 3, "node{id} 投票成员应为 3");
+        if s.is_leader {
+            leaders.push(s.node_id);
+        }
+    }
+    assert_eq!(leaders.len(), 1, "只能有一个 leader: {leaders:?}");
+    eprintln!("✓ 三节点 voter_ids=3 且 leader 唯一（多节点同时竞选已收敛）");
+
+    eprintln!("\n=== 写入并验证复制 ===");
+    append_to(&cluster, leader, "auto", b"one").await;
+    append_to(&cluster, leader, "auto", b"two").await;
+    let applied = cluster.raft_state(leader).await.last_applied;
+    for id in 1..=3u64 {
+        if id == leader {
+            continue;
+        }
+        cluster.wait_applied(id, applied, Duration::from_secs(10)).await;
+    }
+    for id in 1..=3u64 {
+        let events = read_stream_from(&cluster, id, "auto").await;
+        let datas: Vec<&[u8]> = events.iter().map(|e| e.data.as_slice()).collect();
+        assert_eq!(
+            datas,
+            vec![b"one".as_ref(), b"two".as_ref()],
+            "node{id} 应有 2 条事件"
+        );
+    }
+    eprintln!("✓ 3 个节点均可读到 2 条事件");
+
+    eprintln!("\n=== 测试通过 ===");
+    cluster.shutdown();
+}
+
+#[tokio::test]
+#[ignore = "需启动多个进程，耗时较长"]
+async fn 自动组建后重启节点不重复初始化() {
+    eprintln!("\n=== 启动 3 节点集群（自动组建）===");
+    let mut cluster = TestCluster::start_auto(&[1, 2, 3]).await;
+    let leader = cluster
+        .wait_cluster_formed(3, Duration::from_secs(60))
+        .await;
+    eprintln!("✓ 自动组建完成，leader = node{leader}");
+
+    // 选一个 follower 重启
+    let victim = (1..=3u64).find(|id| *id != leader).expect("应有 follower");
+
+    // 重启前写入
+    append_to(&cluster, leader, "auto-restart", b"before").await;
+    let applied_before = cluster.raft_state(leader).await.last_applied;
+    cluster
+        .wait_applied(victim, applied_before, Duration::from_secs(10))
+        .await;
+
+    // 重启 victim：日志持久化 → 重启后 is_initialized 跳过自动组建，
+    // 不会重复 initialize（无 NotAllowed 错误，集群健康即隐式证明）
+    cluster.restart_node(victim).await;
+
+    // 停机期间 leader 继续写入
+    append_to(&cluster, leader, "auto-restart", b"during").await;
+    let applied_after = cluster.raft_state(leader).await.last_applied;
+
+    // 重启的节点追平，且集群仍是 3 投票成员
+    cluster
+        .wait_applied(victim, applied_after, Duration::from_secs(20))
+        .await;
+    let s = cluster.raft_state(victim).await;
+    assert_eq!(s.voter_ids.len(), 3, "重启节点应保留投票成员身份");
+    eprintln!("✓ node{victim} 重启后追平且 membership 保留（未重复初始化）");
+
+    let events = read_stream_from(&cluster, victim, "auto-restart").await;
+    let datas: Vec<&[u8]> = events.iter().map(|e| e.data.as_slice()).collect();
+    assert_eq!(datas, vec![b"before".as_ref(), b"during".as_ref()]);
+
+    cluster.shutdown();
+}
+
+#[tokio::test]
+#[ignore = "需启动多个进程，耗时较长"]
+async fn 全集群重启后自动恢复() {
+    eprintln!("\n=== 启动 3 节点集群（自动组建）===");
+    let mut cluster = TestCluster::start_auto(&[1, 2, 3]).await;
+    let leader = cluster
+        .wait_cluster_formed(3, Duration::from_secs(60))
+        .await;
+    eprintln!("✓ 自动组建完成，leader = node{leader}");
+
+    append_to(&cluster, leader, "auto-all-restart", b"persist").await;
+
+    eprintln!("\n=== 重启全部节点 ===");
+    cluster.restart_all().await;
+
+    eprintln!("\n=== 等待集群从本地日志自动恢复（不调用任何组建 API）===");
+    let leader = cluster
+        .wait_cluster_formed(3, Duration::from_secs(60))
+        .await;
+    eprintln!("✓ 全集群重启后自动恢复，leader = node{leader}");
+
+    // 重启前写入的数据完好
+    let events = read_stream_from(&cluster, leader, "auto-all-restart").await;
+    let datas: Vec<&[u8]> = events.iter().map(|e| e.data.as_slice()).collect();
+    assert_eq!(datas, vec![b"persist".as_ref()], "重启前数据应保留");
+
+    cluster.shutdown();
+}
+
+#[tokio::test]
+#[ignore = "需启动多个进程，耗时较长"]
+async fn 节点乱序启动自动组建() {
+    eprintln!("\n=== 乱序启动：先起 node2，再起 node1、node3 ===");
+    // node2 先起：探测不到其它节点，自行用完整成员 initialize（无 quorum 条目未提交）；
+    // node1/node3 起来后探测到 node2 已初始化 → 跳过自举 → 投票使其提交
+    let cluster = TestCluster::start_auto(&[2, 1, 3]).await;
+
+    eprintln!("\n=== 等待自动组建完成 ===");
+    let leader = cluster
+        .wait_cluster_formed(3, Duration::from_secs(90))
+        .await;
+    eprintln!("✓ 乱序启动下集群收敛，leader = node{leader}");
+
+    // 写入验证（写 leader，任一节点读）
+    append_to(&cluster, leader, "auto-ordered", b"ok").await;
+    let applied = cluster.raft_state(leader).await.last_applied;
+    for id in 1..=3u64 {
+        cluster.wait_applied(id, applied, Duration::from_secs(10)).await;
+    }
+    for id in 1..=3u64 {
+        let events = read_stream_from(&cluster, id, "auto-ordered").await;
+        assert_eq!(events.len(), 1, "node{id} 应有 1 条事件");
+    }
+    eprintln!("✓ 乱序启动下数据复制正常");
+
+    cluster.shutdown();
+}
+
+#[tokio::test]
+#[ignore = "需启动多个进程，耗时较长"]
+async fn 单节点peers只含自己自动自举() {
+    eprintln!("\n=== 启动单节点集群（peers 只含自己）===");
+    let cluster = TestCluster::start_single().await;
+
+    let leader = cluster
+        .wait_cluster_formed(1, Duration::from_secs(30))
+        .await;
+    assert_eq!(leader, 1, "单节点集群 leader 应是自己");
+    eprintln!("✓ 单节点自动自举，leader = node{leader}");
+
+    // 单成员 quorum，写读闭环
+    append_to(&cluster, 1, "auto-single", b"solo").await;
+    let events = read_stream_from(&cluster, 1, "auto-single").await;
+    let datas: Vec<&[u8]> = events.iter().map(|e| e.data.as_slice()).collect();
+    assert_eq!(datas, vec![b"solo".as_ref()]);
 
     cluster.shutdown();
 }
