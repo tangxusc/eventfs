@@ -99,6 +99,26 @@ impl RaftAdmin for RaftAdminService {
             return Err(Status::invalid_argument("voter_ids 不能为空"));
         }
 
+        // CAS：expected_voters 非空时校验当前 voters 与期望一致。
+        // 读-改-写窗口内并发变更会被静默覆盖（后到者整体替换），
+        // 客户端应携带读到的快照，冲突时重读后重试（metrics 是 watch 快照，读取不阻塞）
+        if !req.expected_voters.is_empty() {
+            // metrics() 返回 watch::Receiver，borrow 是临时 guard，须 clone 出快照
+            let m = shard.raft.metrics().borrow().clone();
+            let current: BTreeSet<u64> = m.membership_config.membership().voter_ids().collect();
+            let expected: BTreeSet<u64> = req.expected_voters.iter().copied().collect();
+            if current != expected {
+                let fmt = |s: &BTreeSet<u64>| {
+                    s.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",")
+                };
+                return Err(Status::failed_precondition(format!(
+                    "成员集合已变更：当前 [{}]，期望 [{}]，请重读后重试",
+                    fmt(&current),
+                    fmt(&expected)
+                )));
+            }
+        }
+
         let voters: BTreeSet<u64> = req.voter_ids.into_iter().collect();
 
         shard
