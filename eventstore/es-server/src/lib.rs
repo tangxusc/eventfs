@@ -1,5 +1,6 @@
 //! EventStore 服务端库。
 
+pub mod bootstrap;
 pub mod config;
 pub mod server;
 pub mod service;

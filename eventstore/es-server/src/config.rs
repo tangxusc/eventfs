@@ -25,7 +25,10 @@ pub struct NodeConfig {
     /// gRPC 监听地址
     pub listen_addr: String,
 
-    /// Raft 集群节点列表 (node_id -> addr)
+    /// Raft 集群节点列表 (node_id -> addr)。
+    ///
+    /// 可省略（单节点部署或手动组建路径）：缺省为空，不触发自动组建。
+    #[serde(default)]
     pub peers: Vec<PeerConfig>,
 }
 

@@ -94,7 +94,22 @@ impl Server {
         }
 
         tracing::info!("Initialization complete: {} shards", self.config.shards.num_shards);
+
+        // 配置了 node.peers 时后台自动组建集群（etcd 静态引导语义）。
+        // 不阻塞 serve：组建失败仅告警，可经 RaftAdmin 手动接管。
+        self.spawn_bootstrap();
+
         Ok(())
+    }
+
+    /// 后台自动组建集群任务。
+    ///
+    /// 在 serve 绑定端口之前 spawn：任务第一步会 TCP 轮询等所有 peers（含自己）
+    /// 端口就绪，serve 绑定在毫秒级内完成，时序自洽。
+    pub fn spawn_bootstrap(&self) -> tokio::task::JoinHandle<()> {
+        let config = self.config.clone();
+        let sm = self.shard_manager.clone();
+        tokio::spawn(async move { crate::bootstrap::run(&config, sm).await })
     }
 
     /// 启动 gRPC 服务器。
