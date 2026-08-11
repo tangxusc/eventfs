@@ -345,15 +345,16 @@ impl EventStore for EsService {
         let desc = req.direction == Direction::Backward as i32;
 
         // 确定要读的分片及各自起点：from_positions 非空时优先，用于翻页
-        let cursors: Vec<(u64, u64)> = if !req.from_positions.is_empty() {
+        let cursors: Vec<ShardPosition> = if !req.from_positions.is_empty() {
             req.from_positions
-                .iter()
-                .map(|c| (c.shard_id, c.from_position))
-                .collect()
         } else {
             req.shard_ids
                 .iter()
-                .map(|&s| (s, req.from_position))
+                .map(|&s| ShardPosition {
+                    shard_id: s,
+                    from_position: req.from_position,
+                    ended: false,
+                })
                 .collect()
         };
 
@@ -361,22 +362,28 @@ impl EventStore for EsService {
         // 各取 max_count 条即可保证归并出的首 max_count 条正确。
         let per_shard_limit = req.max_count;
         let mut streams: Vec<Vec<Event>> = Vec::with_capacity(cursors.len());
-        for (shard_id, from) in &cursors {
+        for cursor in &cursors {
+            let shard_id = cursor.shard_id;
             let shard = self
                 .shard_manager
-                .get_shard(*shard_id)
+                .get_shard(shard_id)
                 .await
                 .map_err(|e| Status::not_found(format!("分片 {shard_id}: {e}")))?;
 
-            let events = if desc {
+            // 反向读尽（ended=true）的分片不再有更早事件，直接给空流；
+            // 不能仅靠 from==0 判断——「消费到 position 1 → 游标 0」时
+            // position 0 仍未读，from=0 必须能读到它
+            let events = if desc && cursor.ended {
+                Vec::new()
+            } else if desc {
                 shard
                     .storage
-                    .read_all_events_backward(*from, per_shard_limit)
+                    .read_all_events_backward(cursor.from_position, per_shard_limit)
                     .map_err(|e| Status::internal(format!("read_all_events_backward 失败: {e}")))?
             } else {
                 shard
                     .storage
-                    .read_all_events(*from, per_shard_limit)
+                    .read_all_events(cursor.from_position, per_shard_limit)
                     .map_err(|e| Status::internal(format!("read_all_events 失败: {e}")))?
             };
 
@@ -395,7 +402,7 @@ impl EventStore for EsService {
                             logical: e.hlc.logical,
                         }),
                         position: e.position,
-                        shard_id: *shard_id,
+                        shard_id,
                     })
                     .collect(),
             );
@@ -406,21 +413,31 @@ impl EventStore for EsService {
         // 每分片「下一页的续读起点」= 归并消费水位推进，而非读水位：
         // 读到但被全局截断丢弃的缓冲尾部必须留在游标之后（下一页重读），
         // 否则数据永久丢失。服务端驱动游标，客户端翻页原样透传。
-        // 正序 = 最后消费 position + 1；倒序 = 最后消费 position - 1
-        // （消费到 position=0 已到边界，不再续读）；未消费的路 = 起点不变。
+        // 正序 = 最后消费 position + 1；倒序 = 最后消费 position - 1；
+        // 倒序消费到 position 0 时置 ended=true（该分片已读尽，服务端对
+        // 它返回空页且游标不变）——空页是正反两个方向的统一终止条件。
+        // 未消费的路 = 起点不变（含 ended 状态）。
         let mut next_positions: Vec<ShardPosition> = Vec::with_capacity(cursors.len());
-        for ((shard_id, from), consumed_pos) in cursors.iter().zip(consumed.iter()) {
+        for (cursor, consumed_pos) in cursors.iter().zip(consumed.iter()) {
+            // 每分片恒得一条游标（正反向统一，含读尽标记），客户端翻页原样透传
             let next = match (desc, consumed_pos) {
-                (false, Some(p)) => Some((*shard_id, p.saturating_add(1))),
-                (true, Some(p)) => (*p > 0).then(|| (*shard_id, p.saturating_sub(1))),
-                (_, None) => Some((*shard_id, *from)), // 未消费：起点不变，下一页重读
+                (false, Some(p)) => ShardPosition {
+                    shard_id: cursor.shard_id,
+                    from_position: p.saturating_add(1),
+                    ended: false,
+                },
+                (true, Some(p)) => ShardPosition {
+                    shard_id: cursor.shard_id,
+                    from_position: p.saturating_sub(1),
+                    ended: *p == 0,
+                },
+                (_, None) => ShardPosition {
+                    shard_id: cursor.shard_id,
+                    from_position: cursor.from_position,
+                    ended: cursor.ended, // 未消费：起点不变，下一页重读
+                },
             };
-            if let Some((sid, pos)) = next {
-                next_positions.push(ShardPosition {
-                    shard_id: sid,
-                    from_position: pos,
-                });
-            }
+            next_positions.push(next);
         }
 
         // 流式返回

@@ -71,6 +71,7 @@ pub async fn run_all(ctx: &Ctx, args: &ReadAllArgs) -> Result<()> {
                     .map(|(s, p)| ShardPosition {
                         shard_id: *s,
                         from_position: *p,
+                        ended: false, // 用户显式起点：未读尽
                     })
                     .collect();
                 (ids, sps)
@@ -104,30 +105,36 @@ pub async fn run_all(ctx: &Ctx, args: &ReadAllArgs) -> Result<()> {
     // 也会推进），不再由客户端从本页事件推算——否则页内缺失的分片
     // 会在续读中永久消失（旧缺陷）。
     let count = events.len();
-    if args.max_count > 0 && count as u64 >= args.max_count && !next_positions.is_empty() {
-        let next: Vec<(u64, u64)> = next_positions
-            .iter()
-            .map(|sp| (sp.shard_id, sp.from_position))
-            .collect();
-        match ctx.format {
-            Format::Json => {
-                // json 只输出一行：取满时把续读游标并入同一对象
-                let mut value: serde_json::Value =
-                    serde_json::from_str(&commands::render_events(ctx.format, &events))
-                        .context("解析 JSON")?;
-                let next_text: Vec<String> = next.iter().map(|(s, p)| format!("{s}:{p}")).collect();
-                if let serde_json::Value::Object(ref mut obj) = value {
-                    obj.insert("next_from_positions".into(), serde_json::json!(next_text));
+    if args.max_count > 0 && count as u64 >= args.max_count {
+        // 反向读尽的分片（ended=true）不再有更早事件，从续读提示中剔除
+        let active: Vec<ShardPosition> = next_positions.iter().filter(|sp| !sp.ended).cloned().collect();
+        if !active.is_empty() {
+            let next: Vec<(u64, u64)> = active
+                .iter()
+                .map(|sp| (sp.shard_id, sp.from_position))
+                .collect();
+            match ctx.format {
+                Format::Json => {
+                    // json 只输出一行：取满时把续读游标并入同一对象
+                    let mut value: serde_json::Value =
+                        serde_json::from_str(&commands::render_events(ctx.format, &events))
+                            .context("解析 JSON")?;
+                    let next_text: Vec<String> = next.iter().map(|(s, p)| format!("{s}:{p}")).collect();
+                    if let serde_json::Value::Object(ref mut obj) = value {
+                        obj.insert("next_from_positions".into(), serde_json::json!(next_text));
+                    }
+                    println!("{value}");
                 }
-                println!("{value}");
+                Format::Simple | Format::Table => {
+                    println!("{}", commands::render_events(ctx.format, &events));
+                    eprintln!(
+                        "# 下一页：esctl readall --from-positions \"{}\"",
+                        commands::from_positions_text(&next)
+                    );
+                }
             }
-            Format::Simple | Format::Table => {
-                println!("{}", commands::render_events(ctx.format, &events));
-                eprintln!(
-                    "# 下一页：esctl readall --from-positions \"{}\"",
-                    commands::from_positions_text(&next)
-                );
-            }
+        } else {
+            println!("{}", commands::render_events(ctx.format, &events));
         }
     } else {
         println!("{}", commands::render_events(ctx.format, &events));

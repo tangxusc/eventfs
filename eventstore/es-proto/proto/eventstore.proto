@@ -87,6 +87,10 @@ message ShardPosition {
   uint64 shard_id = 1;
   // 起始 position（含）
   uint64 from_position = 2;
+  // 反向读尽标记：该分片反向已消费到 position 0（最早事件），不再有更早
+  // 的事件可读。仅反向翻页由服务端置 true；true 时服务端对该分片返回
+  // 空页且游标保持不变。正向（或其它用法）恒为 false。
+  bool ended = 3;
 }
 
 message ReadAllRequest {
@@ -110,8 +114,9 @@ message ReadEventsResponse {
   repeated Event events = 1;
   // 仅 ReadAll 填充：每分片一条，为「该分片下一页的续读起点」。
   // 正序 = 本页最后一条 position + 1；倒序 = 本页最小 position - 1。
-  // 本页未读到事件的分片起点不变；倒序已到分片边界（min == 0）的分片不列入
-  // （该分片不再续读）。客户端翻页时原样透传为 ReadAllRequest.from_positions。
+  // 本页未读到事件的分片起点不变；倒序消费到 position 0 的分片置
+  // ended=true（该分片已读尽，不再有更早事件）。客户端翻页时原样
+  // 透传为 ReadAllRequest.from_positions。
   repeated ShardPosition next_positions = 2;
 }
 

@@ -13,7 +13,8 @@
 - **混合逻辑时钟（HLC）**：leader 提交前分配并随日志下发，各副本 apply 出相同时间戳，为日后的近似全序预留基础
 - **流订阅**：先补齐历史（catch-up）再转为实时推送（broadcast），追平边界不丢事件，落后时退回扫描补齐
 - **跨分片 ReadAll**：按 HLC 做 k 路归并（保分片内 position 序），服务端按归并消费水位
-  驱动逐分片续读游标（`next_positions`，客户端原样透传翻页），支持反向
+  驱动逐分片续读游标（`next_positions`，客户端原样透传翻页），支持反向；
+  反向读到分片最早事件后游标带 `ended` 读尽标记，**空页即终止**（正反两向一致）
 - **离线 reshard**：变更分片数时按新路由重写数据，保留 `stream_id` / `version` / `event_id` / HLC，重新分配 position
 
 ## 架构
@@ -210,7 +211,7 @@ esctl reshard --src-dir ./data --src-shards 2 --dst-dir ./data-new --dst-shards 
 ## 测试
 
 ```bash
-# 默认套件，302 项
+# 默认套件，349 项
 cargo test --workspace
 
 # 多节点测试：12 项（7 手动组建 + 5 自动组建），测试框架自动构建并直接运行二进制
@@ -219,14 +220,14 @@ cargo test -p es-server --test multi_node_test -- --ignored --test-threads=1
 
 | 套件 | 项数 | 内容 |
 |---|---|---|
-| `es-core` | 24 | HLC 单调性、分片路由、leader 重定向策略（parse_leader_hint / LeaderRetryPlan） |
+| `es-core` | 30 | HLC 单调性、分片路由、leader 重定向策略（parse_leader_hint / LeaderRetryPlan，含预算尾槽重定向） |
 | `es-proto` | 10 | gRPC 代码生成验证、TLS 信任策略、端点归一化 |
 | `es-storage` | 58 | Key 编码排序性质、日志语义、apply、快照、reshard |
 | `es-raft/partition_test` | 6 | 网络分区、快照追赶、慢节点（进程内可控网络层） |
-| `es-server/e2e_test` | 19 | 端到端读写、乐观并发、订阅、跨分片 ReadAll、反向读取 |
+| `es-server/e2e_test` | 21 | 端到端读写、乐观并发、订阅、跨分片 ReadAll、反向读取与反向翻页终止 |
 | `es-server/server_test` | 1 | 服务器启动与分片初始化 |
 | `es-server/multi_node_test` | 12 | 3 节点真实进程集群（7 项手动组建 + 5 项自动组建，`--ignored` 启用） |
-| `es-client` | 29 | SDK 单测 7 + stub 集成 18 + 进程内 e2e 4（重定向重试、翻页、订阅、元数据） |
+| `es-client` | 32 | SDK 单测 7 + stub 集成 18 + 进程内 e2e 7（重定向重试、正反向翻页、订阅含 catch-up 窗口、元数据） |
 | `es-ctl` 单测 | 77 | 参数解析、leader 提示解析、分片探测、输出渲染、重定向重试 |
 | `es-ctl/e2e_test` | 22 | 进程内全链路：读写/订阅/管理面/TLS/双节点成员管理/翻页/CAS |
 | `es-ctl/reshard_test` | 7 | 离线 reshard 端到端（数据完整、负例、LOCK 约束） |

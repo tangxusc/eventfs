@@ -53,6 +53,9 @@ esctl meta <STREAM>
   simple/table 为 stderr 提示行）。**续读游标由服务端驱动**（覆盖全部分片，
   本页被跨分片归并丢弃的分片也会推进），把提示的游标原样传给 `--from-positions`
   即续读——不要自行从本页事件推算游标，页内缺失分片的事件会永久读不到
+- **反向终止**：`--backward` 反向读到分片最早事件（position 0）后，该分片游标
+  带 `ended` 标记（已读尽，不再出现在续读提示中）；继续翻页会得到空页
+  ——**空页即终止**，正反两个方向一致
 - 事件行格式（simple）：`{version}\t{RFC3339}\t[{event_type}]\t{data}`，
   data 非 UTF-8 时输出 `hex:..`
 

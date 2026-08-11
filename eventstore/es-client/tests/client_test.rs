@@ -421,6 +421,7 @@ async fn read_all_merges_pages_and_exposes_next_positions() {
             next_positions: vec![ShardPosition {
                 shard_id: 0,
                 from_position: 5,
+                ended: false,
             }],
         },
         ReadEventsResponse {
@@ -428,6 +429,7 @@ async fn read_all_merges_pages_and_exposes_next_positions() {
             next_positions: vec![ShardPosition {
                 shard_id: 0,
                 from_position: 10,
+                ended: false,
             }],
         },
     ]);
@@ -446,6 +448,7 @@ async fn read_all_merges_pages_and_exposes_next_positions() {
         vec![ShardPosition {
             shard_id: 0,
             from_position: 10,
+            ended: false,
         }],
         "next_positions 取最后一页"
     );
@@ -462,6 +465,7 @@ async fn read_all_passes_through_from_positions() {
     let page_cursor = vec![ShardPosition {
         shard_id: 1,
         from_position: 42,
+        ended: false,
     }];
     let (_events, _next) = client
         .read_all(vec![], 0, 10, es_client::Direction::Forward, page_cursor.clone())

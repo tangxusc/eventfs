@@ -629,6 +629,7 @@ async fn read_all_per_shard_cursor_paging() {
         .map(|&s| ShardPosition {
             shard_id: s,
             from_position: next.get(&s).copied().unwrap_or(0),
+            ended: false,
         })
         .collect();
 
@@ -777,10 +778,12 @@ async fn cross_shard_read_all_backward() {
                 ShardPosition {
                     shard_id: 0,
                     from_position: u64::MAX,
+                    ended: false,
                 },
                 ShardPosition {
                     shard_id: 1,
                     from_position: u64::MAX,
+                    ended: false,
                 },
             ],
         })
@@ -816,6 +819,153 @@ async fn cross_shard_read_all_backward() {
     eprintln!("正序流名: {:?}", fwd_streams);
     eprintln!("倒序流名: {:?}", back_streams);
 
+    handle.abort();
+}
+
+/// 反向翻页必须干净终止：消费到 position 0 后游标保留为 0（而非被丢弃），
+/// 下页 from=0 返回空页 —— 空页是正反两向统一的终止条件。
+/// 修复前（游标被丢弃 → 客户端保留旧游标重读尾页）该测试死循环在 pages 守卫上。
+#[tokio::test]
+async fn read_all_backward_paging_terminates() {
+    let (addr, handle, _server, _dir) = start_test_server().await;
+    let mut client = EventStoreClient::connect(addr).await.expect("连接");
+
+    // 10 个流分散到 2 分片
+    for i in 0..10u8 {
+        let stream = format!("p{i}");
+        append_one(&mut client, &stream, &[b'a' + i]).await;
+    }
+
+    // 首页：统一从 u64::MAX 哨兵反向读
+    let mut from_positions: Vec<ShardPosition> = vec![0, 1]
+        .iter()
+        .map(|&sid| ShardPosition {
+            shard_id: sid,
+            from_position: u64::MAX,
+            ended: false,
+        })
+        .collect();
+
+    let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+    let mut total = 0;
+    let mut pages = 0;
+    let mut last_next: Vec<ShardPosition> = Vec::new();
+    loop {
+        pages += 1;
+        assert!(pages < 10, "反向翻页应干净终止（最多 ~4 页），当前卡在第 {pages} 页");
+        let mut s = client
+            .read_all(ReadAllRequest {
+                shard_ids: vec![],
+                from_position: 0,
+                max_count: 4,
+                direction: Direction::Backward as i32,
+                from_positions: from_positions.clone(),
+            })
+            .await
+            .expect("反向翻页")
+            .into_inner();
+        let mut page_events = Vec::new();
+        while let Some(r) = s.message().await.expect("读响应") {
+            page_events.extend(r.events);
+            from_positions = r.next_positions;
+        }
+        for e in &page_events {
+            assert!(
+                seen.insert((e.shard_id, e.position)),
+                "事件 (shard {}, position {}) 重复投递",
+                e.shard_id,
+                e.position
+            );
+        }
+        total += page_events.len();
+        if page_events.is_empty() {
+            assert_eq!(
+                from_positions, last_next,
+                "空页游标应稳定不变（读尽分片游标为 0）"
+            );
+            break;
+        }
+        last_next = from_positions.clone();
+    }
+    assert_eq!(total, 10, "应恰好收到 10 条事件");
+    assert!(pages >= 2, "max_count=4 应至少翻 2 页");
+    handle.abort();
+}
+
+/// 首页即反向读尽（单分片 3 条、max_count=4）：游标必须保留为
+/// (shard, 0) 而非被丢弃；翻页 from=0 返回空页且游标稳定。
+#[tokio::test]
+async fn read_all_backward_last_page_cursor_zero_kept() {
+    let (addr, handle, _server, _dir) = start_test_server().await;
+    let mut client = EventStoreClient::connect(addr).await.expect("连接");
+
+    // 单流 3 条（同分片），从 append 响应取实际分片号
+    let mut shard_id = 0u64;
+    for i in 0..3u8 {
+        let resp = append_one(&mut client, "one", &[i]).await;
+        shard_id = resp.shard_id;
+    }
+
+    let mut s = client
+        .read_all(ReadAllRequest {
+            shard_ids: vec![],
+            from_position: 0,
+            max_count: 4,
+            direction: Direction::Backward as i32,
+            from_positions: vec![ShardPosition {
+                shard_id,
+                from_position: u64::MAX,
+                ended: false,
+            }],
+        })
+        .await
+        .expect("首页反向读")
+        .into_inner();
+    let mut events = Vec::new();
+    let mut next_positions = Vec::new();
+    while let Some(r) = s.message().await.expect("读响应") {
+        events.extend(r.events);
+        next_positions = r.next_positions;
+    }
+    assert_eq!(events.len(), 3, "首页应读到全部 3 条");
+    assert_eq!(
+        next_positions,
+        vec![ShardPosition {
+            shard_id,
+            from_position: 0,
+            ended: true, // 消费到 position 0：该分片已读尽
+        }],
+        "消费到 position 0 后游标应保留为 (shard, 0, ended)，而非被丢弃"
+    );
+
+    // 翻页：ended 分片返回空页（不重投 position 0），游标稳定 → 干净终止
+    let mut s = client
+        .read_all(ReadAllRequest {
+            shard_ids: vec![],
+            from_position: 0,
+            max_count: 4,
+            direction: Direction::Backward as i32,
+            from_positions: next_positions,
+        })
+        .await
+        .expect("翻页反向读")
+        .into_inner();
+    let mut tail_events = Vec::new();
+    let mut tail_positions = Vec::new();
+    while let Some(r) = s.message().await.expect("读响应") {
+        tail_events.extend(r.events);
+        tail_positions = r.next_positions;
+    }
+    assert!(tail_events.is_empty(), "ended 分片应返回空页");
+    assert_eq!(
+        tail_positions,
+        vec![ShardPosition {
+            shard_id,
+            from_position: 0,
+            ended: true,
+        }],
+        "空页游标应稳定"
+    );
     handle.abort();
 }
 
