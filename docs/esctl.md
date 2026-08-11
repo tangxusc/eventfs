@@ -21,7 +21,7 @@ cargo build --bin esctl
 | `--cacert <FILE>` | 无 | 严格校验服务端证书的 CA 文件（PEM）；与 `--insecure-skip-tls-verify` 互斥；仅 https 端点生效 |
 | `--insecure-skip-tls-verify` | false | 跳过 https 端点证书校验（自签友好，默认行为）；仅 https 端点生效 |
 | `-w, --write-out <FMT>` | simple | 输出格式：`simple`（逐行文本）/ `table`（对齐表格）/ `json`（结构化） |
-| `--shards <N>` | 自动探测 | 分片总数；缺省时对 shard 0,1,2,… 逐次 `GetRaftState` 探测（首个 `not_found` 即边界），探测失败回退默认 8 并告警 |
+| `--shards <N>` | 自动探测 | 分片总数（≥ 1，`0` 是参数错误）；缺省时对 shard 0,1,2,… 逐次 `GetRaftState` 探测（首个 `not_found` 即边界），探测失败回退默认 8 并告警 |
 
 退出码：**0** 成功 / **1** 运行时失败（连接失败、无 leader、乐观并发冲突等）/ **2** 参数错误（clap）。
 
@@ -50,7 +50,9 @@ esctl meta <STREAM>
 - `--max-count 0` 表示不限量；`--backward` 反向读，未指定 `--from-version` 时从最新开始
 - `readall` 的 `--from-positions` 非空时覆盖 `--from-position` 与 `--shard-ids`；
   `--max-count` 取满时输出下一页续读游标（json 为 `next_from_positions` 字段，
-  simple/table 为 stderr 提示行）
+  simple/table 为 stderr 提示行）。**续读游标由服务端驱动**（覆盖全部分片，
+  本页被跨分片归并丢弃的分片也会推进），把提示的游标原样传给 `--from-positions`
+  即续读——不要自行从本页事件推算游标，页内缺失分片的事件会永久读不到
 - 事件行格式（simple）：`{version}\t{RFC3339}\t[{event_type}]\t{data}`，
   data 非 UTF-8 时输出 `hex:..`
 
@@ -63,7 +65,9 @@ esctl watch --all [--shard <N=0>] [--from-exclusive <N>] [--from-start] [--once]
 
 先补齐历史（catch-up），追平后显示「已追平，进入实时推送」并转为实时推送。
 `--once` 追平即退出（退出码 0），供脚本与测试使用；不带 `--once` 持续运行，Ctrl-C 终止。
-已知限制：`--all`（$all 订阅）服务端目前仅支持分片 0。
+`--all` 订阅 $all 时用 `--shard <N>` 指定分片（默认 0）：一次订阅一个分片的 $all，
+多分片需各自发起订阅。`--once` 在收到 caught_up 前流被关闭（如订阅者落后被服务端断开）
+时以退出码 1 报错——退出码 0 只代表「已追平」。
 
 ### 管理面
 
@@ -78,12 +82,16 @@ esctl member list [--shards <N>]
 - **每个分片是独立的 Raft group**：多分片集群必须对每个分片各自执行。
   `--all-shards` 对全部分片执行相同操作（分片数来自 `--shards`/自动探测）
 - `init`：把给定成员写入首条 membership 日志，只需在一个节点调用一次；
-  initialize 不需要 leader；已初始化的分片报错（退出码 1）
+  initialize 不需要 leader；已初始化的分片报错（退出码 1）。
+  `--all-shards` 遇已初始化的分片**告警后继续补完其余分片**，最后整体报错
 - `member add`：先加为 learner（默认等待追平，`--no-blocking` 关闭），
-  再 `change_membership` 提升为投票成员；`--learner-only` 只加 learner 不提升
+  再 `change_membership` 提升为投票成员；`--learner-only` 只加 learner 不提升。
+  `change_membership` 携带 CAS 期望快照（当前 voters 集合）：读-改-写窗口内
+  并发变更会使后到者返回 `FailedPrecondition`，esctl 自动重读重试
 - `member remove`：从投票成员中移除；`--retain` 降级为 learner 而非剔除。
   **learner 无法移除**（RaftAdmin 无 remove_learner RPC）；目标不在 voters 时校验失败
-- `member list`：遍历 0..N × `--endpoints` 聚合 `GetRaftState`。
+- `member list`：遍历 0..N × `--endpoints` 聚合 `GetRaftState`；
+  全部端点不可达时退出码 1（不把网络故障误报为"未初始化"）。
   已知限制：RPC 不暴露成员地址与 learner 集合，故无地址列、无 learner 行
 
 ### 端点健康
@@ -105,7 +113,11 @@ esctl reshard --src-dir <DIR> --src-shards <N> --dst-dir <DIR> --dst-shards <M> 
 集群未停时目标目录被 LOCK 占用，命令直接拒绝（退出码 1）。核心逻辑复用
 `es_storage::reshard::reshard()`（K 路归并 + position 重分配，保留
 stream_id/version/event_id/HLC）。非 `--yes` 时交互确认（非交互 stdin 视为拒绝）。
-目标目录已存在且非空时需 `--yes` 确认覆盖。参数与输出示例见 [docs/reshard.md](reshard.md)。
+目标目录已存在且非空时需 `--yes` 确认覆盖；**目标目录不存在时自动创建**（无需预建）。
+`--src-shards` 必须与数据目录实际布局一致（按数据中出现的最大分片推断），
+少报分片数会导致枚举范围之外的分片数据被跳过——不一致直接拒绝（退出码 1）。
+任何失败路径都会 flush 并关闭已打开的 tree（释放 LOCK，不留未落盘脏数据）。
+参数与输出示例见 [docs/reshard.md](reshard.md)。
 
 ## 输出格式
 
@@ -123,14 +135,16 @@ SHARD  NODE  STATE     TERM  LEADER  LAST_APPLIED  VOTER
 ## 连接与 leader 发现策略
 
 - **连接**：端点归一化（裸地址补 `http://`，与节点间 Raft 网络同一规则）、
-  TLS 装配（`--cacert` 严格校验 / 默认跳过校验，仅 https 生效）、按端点惰性建连并缓存
+  TLS 装配（`--cacert` 严格校验 / 默认跳过校验，仅 https 生效）、按端点惰性建连并缓存。
+  单个端点**建连失败会故障转移到下一个端点**（不会中止整个命令）
 - **数据面写**（append）：依序尝试各端点（轮询起点分散负载）→ 非 leader 返回
   `Unavailable` 且 message 带 `leader_addr` 时优先重定向该地址 →
   `leader unknown`（选举中）退避重试并轮换其它端点 → 乐观冲突（`FailedPrecondition`）
   原样上抛。已知限制：openraft 不总填充 `leader_node` 信息（`leader_addr=` 为空），
   此时无法重定向，靠端点列表轮换兜底——多端点部署建议 `--endpoints` 给出全部节点
 - **管理面写**（member add/remove）：管理面错误不带 leader 提示，先对每个端点
-  `GetRaftState` 找 `is_leader` 的端点再执行，失败重跑最多 3 轮
+  `GetRaftState` 找 `is_leader` 的端点再执行；leader 探测失败（选举中/端点不可达）
+  与 RPC 失败都重试，最多 3 轮（分片未初始化是永久错误，直接返回）
 - **读**（read/readall/meta）：任一可达端点即可
 
 ## 与 etcdctl 对应关系

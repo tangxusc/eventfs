@@ -197,13 +197,21 @@ cargo build --bin esctl
 
 安全约束（fail-fast）：集群未停时数据目录被 LOCK 占用，命令直接拒绝；
 目标目录已存在且非空时需 `--yes` 确认覆盖；源/目标目录必须不同、分片数 ≥1。
-端到端测试见 `es-ctl/tests/reshard_test.rs`（数据完整、负例、LOCK 约束、json 输出）。
+**目标目录不存在时自动创建**（示例中的 `data-new` 无需预先 mkdir）。
+`--src-shards` 必须与数据目录实际布局一致：执行前按数据中出现的最大分片推断
+实际分片数，不一致直接拒绝——少报分片数时，哈希落在枚举范围之外的分片数据
+会被静默跳过（且源/目标计数来自同一枚举子集、完整性校验拦不住）。
+任何失败路径都会 flush 并关闭已打开的 tree（释放 LOCK，不留未落盘脏数据）。
+端到端测试见 `es-ctl/tests/reshard_test.rs`（数据完整、负例、LOCK 约束、
+src-shards 不匹配、全新目标目录、json 输出）。
 
 ### 测试现状
 
 - **单元测试**（`es-storage/src/reshard.rs` 内嵌 `#[cfg(test)] mod tests`）：
-  1 项 `reshard_空到空无错误`。完整含数据场景的测试（写入真实数据 → reshard →
-  验证版本/event_id/position 连续性）尚未补充，属后续工作。
+  `reshard_空到空无错误`、`reshard_稀疏布局_按声明分片数路由不丢数据`（4 分片布局只写
+  分片 0/3，验证读事件按声明的 `src_num_shards` 路由而非按数据推断，稀疏布局不丢数据）。
+  含数据场景的完整 e2e（写入真实数据 → reshard → 验证 version/event_id/position 连续性）
+  见 `es-ctl/tests/reshard_test.rs`。
 - **基准测试**（`es-storage/benches/storage_bench.rs`）：覆盖 10 / 100 流两种规模，
   结果见 `benchmarks.md`。
 - **手工验证流程**（计划）：

@@ -12,7 +12,8 @@
 - **单事务原子提交**：事件、流元数据、position 指针、幂等索引、已应用状态在同一 surrealkv 事务内提交，崩溃不留下版本回退
 - **混合逻辑时钟（HLC）**：leader 提交前分配并随日志下发，各副本 apply 出相同时间戳，为日后的近似全序预留基础
 - **流订阅**：先补齐历史（catch-up）再转为实时推送（broadcast），追平边界不丢事件，落后时退回扫描补齐
-- **跨分片 ReadAll**：按 HLC 做 k 路归并（保分片内 position 序），逐分片游标翻页，支持反向
+- **跨分片 ReadAll**：按 HLC 做 k 路归并（保分片内 position 序），服务端按归并消费水位
+  驱动逐分片续读游标（`next_positions`，客户端原样透传翻页），支持反向
 - **离线 reshard**：变更分片数时按新路由重写数据，保留 `stream_id` / `version` / `event_id` / HLC，重新分配 position
 
 ## 架构
@@ -185,12 +186,12 @@ let mut client = EventStoreClient::connect_with_tls(
 # 数据面：写事件、读流、跨分片读 $all、查流元数据
 esctl append orders/1 --event-type OrderPlaced --data '{"qty":1}' --expected-version nostream
 esctl read orders/1 --from-version 0 --max-count 100
-esctl readall --max-count 100          # 取满时输出下一页续读游标提示
+esctl readall --max-count 100          # 取满时输出下一页续读游标（服务端 next_positions 驱动）
 esctl meta orders/1
 
 # 订阅：先追平历史再实时推送；--once 追平即退出（脚本/测试用）
 esctl watch orders/1 --from-start
-esctl watch --all --from-start
+esctl watch --all --shard 1 --from-start   # $all 订阅分片 1（一次一个分片）
 
 # 管理面：初始化分片（每个分片独立 Raft group）、加/删成员、查看状态
 esctl init --all-shards --member 1@127.0.0.1:50051 --member 2@127.0.0.1:50052
@@ -226,7 +227,7 @@ cargo test -p es-server --test multi_node_test -- --ignored --test-threads=1
 | `es-server/server_test` | 1 | 服务器启动与分片初始化 |
 | `es-server/multi_node_test` | 11 | 3 节点真实进程集群（6 项手动组建 + 5 项自动组建，`--ignored` 启用） |
 | `es-ctl` 单测 | 47 | 参数解析、leader 提示解析、分片探测、输出渲染 |
-| `es-ctl/e2e_test` | 15 | 进程内全链路：读写/订阅/管理面/TLS/双节点成员管理 |
+| `es-ctl/e2e_test` | 22 | 进程内全链路：读写/订阅/管理面/TLS/双节点成员管理/翻页/CAS |
 | `es-ctl/reshard_test` | 5 | 离线 reshard 端到端（数据完整、负例、LOCK 约束） |
 | `es-ctl/multi_node_test` | 2 | esctl 组建三节点真实进程集群（`--ignored` 启用） |
 
@@ -274,7 +275,7 @@ cargo bench -p es-storage
 - [ ] reshard 并行处理与增量重分布（中断后可续跑）
 - [ ] 在线分片变更（方案 B 分裂/合并 或方案 C 虚拟节点，需架构级改动）
 - [ ] 磁盘故障注入测试
-- [ ] 跨分片 `$all` 订阅（当前只读 shard 0）
+- [ ] 跨分片 `$all` 聚合订阅（当前 `--all` 按 `--shard` 单分片订阅，多分片需各自发起）
 
 **可观测性与基准**
 - [ ] Prometheus 指标（当前只有 tracing 日志）
@@ -304,7 +305,8 @@ cargo bench -p es-storage
   运行前须备份。reshard 后客户端的 position 游标失效，需从头读或用别的方式续读。
 - **`esctl member remove` 无法移除 learner**：RaftAdmin 无 remove_learner RPC；
   `member list` 不含地址列与 learner 行（GetRaftState 不暴露成员地址）。
-- **`esctl watch --all` 仅支持分片 0**：服务端 `$all` 订阅的已知限制。
+- **`esctl watch --all` 单分片订阅**：`--shard <N>` 指定分片（默认 0），多分片 $all
+  需各自发起订阅；跨分片聚合订阅尚未实现。
 - **快照为全量、未压缩**：每次 `build_snapshot` 用 serde_json 序列化整个分片状态机，
   大状态机体积偏大。
 
