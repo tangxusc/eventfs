@@ -717,6 +717,49 @@ async fn non_leader_write_rejected_read_ok() {
 
 #[tokio::test]
 #[ignore = "需启动多个进程，耗时较长"]
+async fn sdk_append_redirects_to_leader() {
+    // SDK 只给 follower 地址：leader_addr 不在初始节点列表，
+    // 必须走完整重定向路径（解析 Unavailable → 连接新地址）才能写入。
+    let cluster = TestCluster::start().await;
+    cluster.form_cluster().await;
+    let leader = cluster.wait_for_leader(Duration::from_secs(10)).await;
+    let follower = (1..=3u64).find(|id| *id != leader).expect("应有 follower");
+
+    let mut sdk = es_client::EventStoreClient::connect(vec![cluster.addr_of(follower)])
+        .await
+        .expect("连接 SDK");
+    sdk.append(
+        "sdk-redirect".to_string(),
+        es_client::ExpectedVersionBuilder::any(),
+        vec![es_client::EventBuilder::new("E").data(b"x".to_vec()).build()],
+    )
+    .await
+    .expect("经 leader_addr 重定向后 append 成功");
+    eprintln!("✓ SDK 经 leader_addr 重定向写入成功");
+
+    // 等复制后经 SDK 从 follower 读回（读走本地存储，任一节点可达）
+    let applied = cluster.raft_state(leader).await.last_applied;
+    cluster
+        .wait_applied(follower, applied, Duration::from_secs(10))
+        .await;
+    let events = sdk
+        .read_stream(
+            "sdk-redirect".to_string(),
+            0,
+            10,
+            es_client::Direction::Forward,
+        )
+        .await
+        .expect("SDK 读回");
+    assert_eq!(events.len(), 1, "follower 应能读到经重定向写入的数据");
+    assert_eq!(events[0].data, b"x");
+    eprintln!("✓ SDK 从 follower 读回重定向写入的数据");
+
+    cluster.shutdown();
+}
+
+#[tokio::test]
+#[ignore = "需启动多个进程，耗时较长"]
 async fn leader_killed_re_elect_data_intact() {
     let mut cluster = TestCluster::start().await;
     cluster.form_cluster().await;

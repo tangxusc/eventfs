@@ -1,7 +1,7 @@
 //! 集群连接管理：端点归一化、TLS 装配、惰性通道缓存、leader 发现与重定向。
 
-use std::collections::VecDeque;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::future::Future;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11,29 +11,12 @@ use anyhow::{Context, anyhow, bail};
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Status};
 
+use es_core::{LeaderRetryPlan, parse_leader_hint};
 use es_proto::endpoint::normalize_endpoint;
 use es_proto::eventstore::event_store_client::EventStoreClient;
 use es_proto::eventstore::raft_admin_client::RaftAdminClient;
 use es_proto::eventstore::{GetRaftStateRequest, GetRaftStateResponse};
 use es_proto::tls::{TlsClientConfig, apply_endpoint_tls};
-
-/// 解析服务端返回的 leader 重定向提示。
-///
-/// 格式（es-server/src/service.rs `client_write_to_status`）：
-/// - `"not leader; leader_id=3 leader_addr=http://127.0.0.1:50052"` → 地址
-/// - `"not leader; leader unknown, retry later"` → None（选举中，稍后重试）
-/// - 其它任何文本 → None
-pub fn parse_leader_hint(msg: &str) -> Option<String> {
-    let rest = msg.strip_prefix("not leader;")?.trim();
-    let rest = rest.strip_prefix("leader_id=")?;
-    let (_id, addr) = rest.split_once(" leader_addr=")?;
-    let addr = addr.trim();
-    if addr.is_empty() {
-        None
-    } else {
-        Some(addr.to_string())
-    }
-}
 
 /// 集群客户端。
 ///
@@ -206,24 +189,18 @@ impl ClusterClient {
     /// 组合策略：依序尝试各端点（轮询起点分散负载）→ `Unavailable` 且消息带
     /// `leader_addr` 时优先重定向到该地址 → `leader unknown`（选举中）退避重试 →
     /// `FailedPrecondition`（乐观冲突等）原样上抛。全部尝试完仍失败则报无 leader。
+    ///
+    /// 队列/预算/去重由 [`LeaderRetryPlan`]（es-core）驱动。
     pub async fn with_leader<T, F, Fut>(&self, shard_id: u64, f: F) -> Result<T, anyhow::Error>
     where
         F: Fn(EventStoreClient<Channel>) -> Fut,
         Fut: Future<Output = Result<T, Status>>,
     {
         // 重定向地址可能不在初始端点列表，总预算 = 初始端点 × 2 + 2 轮
-        let budget = self.endpoints.len() * 2 + 2;
-        let mut queue: VecDeque<String> = self.rotated_endpoints().into();
-        let mut tried: HashSet<String> = HashSet::new();
+        let mut plan = LeaderRetryPlan::new(self.rotated_endpoints());
         let mut errors: Vec<String> = Vec::new();
 
-        for _ in 0..budget {
-            let Some(target) = queue.pop_front() else {
-                break;
-            };
-            if !tried.insert(target.clone()) {
-                continue;
-            }
+        while let Some(target) = plan.next() {
             let client = match self.event_client(&target).await {
                 Ok(c) => c,
                 // 建连失败：本端点不可用，继续试下一个（不重入队，避免空转）
@@ -237,30 +214,23 @@ impl ClusterClient {
                 Err(status) if status.code() == Code::Unavailable => {
                     match parse_leader_hint(status.message()) {
                         Some(addr) => {
-                            let norm = normalize_endpoint(&addr);
-                            // 重定向地址即使已试过也值得重试：它可能正处于选举中
-                            // （返回 unknown），重试有界（预算 2N+2）
-                            queue.push_front(norm); // 重定向优先
+                            // 重定向地址优先；即使已试过也可能正处选举中，
+                            // 由 plan 的去重兜底，重试有界（预算 2N+2）
+                            plan.redirect_to(normalize_endpoint(&addr));
                         }
                         // 提示缺失（选举中 leader unknown，或 leader_addr 为空）：
                         // 本端点稍后重试，但先把队列里其它端点试完，避免死等。
-                        // tried.remove 是关键：否则 push_back 后再次 pop 时会被
-                        // tried 集合挡下，重试永远不会发生（死代码）。
+                        // retry_later 先移出已试集合再入队，否则重试会被去重挡下。
                         None => {
-                            tried.remove(&target);
-                            queue.push_back(target);
+                            plan.retry_later(target);
                             tokio::time::sleep(Duration::from_millis(200)).await;
                         }
                     }
                 }
-                Err(status) if status.code() == Code::FailedPrecondition => {
-                    // 乐观冲突等不可重试错误，原样上抛（命令层据此翻译中文提示）
-                    let msg = status.message().to_string();
-                    return Err(anyhow!(msg));
-                }
                 Err(status) => {
-                    let msg = status.message().to_string();
-                    return Err(anyhow!(msg));
+                    // FailedPrecondition（乐观冲突等）及其它不可重试错误
+                    // 原样上抛（命令层据此翻译中文提示）
+                    return Err(anyhow!(status.message().to_string()));
                 }
             }
         }
@@ -390,46 +360,6 @@ enum LeaderLookupError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_leader_hint_with_addr() {
-        assert_eq!(
-            parse_leader_hint("not leader; leader_id=3 leader_addr=http://127.0.0.1:50052"),
-            Some("http://127.0.0.1:50052".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_leader_hint_bare_addr() {
-        assert_eq!(
-            parse_leader_hint("not leader; leader_id=1 leader_addr=127.0.0.1:50051"),
-            Some("127.0.0.1:50051".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_leader_hint_electing_returns_none() {
-        assert_eq!(
-            parse_leader_hint("not leader; leader unknown, retry later"),
-            None
-        );
-    }
-
-    #[test]
-    fn parse_leader_hint_noise_returns_none() {
-        assert_eq!(parse_leader_hint("internal error: boom"), None);
-        assert_eq!(parse_leader_hint(""), None);
-        assert_eq!(
-            parse_leader_hint("not leader; leader_id=3"),
-            None,
-            "缺地址段"
-        );
-        assert_eq!(
-            parse_leader_hint("not leader; leader_id= leader_addr="),
-            None,
-            "空地址"
-        );
-    }
 
     #[test]
     fn endpoints_normalized_deduped_ordered() {

@@ -6,7 +6,7 @@
 
 分两套：**多进程测试**跑真实 gRPC 路径，**进程内测试**用可控网络层跑分区场景。
 
-### 多进程测试（11 项：6 手动组建 + 5 自动组建，约 13s）
+### 多进程测试（12 项：7 手动组建 + 5 自动组建，约 13s）
 
 ```
 test 三节点能正常启动并接受连接 ... ok
@@ -15,6 +15,7 @@ test 多分片各自选主且互不影响 ... ok
 test 杀掉leader后重新选主且数据不丢 ... ok
 test 节点重启后能重新加入并追平落后的数据 ... ok
 test 非leader节点拒绝写入并可从其读取 ... ok
+test SDK只给follower地址经重定向写入成功 ... ok
 test 三节点配置peers自动组建并复制数据 ... ok   # 自动组建
 test 自动组建后重启节点不重复初始化 ... ok        # 自动组建
 test 全集群重启后自动恢复 ... ok                  # 自动组建
@@ -30,6 +31,7 @@ test 单节点peers只含自己自动自举 ... ok            # 自动组建
 | `杀掉leader后重新选主且数据不丢` | kill leader 进程后剩余 2 节点仍构成多数派并选出新 leader；崩溃前已提交数据完好；新 leader 可继续写入且版本号接续 |
 | `节点重启后能重新加入并追平落后的数据` | 复用原数据目录重启 follower，恢复重启前数据；追平停机期间多数派写入的 3 条；版本连续无空洞 |
 | `非leader节点拒绝写入并可从其读取` | 非 leader 写入返回 `Unavailable` 且带 leader 地址；客户端重定向后写入成功；follower 可读已复制数据 |
+| `SDK只给follower地址经重定向写入成功` | es-client 只给 follower 地址（`leader_addr` 不在初始列表），append 经完整重定向路径写入成功；等复制后从 follower 读回 |
 | `三节点配置peers自动组建并复制数据` | 配置完整 peers 启动、不调用任何组建 API，自动收敛为唯一 leader 与 3 投票成员；写入复制到全部节点（同时实测裁决"多节点同时竞选"收敛性） |
 | `自动组建后重启节点不重复初始化` | 自动组建后重启 follower：从本地日志恢复、不重复 initialize、追平停机期间写入且 membership 保留 |
 | `全集群重启后自动恢复` | 全部节点重启后不调用任何 API，从本地日志自动恢复 leader 与 3 投票成员，重启前数据完好 |
@@ -204,4 +206,6 @@ k 路归并只在各路队首之间比较，每路内部顺序原样保留。
 ## 后续工作
 
 - [ ] 磁盘故障注入（kill -9 时进程崩溃中断写）
-- [ ] 客户端 SDK 内置 leader 重定向重试（当前需调用方处理 `leader_addr`）
+- [x] 客户端 SDK 内置 leader 重定向重试（`es-client` append 与 `es-ctl`
+  with_leader 共用 `es-core::redirect` 策略；`sdk_append_redirects_to_leader`
+  覆盖只给 follower 地址的完整重定向路径）
