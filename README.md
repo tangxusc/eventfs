@@ -315,9 +315,10 @@ cargo bench -p es-storage
   （支持 zstd/lz4 压缩与多快照保留，见 docs/snapshot.md）。
 - **install 单事务内存 ≈ 快照未压缩体积**：surrealkv 事务写入全内存缓冲，超大快照
   不适用（失败时事务原子，旧数据无损）。
-- **快照分块与 append 批量共用 8MB 消息上限**：快照分块（3MiB 默认）有余量；
-  但 append 批量无字节上限（仅 300 条数限制），单事件极大时可能超限被拒，
-  openraft 不重试导致复制停滞——单事件数据应保持合理大小。
+- **快照分块与 append 批量共用 8MB 消息上限**：快照分块（3MiB 默认，上限 6MiB
+  启动校验）有余量；append 超限由网络层映射为 openraft PayloadTooLarge 拆小
+  重试（可自愈），单事件（1MiB）与批次（7MiB，`[limits]` 可配）超限在服务端
+  权威拒绝、客户端本地前置校验。
 
 ## 技术栈
 

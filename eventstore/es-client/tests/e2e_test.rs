@@ -474,6 +474,40 @@ async fn append_oversized_event_rejected_by_server_limits() {
     assert!(events.is_empty(), "被拒的 append 不应写入任何事件");
 }
 
+/// 服务端 batch 级校验:单事件各不过限、但 proto 编码后总字节超限被拒。
+///
+/// 覆盖 service.rs 的 encoded_len 权威校验分支——「海量小事件 × 逐事件头」
+/// 的线缆膨胀正是该分支存在的意义(客户端 data+metadata 总和近似拦不住)。
+#[tokio::test]
+async fn append_batch_encoded_len_over_limit_rejected() {
+    let limits = es_server::config::LimitsSection {
+        max_event_bytes: 1024,
+        max_append_batch_bytes: 4096,
+    };
+    let (addr, _handle, _server, _dir) = start_test_server_with_limits(limits).await;
+    let mut client = EventStoreClient::connect(vec![addr]).await.expect("连接");
+
+    // 5 × 1000B:单事件(1000 ≤ 1024)过逐事件检查;总和 5000B,
+    // proto 编码后(每事件 ~21B 头)≈ 5100 > 4096,触发 batch 级拒绝
+    let events = (0..5)
+        .map(|i| EventBuilder::new(&format!("T{i}")).data(vec![0u8; 1000]).build())
+        .collect::<Vec<_>>();
+    let err = client
+        .append("s".into(), ExpectedVersionBuilder::any(), events)
+        .await
+        .expect_err("batch 编码超限应被拒");
+    match err {
+        ClientError::RpcFailed { code, message } => {
+            assert_eq!(code, tonic::Code::FailedPrecondition);
+            assert!(
+                message.starts_with("append payload too large: request"),
+                "应说明 request 超限: {message}"
+            );
+        }
+        other => panic!("应原样上抛 RpcFailed(FailedPrecondition),实际 {other:?}"),
+    }
+}
+
 /// 客户端前置校验:单事件超过默认上限（1MiB）本地拒绝,不发 RPC。
 #[tokio::test]
 async fn append_client_side_limit_rejects_without_rpc() {

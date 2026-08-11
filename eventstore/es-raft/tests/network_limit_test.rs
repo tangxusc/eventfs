@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use openraft::error::RPCError;
 use openraft::network::{RPCOption, RaftNetwork};
-use openraft::raft::{AppendEntriesRequest, AppendEntriesResponse};
+use openraft::raft::{AppendEntriesRequest, AppendEntriesResponse, VoteRequest};
 use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId, Vote};
 use tokio::net::TcpListener;
 
@@ -43,7 +43,15 @@ impl RaftRpc for StubService {
         &self,
         _request: tonic::Request<RaftVoteRequest>,
     ) -> Result<tonic::Response<RaftVoteResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("vote"))
+        match &self.mode {
+            // Reject 模式同时拒 vote：验证 network.rs 对 vote 不做
+            // ResourceExhausted → PayloadTooLarge 映射（openraft 对
+            // Vote 动作的 PayloadTooLarge 是 unreachable! panic）
+            StubMode::Reject => Err(tonic::Status::resource_exhausted(
+                "Error, decoded message length too large: 8388608 > 8388608",
+            )),
+            StubMode::Echo(_) => Err(tonic::Status::unimplemented("vote")),
+        }
     }
 
     async fn append_entries(
@@ -207,4 +215,25 @@ async fn small_request_roundtrips() {
         "应得到 Success,实际 {resp:?}"
     );
     assert_eq!(count.load(Ordering::SeqCst), 1, "应恰好调用一次");
+}
+
+/// vote 的 ResourceExhausted 不映射为 PayloadTooLarge。
+///
+/// openraft 0.9.25 对 Vote 动作的 PayloadTooLarge 在 update_hint 里是
+/// `unreachable!` panic(replication/mod.rs),映射会直接打崩 leader;
+/// network.rs 对 vote 保持 net_err(Network 错误)原样包装。
+#[tokio::test]
+async fn vote_resource_exhausted_stays_network_error() {
+    let addr = start_stub(StubMode::Reject).await;
+    let mut conn = GrpcConnection::new(1, 2, addr, None);
+
+    let req = openraft::raft::VoteRequest {
+        vote: Vote::new_committed(1, 1),
+        last_log_id: None,
+    };
+    let err = conn.vote(req, rpc_option()).await.expect_err("应被拒");
+    assert!(
+        matches!(err, RPCError::Network(_)),
+        "vote 超限应保持 Network 错误(不映射 PayloadTooLarge),实际 {err:?}"
+    );
 }

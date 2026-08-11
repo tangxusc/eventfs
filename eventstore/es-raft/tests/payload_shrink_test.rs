@@ -410,9 +410,11 @@ async fn oversized_batch_splits_and_converges() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // 恢复链路并注入「leader→follower 单次批量 ≤ 5 条」的限制
-    c.net.heal().await;
+    // 先注入限制再恢复链路：heal 后 leader 对被隔离 follower 的首个批量
+    // （30 条整批）必然被拒；若先 heal 后设置，两者之间有个微秒级窗口——
+    // 恰好落在窗口内的重试会整批通过，rejected 计数保持 0 导致断言误报。
     c.net.set_max_entries(leader, follower, Some(5)).await;
+    c.net.heal().await;
 
     // follower 追赶:数据最终全部到达
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);

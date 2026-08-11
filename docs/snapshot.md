@@ -154,10 +154,13 @@ openraft::Config {
 - `max_in_snapshot_log_to_keep` 决定「多落后的节点还能靠日志追赶」;
   超出这个窗口就必须传快照(更慢但更可靠)
 
-**传输上限**:快照分块默认 3MiB + bincode 头,tonic 0.14 默认 4MB 消息上限
-恰好能过但无余量。server 显式 `max_decoding_message_size(8MB)`（tonic 0.14
-在服务级配置）,消除 `snapshot_max_chunk_size` 调大时 PayloadTooLarge 直接
-失败不重试的隐患。
+**传输上限**:系统级 8MB 消息契约（`es_proto::limits::MAX_GRPC_MESSAGE_SIZE`,
+三个 gRPC 服务与服务端/客户端/节点间通道在编码与解码两个方向统一设置——
+tonic 0.14 解码默认 4MB,不设置的话大响应在接收侧就被拒）。快照分块默认
+3MiB + bincode 头,余量充足;`[snapshot] max_chunk_size` 上限 6MiB 由启动
+校验保证不触线（openraft 0.9.25 对超限快照块直接放弃传输,无拆小路径）。
+append 批量超限由 es-raft 网络层在发送前映射为 openraft `PayloadTooLarge`
+拆小重试（可自愈）,单事件/批次超限由 `[limits]` 在服务端权威拒绝。
 
 ## 测试覆盖
 

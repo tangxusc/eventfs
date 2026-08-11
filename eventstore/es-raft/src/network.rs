@@ -77,8 +77,8 @@ fn pre_send_oversize_err<E: std::error::Error>(
 /// 接收侧兜底：对端拒绝超限消息（`Code::ResourceExhausted`）时的映射。
 ///
 /// 正常路径发送前检查已拦截；此处覆盖估算误差、节点间上限配置不一致等
-/// 场景。对端已拒绝且不知道其上限，用二分收缩（最坏 log2(条数) 轮收敛，
-/// hint TTL 10 次 RPC 足够）。
+/// 场景。对端已拒绝且不知道其上限，用二分收缩：每轮 1 次 RPC（失败会刷新
+/// hint，TTL=10 次计数在成功续传时才限制 hint 寿命），约 log2(条数) 轮收敛。
 fn recv_oversize_err<E: std::error::Error>(
     entries: usize,
 ) -> RPCError<u64, BasicNode, E> {
@@ -270,6 +270,9 @@ impl RaftNetwork<TypeConfig> for GrpcConnection {
             .map_err(|e| {
                 // 兜底映射（正常不可达）：PayloadTooLarge 在快照传输里是明确的
                 // 「块被拒」终止错误，比 Network 错误退避重试同样大小的块更好诊断。
+                // 注:openraft 未公开快照动作的 PayloadTooLarge 构造器(new_bytes_hint
+                // 是 pub(crate)),统一用 new_entries_hint(1) —— Chunked 只看变体不看
+                // action,日志里显示 AppendEntries 是 openraft 的显示限制,功能无害。
                 if e.code() == tonic::Code::ResourceExhausted {
                     RPCError::PayloadTooLarge(PayloadTooLarge::new_entries_hint(1))
                 } else {
@@ -371,5 +374,57 @@ mod tests {
                 assert!(hint >= 1 && hint < entries, "hint={hint} entries={entries}");
             }
         }
+    }
+
+    /// 接收侧兜底:单条被拒 → Unreachable(避免 hint=1 让 openraft 死循环)
+    #[test]
+    fn recv_oversize_err_single_entry_unreachable() {
+        assert!(matches!(
+            recv_oversize_err::<std::io::Error>(1),
+            RPCError::Unreachable(_)
+        ));
+    }
+
+    /// 接收侧兜底:多条被拒 → 二分收缩 hint
+    #[test]
+    fn recv_oversize_err_multi_entry_bisect() {
+        match recv_oversize_err::<std::io::Error>(8) {
+            RPCError::PayloadTooLarge(p) => assert_eq!(p.entries_hint(), 4),
+            other => panic!("应 PayloadTooLarge,实际 {other:?}"),
+        }
+    }
+
+    /// 传输链不变量:服务端最大合法 append(单事件 ≤1MiB、批次编码 ≤7MiB)
+    /// 转换领域模型后 bincode 不超发送预算。
+    ///
+    /// 该不变量依赖 bincode 默认变长整数编码(bincode 2 standard()):
+    /// 若默认改为 fixint,逐事件膨胀 ~19B × 20 万条就会让合法请求超预算,
+    /// 走 SingleEntryTooLarge → Unreachable → 复制停滞——正是本文件要防的故障。
+    #[test]
+    fn max_legal_append_bincode_within_budget() {
+        use es_core::{ExpectedVersion, Hlc, NewEvent};
+        use es_storage::EsRequest;
+
+        // 6 条 × 1MiB:客户端估算 ≈ 6.3MiB 通过本地检查,服务端 encoded_len
+        // ≈ 6.3MiB ≤ 7MiB 接受(7 条会超 7MiB 被拒,有效上限 6 条)
+        let req = EsRequest::Append {
+            stream_id: "s".to_string(),
+            expected_version: ExpectedVersion::Any,
+            events: vec![NewEvent {
+                event_id: uuid::Uuid::new_v4(),
+                event_type: "t".into(),
+                data: vec![0u8; 1024 * 1024],
+                metadata: vec![],
+            }; 6],
+            hlc: Hlc::now(),
+        };
+        let payload = bincode::serde::encode_to_vec(&req, bincode::config::standard())
+            .expect("编码 EsRequest");
+        assert!(
+            payload.len() <= APPEND_WIRE_BUDGET,
+            "最大合法 append bincode {} 字节超发送预算 {}",
+            payload.len(),
+            APPEND_WIRE_BUDGET
+        );
     }
 }

@@ -123,7 +123,11 @@ impl ClusterClient {
         &self,
         endpoint: &str,
     ) -> Result<EventStoreClient<Channel>, anyhow::Error> {
-        Ok(EventStoreClient::new(self.channel_for(endpoint).await?))
+        Ok(EventStoreClient::new(self.channel_for(endpoint).await?)
+            // 与系统级 8MB 上限对齐：tonic 解码默认 4MB，不设置的话
+            // read/read_all 单页响应超 4MB 时（如多条大事件）解码失败
+            .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
+            .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE))
     }
 
     /// 管理面客户端（RaftAdmin 服务）
@@ -131,7 +135,10 @@ impl ClusterClient {
         &self,
         endpoint: &str,
     ) -> Result<RaftAdminClient<Channel>, anyhow::Error> {
-        Ok(RaftAdminClient::new(self.channel_for(endpoint).await?))
+        Ok(RaftAdminClient::new(self.channel_for(endpoint).await?)
+            // 与系统级 8MB 上限对齐（管理面响应虽小，保持契约一致）
+            .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
+            .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE))
     }
 
     /// 调单个端点的 GetRaftState（NotFound 等状态原样返回）。

@@ -190,9 +190,10 @@ impl EventStoreClient {
     /// 重定向到该地址；选举中（`leader unknown`）退避后重试；`FailedPrecondition`
     ///（乐观冲突）等不可重试错误原样上抛。
     ///
-    /// 大小限制：单事件 data+metadata 与批次总和超限在本地直接拒绝
-    /// （[`ClientError::PayloadTooLarge`]），不发 RPC；服务端对更小配置的
-    /// 上限以 `FailedPrecondition` 权威拒绝。
+    /// 大小限制：单事件 data+metadata 与批次编码后大小超限在本地直接拒绝
+    /// （[`ClientError::PayloadTooLarge`]），不发 RPC；服务端按 proto 编码
+    /// 精确字节数权威校验——默认配置下编码头膨胀（海量小事件）也会被拒，
+    /// 服务端更小的配置以服务端结果为准。
     ///
     /// # 参数
     /// - `stream_id`: 流 ID
@@ -512,11 +513,11 @@ impl ClientError {
     }
 }
 
-/// append 前置校验：单事件 data+metadata ≤ 1MiB，批次总和 ≤ 7MiB。
+/// append 前置校验：单事件 data+metadata ≤ 1MiB，批次编码后 ≤ 7MiB。
 ///
-/// 启发式提前失败（本地即可判断，不发 RPC）；服务端对 proto 请求的
-/// `encoded_len` 校验为权威——本处总和近似不含逐事件 proto 头，
-/// 服务端配置更小的上限时以服务端结果为准。
+/// 启发式提前失败（本地即可判断，不发 RPC）；服务端按 proto 编码精确
+/// 字节数（encoded_len）权威校验——本处总和加每事件头（21B）估算仍可能
+/// 略低（超长 event_type 等），服务端拒绝时以服务端结果为准。
 fn check_append_limits(events: &[NewEvent]) -> Result<(), ClientError> {
     use es_core::limits::{MAX_APPEND_BATCH_BYTES, MAX_EVENT_PAYLOAD_BYTES};
 
@@ -531,10 +532,13 @@ fn check_append_limits(events: &[NewEvent]) -> Result<(), ClientError> {
         }
         total += n;
     }
-    if total > MAX_APPEND_BATCH_BYTES {
+    // 每事件 proto 固定头约 21 字节（event_id 16 + 各字段 tag/varint）。
+    // 不加此估算时，「海量小事件」总和远低于上限但线缆膨胀超限——客户端
+    // 自身的编码上限会在发送前给出语义模糊的传输错误。
+    let estimated = total + events.len() * 21;
+    if estimated > MAX_APPEND_BATCH_BYTES {
         return Err(ClientError::PayloadTooLarge(format!(
-            "append batch {} bytes exceeds limit {} bytes",
-            total, MAX_APPEND_BATCH_BYTES
+            "append batch ~{estimated} bytes (encoded) exceeds limit {MAX_APPEND_BATCH_BYTES} bytes"
         )));
     }
     Ok(())
@@ -577,13 +581,15 @@ mod tests {
         );
     }
 
-    /// 边界值通过:单事件恰好等于上限、总和恰好等于上限
+    /// 边界值通过:单事件恰好等于上限;批次在编码估算内通过
     #[test]
     fn at_limit_passes() {
         check_append_limits(&[new_event(MAX_EVENT_PAYLOAD_BYTES)]).expect("单事件等于上限应通过");
-        // 7 条各 1MiB = 7MiB 恰好等于批次上限(每条也恰等于单事件上限)
-        let seven: Vec<NewEvent> = (0..7).map(|_| new_event(MAX_EVENT_PAYLOAD_BYTES)).collect();
-        check_append_limits(&seven).expect("总和等于上限应通过");
+        // 6 条各 1MiB:总和 6MiB + 每事件头 ≈ 6.3MiB < 7MiB,客户端与服务端都接受。
+        // 注意 7×1MiB 时估算 ≈ 7MiB+147 > 7MiB 会被本地拒(服务端 encoded_len
+        // 同样拒绝),因此有效上限是 6 条而不是 7 条。
+        let six: Vec<NewEvent> = (0..6).map(|_| new_event(MAX_EVENT_PAYLOAD_BYTES)).collect();
+        check_append_limits(&six).expect("批次在编码估算内应通过");
     }
 
     /// 空列表通过(心跳语义)

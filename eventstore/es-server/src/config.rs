@@ -419,6 +419,22 @@ mod tests {
     }
 
     #[test]
+    fn limits_batch_zero_rejected() {
+        let config = Config {
+            limits: LimitsSection {
+                max_append_batch_bytes: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = config.validate().expect_err("batch=0 应报错");
+        assert!(
+            err.contains("max_append_batch_bytes"),
+            "错误应说明 max_append_batch_bytes: {err}"
+        );
+    }
+
+    #[test]
     fn limits_event_greater_than_batch_rejected() {
         let config = Config {
             limits: LimitsSection {
@@ -456,6 +472,22 @@ mod tests {
             ..Default::default()
         };
         let err = config.validate().expect_err("chunk 超出上限应报错");
+        assert!(
+            err.contains("max_chunk_size"),
+            "错误应说明 max_chunk_size: {err}"
+        );
+    }
+
+    #[test]
+    fn snapshot_chunk_zero_rejected() {
+        let config = Config {
+            snapshot: SnapshotSection {
+                max_chunk_size: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = config.validate().expect_err("chunk=0 应报错");
         assert!(
             err.contains("max_chunk_size"),
             "错误应说明 max_chunk_size: {err}"
