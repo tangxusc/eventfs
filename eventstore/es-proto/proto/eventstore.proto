@@ -101,12 +101,18 @@ message ReadAllRequest {
   //
   // 翻页必须用它：跨分片归并后，各分片被消费到的位置不同，
   // 用单一 from_position 续读会重复或漏掉事件。
-  // 客户端可从上一页结果中按 shard_id 取各自最大的 position + 1 构造。
+  // 首页可不传（用 shard_ids + from_position），续页请把上一页响应里的
+  // next_positions 原样透传，不要自行构造——服务端才知道每分片实际读到的边界。
   repeated ShardPosition from_positions = 5;
 }
 
 message ReadEventsResponse {
   repeated Event events = 1;
+  // 仅 ReadAll 填充：每分片一条，为「该分片下一页的续读起点」。
+  // 正序 = 本页最后一条 position + 1；倒序 = 本页最小 position - 1。
+  // 本页未读到事件的分片起点不变；倒序已到分片边界（min == 0）的分片不列入
+  // （该分片不再续读）。客户端翻页时原样透传为 ReadAllRequest.from_positions。
+  repeated ShardPosition next_positions = 2;
 }
 
 message SubscribeRequest {
@@ -118,6 +124,8 @@ message SubscribeRequest {
   uint64 from_exclusive = 3;
   // true 表示从头开始，忽略 from_exclusive
   bool from_start = 4;
+  // 仅 target=all 时有意义：订阅哪个分片的 $all，默认 0（与历史行为一致）
+  uint64 shard_id = 5;
 }
 
 message SubscribeResponse {
@@ -233,6 +241,10 @@ message ChangeMembershipRequest {
   repeated uint64 voter_ids = 2;
   // true 表示被移除的成员降级为学习者而非直接剔除
   bool retain = 3;
+  // CAS 期望的当前投票成员快照（读-改-写防并发覆盖）。
+  // 非空时服务端先校验当前 voters 与之一致才应用变更，不一致返回
+  // FailedPrecondition，客户端应重读后重试；空表示不校验（兼容旧客户端）。
+  repeated uint64 expected_voters = 4;
 }
 
 message ChangeMembershipResponse {}
