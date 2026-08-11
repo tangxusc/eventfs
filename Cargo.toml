@@ -34,10 +34,18 @@ openraft = { version = "0.9.25", features = ["storage-v2", "serde"] }
 surrealkv = "0.21.3"
 
 # ---- gRPC：tonic 0.14 已将 prost codec 拆为独立 crate ----
-tonic = "0.14.6"
+# tls-ring：启用 TLS（rustls ring 后端），https 节点间通信与客户端 API 依赖
+tonic = { version = "0.14.6", features = ["tls-ring"] }
 tonic-prost = "0.14.6"
 tonic-prost-build = "0.14.6"
 prost = "0.14.4"
+
+# ---- TLS：与 tokio-rustls 0.26（tonic tls-ring 带入）统一为 0.23 ----
+# 只开 ring 后端（默认 aws-lc-rs 编译重且本机无缓存）；rustls 仅 es-proto 直接依赖
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+
+# ---- 测试：内存生成自签证书（https 集群测试用）----
+rcgen = "0.13"
 
 # ---- 异步运行时 ----
 tokio = { version = "1.48", features = ["full"] }

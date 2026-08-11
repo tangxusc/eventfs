@@ -10,6 +10,13 @@ license.workspace = true
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
 prost = { workspace = true }
+# 客户端 TLS 信任策略（跳过校验 verifier / CA 校验）——rustls 类型不对外暴露
+rustls = { workspace = true }
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+rcgen = { workspace = true }

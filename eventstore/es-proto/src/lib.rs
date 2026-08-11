@@ -14,6 +14,11 @@ pub mod raft {
     tonic::include_proto!("eventstore.raft.v1");
 }
 
+/// 客户端 TLS 信任策略与端点装配（https 支持）
+pub mod tls;
+
+pub use tls::{apply_endpoint_tls, TlsClientConfig};
+
 #[cfg(test)]
 mod tests {
     use super::*;
