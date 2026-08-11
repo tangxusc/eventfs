@@ -182,12 +182,22 @@ fn proto_to_expected_version(ev: ExpectedVersion) -> es_core::ExpectedVersion {
 /// EventStore gRPC 服务
 pub struct EsService {
     shard_manager: Arc<ShardManager>,
+    /// 请求大小限制（append 权威校验）
+    limits: crate::config::LimitsSection,
 }
 
 impl EsService {
-    /// 创建服务实例
+    /// 创建服务实例（默认大小限制）
     pub fn new(shard_manager: Arc<ShardManager>) -> Self {
-        Self { shard_manager }
+        Self::with_limits(shard_manager, Default::default())
+    }
+
+    /// 创建服务实例（自定义大小限制）
+    pub fn with_limits(
+        shard_manager: Arc<ShardManager>,
+        limits: crate::config::LimitsSection,
+    ) -> Self {
+        Self { shard_manager, limits }
     }
 }
 
@@ -197,10 +207,37 @@ impl EventStore for EsService {
         &self,
         request: Request<AppendRequest>,
     ) -> Result<Response<AppendResponse>, Status> {
+        use prost::Message;
+
+        // 权威校验：proto 请求精确字节数（encoded_len）。仅按 data+metadata
+        // 总和近似（见 check_append_limits）堵不住「海量小事件 × 逐事件头」
+        // 造成的线缆膨胀，这里以精确编码长度为准——超限直接拒绝，而不是让
+        // 请求在传输层被 gRPC 上限拒绝后语义模糊（客户端拿不到可操作的错误）。
+        let encoded_len = request.get_ref().encoded_len();
+        if encoded_len as u64 > self.limits.max_append_batch_bytes {
+            return Err(Status::failed_precondition(format!(
+                "append payload too large: request {} bytes exceeds limit {} bytes",
+                encoded_len, self.limits.max_append_batch_bytes
+            )));
+        }
+
         let req = request.into_inner();
         let stream_id = &req.stream_id;
 
         tracing::debug!("Append request for stream: {}", stream_id);
+
+        // 逐事件校验：单事件超限直接拒绝。一条 append 批在 raft 里是一条
+        // 日志条目，openraft 对单条超限的 AppendEntries 没有拆小路径，
+        // 必须从源头拦截（否则复制停滞）。
+        for e in &req.events {
+            let n = e.data.len() + e.metadata.len();
+            if n as u64 > self.limits.max_event_bytes {
+                return Err(Status::failed_precondition(format!(
+                    "append payload too large: single event data+metadata {} bytes exceeds limit {} bytes",
+                    n, self.limits.max_event_bytes
+                )));
+            }
+        }
 
         // 1. 根据 stream_id 路由到对应分片
         let shard = self

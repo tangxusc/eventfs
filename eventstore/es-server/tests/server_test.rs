@@ -27,6 +27,7 @@ async fn server_starts_and_inits_raft() {
         shards: ShardConfig { num_shards: 2 },
         snapshot: Default::default(),
         tls: None,
+        limits: Default::default(),
     };
 
     let server = Server::new(config).expect("创建服务器");

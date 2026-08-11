@@ -20,6 +20,9 @@ pub mod tls;
 /// 端点地址归一化（裸地址补 http:// 前缀）
 pub mod endpoint;
 
+/// 系统级 gRPC 消息大小上限
+pub mod limits;
+
 pub use tls::{TlsClientConfig, apply_endpoint_tls};
 
 #[cfg(test)]

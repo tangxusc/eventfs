@@ -118,6 +118,7 @@ async fn start_node(
         shards: ShardConfig { num_shards },
         snapshot: Default::default(),
         tls: tls_config,
+        limits: Default::default(),
     };
 
     let server = Arc::new(Server::new(config).expect("创建服务器"));

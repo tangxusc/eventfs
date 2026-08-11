@@ -2,12 +2,14 @@
 
 pub mod error;
 pub mod hlc;
+pub mod limits;
 pub mod model;
 pub mod redirect;
 pub mod routing;
 
 pub use error::{Error, Result};
 pub use hlc::Hlc;
+pub use limits::{MAX_APPEND_BATCH_BYTES, MAX_EVENT_PAYLOAD_BYTES, MAX_SNAPSHOT_CHUNK_BYTES};
 pub use model::{Event, ExpectedVersion, NewEvent, StreamMeta};
 pub use redirect::{LeaderRetryPlan, parse_leader_hint};
 pub use routing::route;

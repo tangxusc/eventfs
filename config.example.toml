@@ -43,11 +43,26 @@ data_dir = "./data/node1"
 # compression：快照压缩算法，zstd（压缩率高）/ lz4（速度快）/ none（不压缩）；
 #              快照文件头记录算法，读取时自动识别，节点间可混用不同算法
 # keep：保留历史快照数（含最新），超出部分自动清理；默认 3
+# max_chunk_size：快照分块大小（字节），默认 3145728（3MiB）。openraft 对
+#                 超限快照块直接放弃传输（无拆小路径），上限 6MiB 由启动校验
+#                 保证不会触线（8MB 消息上限 - 余量）
 # dir：快照目录，缺省为 {data_dir}/snapshots（独立于业务数据文件）
 [snapshot]
 compression = "zstd"
 keep = 3
+max_chunk_size = 3145728
 # dir = "./data/node1/snapshots"
+
+# 请求大小限制（可选，可整体缺省；缺省值见注释）
+# max_event_bytes：单事件 data+metadata 上限（字节），默认 1048576（1MiB）。
+#                  一条 append 批在 raft 里是一条日志条目，单条日志超限时
+#                  openraft 无拆小路径（复制停滞），必须源头拦截
+# max_append_batch_bytes：单次 append 请求上限（字节），默认 7340032（7MiB，
+#                  8MB 传输上限 - 余量）。服务端按 proto 编码精确字节数校验，
+#                  超限返回 FailedPrecondition（"append payload too large..."）
+[limits]
+max_event_bytes = 1048576
+max_append_batch_bytes = 7340032
 
 [shards]
 num_shards = 8

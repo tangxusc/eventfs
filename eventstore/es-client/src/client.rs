@@ -109,7 +109,11 @@ impl EventStoreClient {
             .connect()
             .await
             .map_err(|e| ClientError::ConnectionFailed(e.to_string()))?;
-        Ok(GrpcClient::new(channel))
+        Ok(GrpcClient::new(channel)
+            // 与系统级 8MB 上限对齐：tonic 解码默认 4MB，不设置的话
+            // read_stream/read_all/subscribe 单页响应超 4MB 时客户端解码失败
+            .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
+            .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE))
     }
 
     /// 获取或创建到指定节点的连接
@@ -186,12 +190,17 @@ impl EventStoreClient {
     /// 重定向到该地址；选举中（`leader unknown`）退避后重试；`FailedPrecondition`
     ///（乐观冲突）等不可重试错误原样上抛。
     ///
+    /// 大小限制：单事件 data+metadata 与批次总和超限在本地直接拒绝
+    /// （[`ClientError::PayloadTooLarge`]），不发 RPC；服务端对更小配置的
+    /// 上限以 `FailedPrecondition` 权威拒绝。
+    ///
     /// # 参数
     /// - `stream_id`: 流 ID
     /// - `expected_version`: 期望版本
     /// - `events`: 待追加事件列表
     ///
     /// # 错误
+    /// - 请求超限 → [`ClientError::PayloadTooLarge`]
     /// - 重试预算耗尽（集群可能长期处于选举中）→ [`ClientError::NotLeader`]
     pub async fn append(
         &mut self,
@@ -199,6 +208,7 @@ impl EventStoreClient {
         expected_version: ExpectedVersion,
         events: Vec<NewEvent>,
     ) -> Result<AppendResponse, ClientError> {
+        check_append_limits(&events)?;
         let request = AppendRequest {
             stream_id,
             expected_version: Some(expected_version),
@@ -480,6 +490,13 @@ pub enum ClientError {
     #[error("Not leader, redirect to: {0:?}")]
     NotLeader(Option<String>),
 
+    /// append 请求超出大小限制，客户端前置校验拒绝（未发起 RPC）。
+    ///
+    /// 与服务端 FailedPrecondition 不同：这是本地即可判断的
+    /// 请求构造期错误，独立变体便于调用方区分。
+    #[error("Payload too large: {0}")]
+    PayloadTooLarge(String),
+
     /// 读方法轮换全部节点后仍失败，附各节点错误详情
     #[error("All nodes failed: {0}")]
     AllNodesFailed(String),
@@ -492,5 +509,86 @@ impl ClientError {
             code: status.code(),
             message: status.message().to_string(),
         }
+    }
+}
+
+/// append 前置校验：单事件 data+metadata ≤ 1MiB，批次总和 ≤ 7MiB。
+///
+/// 启发式提前失败（本地即可判断，不发 RPC）；服务端对 proto 请求的
+/// `encoded_len` 校验为权威——本处总和近似不含逐事件 proto 头，
+/// 服务端配置更小的上限时以服务端结果为准。
+fn check_append_limits(events: &[NewEvent]) -> Result<(), ClientError> {
+    use es_core::limits::{MAX_APPEND_BATCH_BYTES, MAX_EVENT_PAYLOAD_BYTES};
+
+    let mut total: usize = 0;
+    for e in events {
+        let n = e.data.len() + e.metadata.len();
+        if n > MAX_EVENT_PAYLOAD_BYTES {
+            return Err(ClientError::PayloadTooLarge(format!(
+                "single event data+metadata {} bytes exceeds limit {} bytes",
+                n, MAX_EVENT_PAYLOAD_BYTES
+            )));
+        }
+        total += n;
+    }
+    if total > MAX_APPEND_BATCH_BYTES {
+        return Err(ClientError::PayloadTooLarge(format!(
+            "append batch {} bytes exceeds limit {} bytes",
+            total, MAX_APPEND_BATCH_BYTES
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use es_core::limits::MAX_EVENT_PAYLOAD_BYTES;
+
+    fn new_event(data_len: usize) -> NewEvent {
+        NewEvent {
+            event_id: vec![0u8; 16],
+            event_type: "t".into(),
+            data: vec![0u8; data_len],
+            metadata: vec![],
+        }
+    }
+
+    /// 单事件超限 → PayloadTooLarge（不发 RPC）
+    #[test]
+    fn single_event_over_limit_rejected() {
+        let err = check_append_limits(&[new_event(MAX_EVENT_PAYLOAD_BYTES + 1)])
+            .expect_err("超限应报错");
+        assert!(
+            matches!(err, ClientError::PayloadTooLarge(_)),
+            "应为 PayloadTooLarge,实际 {err:?}"
+        );
+    }
+
+    /// 批次总和超限 → PayloadTooLarge
+    #[test]
+    fn batch_total_over_limit_rejected() {
+        // 三条各 3MiB 的事件,总和 9MiB > 7MiB
+        let events = vec![new_event(3 * 1024 * 1024); 3];
+        let err = check_append_limits(&events).expect_err("超限应报错");
+        assert!(
+            matches!(err, ClientError::PayloadTooLarge(_)),
+            "应为 PayloadTooLarge,实际 {err:?}"
+        );
+    }
+
+    /// 边界值通过:单事件恰好等于上限、总和恰好等于上限
+    #[test]
+    fn at_limit_passes() {
+        check_append_limits(&[new_event(MAX_EVENT_PAYLOAD_BYTES)]).expect("单事件等于上限应通过");
+        // 7 条各 1MiB = 7MiB 恰好等于批次上限(每条也恰等于单事件上限)
+        let seven: Vec<NewEvent> = (0..7).map(|_| new_event(MAX_EVENT_PAYLOAD_BYTES)).collect();
+        check_append_limits(&seven).expect("总和等于上限应通过");
+    }
+
+    /// 空列表通过(心跳语义)
+    #[test]
+    fn empty_events_passes() {
+        check_append_limits(&[]).expect("空列表应通过");
     }
 }

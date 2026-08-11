@@ -92,6 +92,8 @@ impl Server {
                     // 需重放全部历史日志，恢复时间随运行时长线性增长。
                     snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(5000),
                     max_in_snapshot_log_to_keep: 1000,
+                    // 分块大小来自配置：默认 3MiB，上限 6MiB（config validate 保证）
+                    snapshot_max_chunk_size: self.config.snapshot.max_chunk_size,
                     ..Default::default()
                 }
                 .validate()?,
@@ -141,7 +143,10 @@ impl Server {
     /// 配置 [tls] 时以 TLS（https）监听，否则明文。
     pub async fn serve(&self) -> Result<()> {
         let addr: std::net::SocketAddr = self.config.node.listen_addr.parse()?;
-        let es_service = EsService::new(self.shard_manager.clone());
+        let es_service = EsService::with_limits(
+            self.shard_manager.clone(),
+            self.config.limits.clone(),
+        );
         let raft_service = es_raft::RaftRpcService::new(self.shard_manager.clone());
         let admin_service = es_raft::RaftAdminService::new(self.shard_manager.clone());
 
@@ -161,19 +166,27 @@ impl Server {
             if self.config.tls.is_some() { "https" } else { "http" }
         );
 
-        // 消息上限放宽到 8MB：快照分块默认 3MiB/块 + bincode 头，超出 tonic 默认
-        // 4MB 时 openraft 对 PayloadTooLarge 直接失败不重试（快照传输中断）。
-        // tonic 0.14 中该限制在服务级配置。
+        // 系统级 8MB 消息契约（es_proto::limits::MAX_GRPC_MESSAGE_SIZE）：
+        // - 快照分块默认 3MiB/块 + bincode 头，比 tonic 默认 4MB 需要更宽余量；
+        //   openraft 0.9.25 对超限快照块直接放弃传输（无拆小路径），
+        //   块大小上限 6MiB 由 config validate 保证不会触线。
+        // - append 批量超限由 es-raft 网络层在发送前映射为 openraft
+        //   PayloadTooLarge 拆小重试（可自愈），无需依赖这里的上限兜底。
+        // tonic 0.14 中该限制在服务级配置；编码方向同样显式设置，
+        // 与客户端解码上限对齐。
         let event_store = es_proto::eventstore::event_store_server::EventStoreServer::new(
             es_service,
         )
-        .max_decoding_message_size(8 * 1024 * 1024);
+        .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
+        .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE);
         let raft_rpc = es_proto::eventstore::raft_rpc_server::RaftRpcServer::new(raft_service)
-            .max_decoding_message_size(8 * 1024 * 1024);
+            .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
+            .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE);
         let raft_admin = es_proto::eventstore::raft_admin_server::RaftAdminServer::new(
             admin_service,
         )
-        .max_decoding_message_size(8 * 1024 * 1024);
+        .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
+        .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE);
 
         server
             .add_service(event_store)

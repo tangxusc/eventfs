@@ -194,9 +194,12 @@ openraft::Config {
 - **快照是全量的**:每次 `build_snapshot` 序列化整个分片状态机,
   数据量大时耗时明显。openraft 不支持增量快照。
 - **快照分块与 append 批量共用消息上限**（server 8MB）:快照分块默认 3MiB
-  有余量;但 append_entries 批量只有条数上限（300）无字节上限,单事件极大
-  （如百 KB 级 × 数百条）时批量可能超 8MB 被拒——openraft 对
-  PayloadTooLarge 不重试,复制停滞。规避:单事件数据保持合理大小。
+  有余量,`[snapshot] max_chunk_size` 上限 6MiB 由启动校验保证不触线
+  （openraft 0.9.25 对超限快照块直接放弃传输,无拆小路径）。
+  append 批量超限由 es-raft 网络层在发送前映射为 openraft `PayloadTooLarge`
+  拆小重试（可自愈,复制不永久停滞）;单事件超限（无拆小路径的死角）由
+  `[limits] max_event_bytes`（默认 1MiB）在服务端权威拒绝、客户端本地前置
+  校验兜底。
 - **install 单事务内存 ≈ 快照未压缩体积**:surrealkv 事务的写入全部在内存缓冲
   到 commit（已核源码 `Transaction.write_set`）。快照体积显著大于可用内存时
   不适用;失败时事务原子,旧数据无损。后续方案:多事务 + installing 标记文件。
@@ -210,5 +213,15 @@ openraft::Config {
 [snapshot]
 compression = "zstd"   # zstd（压缩率高）/ lz4（速度快）/ none
 keep = 3               # 保留历史快照数（含最新），默认 3
+max_chunk_size = 3145728  # 快照分块字节数，默认 3MiB；上限 6MiB（8MB 消息上限 - 余量）
 # dir = "./data/node1/snapshots"   # 缺省 {data_dir}/snapshots
+
+# 请求大小限制（可选，可整体缺省）
+# max_event_bytes：单事件 data+metadata 上限（默认 1MiB）。单条日志超限时
+#                  openraft 无拆小路径（复制停滞），必须源头拦截。
+# max_append_batch_bytes：单次 append 请求上限（默认 7MiB = 8MB 传输上限 - 余量）。
+#                  服务端按 proto 编码精确字节数校验。
+[limits]
+max_event_bytes = 1048576
+max_append_batch_bytes = 7340032
 ```

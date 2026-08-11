@@ -5,15 +5,29 @@ use std::time::Duration;
 
 use tokio_stream::StreamExt;
 
-use es_client::{EventStoreClient, SubscribeStream, SubscribeTarget, subscribe_response};
+use es_client::{
+    ClientError, Direction, EventStoreClient, SubscribeStream, SubscribeTarget,
+    subscribe_response,
+};
+use es_client::{ExpectedVersionBuilder, EventBuilder};
 use es_server::config::{Config, NodeConfig, ShardConfig, StorageConfig};
 use es_server::Server;
 
-/// 启动进程内测试服务器（单节点，2 分片，立即成为 leader）。
+/// 启动进程内测试服务器（单节点，2 分片，立即成为 leader，默认大小限制）。
 ///
 /// 返回 (地址, 服务器任务句柄, Server, TempDir)。
 /// TempDir 必须由调用方持有到测试结束，drop 即删数据目录。
 async fn start_test_server() -> (
+    String,
+    tokio::task::JoinHandle<()>,
+    Server,
+    tempfile::TempDir,
+) {
+    start_test_server_with_limits(Default::default()).await
+}
+
+/// 启动进程内测试服务器（可自定义 [LimitsSection] 大小限制）。
+async fn start_test_server_with_limits(limits: es_server::config::LimitsSection) -> (
     String,
     tokio::task::JoinHandle<()>,
     Server,
@@ -33,6 +47,7 @@ async fn start_test_server() -> (
         shards: ShardConfig { num_shards: 2 },
         snapshot: Default::default(),
         tls: None,
+        limits: limits.clone(),
     };
 
     let server = Server::new(config).expect("创建服务器");
@@ -58,7 +73,8 @@ async fn start_test_server() -> (
         .expect("绑定端口");
     let addr = format!("http://{}", listener.local_addr().expect("取本地地址"));
 
-    let service = es_server::service::EsService::new(server.shard_manager().clone());
+    let service =
+        es_server::service::EsService::with_limits(server.shard_manager().clone(), limits);
     let handle = tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
             .add_service(
@@ -416,4 +432,73 @@ async fn subscribe_all_writes_during_catchup_exactly_once() {
     for p in 0..2005 {
         assert!(positions.contains(&p), "position {p} 缺失");
     }
+}
+
+/// 服务端小上限时超限 append 被权威拒绝（FailedPrecondition 原样上抛）。
+///
+/// 客户端默认常量（1MiB）大于服务端配置（1KB），验证「终以服务端为准」。
+#[tokio::test]
+async fn append_oversized_event_rejected_by_server_limits() {
+    let limits = es_server::config::LimitsSection {
+        max_event_bytes: 1024,
+        max_append_batch_bytes: 4096,
+    };
+    let (addr, _handle, _server, _dir) = start_test_server_with_limits(limits).await;
+    let mut client = EventStoreClient::connect(vec![addr]).await.expect("连接");
+
+    // 2KB 事件:客户端前置校验（1MiB）放行,服务端（1KB）拒绝
+    let err = client
+        .append(
+            "s".into(),
+            ExpectedVersionBuilder::any(),
+            vec![EventBuilder::new("T").data(vec![0u8; 2048]).build()],
+        )
+        .await
+        .expect_err("超限应被服务端拒绝");
+    match err {
+        ClientError::RpcFailed { code, message } => {
+            assert_eq!(code, tonic::Code::FailedPrecondition);
+            assert!(
+                message.starts_with("append payload too large"),
+                "消息应说明超限: {message}"
+            );
+        }
+        other => panic!("应原样上抛 RpcFailed(FailedPrecondition),实际 {other:?}"),
+    }
+
+    // 流里没有任何事件被写入
+    let events = client
+        .read_stream("s".into(), 0, 10, Direction::Forward)
+        .await
+        .expect("读流");
+    assert!(events.is_empty(), "被拒的 append 不应写入任何事件");
+}
+
+/// 客户端前置校验:单事件超过默认上限（1MiB）本地拒绝,不发 RPC。
+#[tokio::test]
+async fn append_client_side_limit_rejects_without_rpc() {
+    let (addr, _handle, _server, _dir) = start_test_server().await;
+    let mut client = EventStoreClient::connect(vec![addr]).await.expect("连接");
+
+    // 1MiB + 1 字节:超过客户端默认单事件上限（es_core::limits::MAX_EVENT_PAYLOAD_BYTES）
+    let big = vec![0u8; 1024 * 1024 + 1];
+    let err = client
+        .append(
+            "s".into(),
+            ExpectedVersionBuilder::any(),
+            vec![EventBuilder::new("T").data(big).build()],
+        )
+        .await
+        .expect_err("超限应在本地拒绝");
+    assert!(
+        matches!(err, ClientError::PayloadTooLarge(_)),
+        "应为 PayloadTooLarge,实际 {err:?}"
+    );
+
+    // 未发出 RPC:流为空
+    let events = client
+        .read_stream("s".into(), 0, 10, Direction::Forward)
+        .await
+        .expect("读流");
+    assert!(events.is_empty(), "本地拒绝不应写入任何事件");
 }

@@ -24,6 +24,35 @@ pub struct Config {
     /// ca_file 配置时严格校验，否则默认跳过校验（自签友好）。
     #[serde(default)]
     pub tls: Option<TlsConfig>,
+
+    /// 请求大小限制（可选，可整体缺省）
+    #[serde(default)]
+    pub limits: LimitsSection,
+}
+
+/// 请求大小限制配置（[limits] 段）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LimitsSection {
+    /// 单事件 data+metadata 上限（字节），默认 1MiB。
+    ///
+    /// 一条 append 批在 raft 里是一条日志条目；openraft 对单条超限的
+    /// AppendEntries 没有拆小路径，必须从源头限制单事件大小。
+    pub max_event_bytes: u64,
+    /// 单次 append 请求上限（字节，proto 编码后精确值），默认 7MiB。
+    ///
+    /// 8MB 传输上限减去 1MiB 余量（逐事件 proto 头 + gRPC 信封），
+    /// 保证「总和达标」的请求不会在传输层被拒。
+    pub max_append_batch_bytes: u64,
+}
+
+impl Default for LimitsSection {
+    fn default() -> Self {
+        Self {
+            max_event_bytes: es_core::limits::MAX_EVENT_PAYLOAD_BYTES as u64,
+            max_append_batch_bytes: es_core::limits::MAX_APPEND_BATCH_BYTES as u64,
+        }
+    }
 }
 
 /// 快照配置（[snapshot] 段）
@@ -36,6 +65,11 @@ pub struct SnapshotSection {
     pub keep: usize,
     /// 快照目录；缺省为 {data_dir}/snapshots
     pub dir: Option<PathBuf>,
+    /// 快照分块大小上限（字节），默认 3MiB 与 openraft 一致。
+    ///
+    /// openraft 0.9.25 对超限快照块直接放弃传输（无拆小路径），
+    /// 此值受 [es_core::limits::MAX_SNAPSHOT_CHUNK_BYTES]（6MiB）约束。
+    pub max_chunk_size: u64,
 }
 
 impl Default for SnapshotSection {
@@ -44,6 +78,7 @@ impl Default for SnapshotSection {
             compression: Default::default(), // zstd
             keep: 3,
             dir: None,
+            max_chunk_size: 3 * 1024 * 1024,
         }
     }
 }
@@ -119,6 +154,28 @@ impl Config {
         if self.snapshot.keep == 0 {
             return Err("[snapshot] keep 必须 ≥ 1（keep=0 会删光全部快照）".to_string());
         }
+        if self.limits.max_event_bytes == 0 {
+            return Err("[limits] max_event_bytes 必须 ≥ 1".to_string());
+        }
+        if self.limits.max_append_batch_bytes == 0
+            || self.limits.max_append_batch_bytes > es_core::limits::MAX_APPEND_BATCH_BYTES as u64
+        {
+            return Err(format!(
+                "[limits] max_append_batch_bytes 必须 ∈ [1, {}]（8MB 传输上限减去余量）",
+                es_core::limits::MAX_APPEND_BATCH_BYTES
+            ));
+        }
+        if self.limits.max_event_bytes > self.limits.max_append_batch_bytes {
+            return Err("[limits] max_event_bytes 不能大于 max_append_batch_bytes".to_string());
+        }
+        if self.snapshot.max_chunk_size == 0
+            || self.snapshot.max_chunk_size > es_core::limits::MAX_SNAPSHOT_CHUNK_BYTES as u64
+        {
+            return Err(format!(
+                "[snapshot] max_chunk_size 必须 ∈ [1, {}]（超限快照块 openraft 直接放弃传输）",
+                es_core::limits::MAX_SNAPSHOT_CHUNK_BYTES
+            ));
+        }
         if let Some(tls) = &self.tls {
             tls.validate()?;
         }
@@ -180,6 +237,7 @@ impl Default for Config {
             shards: ShardConfig { num_shards: 8 },
             snapshot: SnapshotSection::default(),
             tls: None,
+            limits: LimitsSection::default(),
         }
     }
 }
@@ -329,6 +387,119 @@ mod tests {
         };
         let err = config.validate().expect_err("keep=0 应报错");
         assert!(err.contains("keep"), "错误应说明 keep: {err}");
+    }
+
+    #[test]
+    fn limits_event_zero_rejected() {
+        let config = Config {
+            limits: LimitsSection {
+                max_event_bytes: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = config.validate().expect_err("max_event_bytes=0 应报错");
+        assert!(err.contains("max_event_bytes"), "错误应说明 max_event_bytes: {err}");
+    }
+
+    #[test]
+    fn limits_batch_over_cap_rejected() {
+        let config = Config {
+            limits: LimitsSection {
+                max_append_batch_bytes: es_core::limits::MAX_APPEND_BATCH_BYTES as u64 + 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = config.validate().expect_err("超出上限应报错");
+        assert!(
+            err.contains("max_append_batch_bytes"),
+            "错误应说明 max_append_batch_bytes: {err}"
+        );
+    }
+
+    #[test]
+    fn limits_event_greater_than_batch_rejected() {
+        let config = Config {
+            limits: LimitsSection {
+                max_event_bytes: 4096,
+                max_append_batch_bytes: 2048,
+            },
+            ..Default::default()
+        };
+        let err = config.validate().expect_err("单事件大于批次上限应报错");
+        assert!(
+            err.contains("max_event_bytes"),
+            "错误应说明 max_event_bytes: {err}"
+        );
+    }
+
+    #[test]
+    fn limits_valid_passes() {
+        let config = Config {
+            limits: LimitsSection {
+                max_event_bytes: 1024,
+                max_append_batch_bytes: 4096,
+            },
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn snapshot_chunk_over_cap_rejected() {
+        let config = Config {
+            snapshot: SnapshotSection {
+                max_chunk_size: es_core::limits::MAX_SNAPSHOT_CHUNK_BYTES as u64 + 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = config.validate().expect_err("chunk 超出上限应报错");
+        assert!(
+            err.contains("max_chunk_size"),
+            "错误应说明 max_chunk_size: {err}"
+        );
+    }
+
+    #[test]
+    fn snapshot_chunk_default_passes() {
+        let config = Config {
+            snapshot: SnapshotSection {
+                max_chunk_size: 3 * 1024 * 1024,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn limits_section_deserializes_defaults() {
+        // [limits] 段整体缺省时使用默认值(1MiB / 7MiB)
+        let config: Config = toml::from_str(
+            r#"
+[node]
+id = 1
+listen_addr = "127.0.0.1:50051"
+
+[storage]
+data_dir = "./data"
+
+[shards]
+num_shards = 8
+"#,
+        )
+        .expect("配置解析");
+        assert_eq!(
+            config.limits.max_event_bytes,
+            es_core::limits::MAX_EVENT_PAYLOAD_BYTES as u64
+        );
+        assert_eq!(
+            config.limits.max_append_batch_bytes,
+            es_core::limits::MAX_APPEND_BATCH_BYTES as u64
+        );
+        assert_eq!(config.snapshot.max_chunk_size, 3 * 1024 * 1024);
     }
 
     #[test]

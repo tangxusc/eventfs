@@ -32,6 +32,7 @@ async fn start_test_server() -> (
         shards: ShardConfig { num_shards: 2 },
         snapshot: Default::default(),
         tls: None,
+        limits: Default::default(),
     };
 
     let server = Server::new(config).expect("创建服务器");

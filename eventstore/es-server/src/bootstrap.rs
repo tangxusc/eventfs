@@ -389,6 +389,7 @@ mod tests {
             shards: crate::config::ShardConfig { num_shards: 1 },
             snapshot: Default::default(),
             tls: None,
+            limits: Default::default(),
         }
     }
 

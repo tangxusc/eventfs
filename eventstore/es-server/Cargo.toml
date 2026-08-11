@@ -20,6 +20,8 @@ openraft = { workspace = true }
 surrealkv = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
+# prost 的 Message::encoded_len 用于 append 请求的权威字节数校验
+prost = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }

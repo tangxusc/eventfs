@@ -26,3 +26,5 @@ async-trait = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 uuid = { workspace = true }
+# network_limit_test 的 tonic stub 服务端用 TcpListenerStream 接入
+tokio-stream = { workspace = true }
