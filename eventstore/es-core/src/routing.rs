@@ -16,7 +16,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 相同stream落入同一分片() {
+    fn same_stream_same_shard() {
         let s = "test-stream";
         let shard = route(s, 16);
         for _ in 0..10 {
@@ -25,7 +25,7 @@ mod tests {
     }
 
     #[test]
-    fn 不同stream大概率落入不同分片() {
+    fn different_streams_spread_across_shards() {
         let shards: std::collections::HashSet<_> = (0..100)
             .map(|i| route(&format!("stream-{i}"), 16))
             .collect();
@@ -34,13 +34,13 @@ mod tests {
     }
 
     #[test]
-    fn 空串也能路由() {
+    fn empty_stream_routable() {
         let _s = route("", 16);
     }
 
     /// 用 proptest 验证分片 ID 始终在合法范围内
     #[test]
-    fn 分片id范围合法() {
+    fn shard_id_in_valid_range() {
         use proptest::prelude::*;
         proptest!(|(s in ".*", c in 1u64..=256)| {
             let shard = route(&s, c);

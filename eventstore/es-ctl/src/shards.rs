@@ -154,7 +154,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 序列Ok到NotFound得数量() {
+    fn probe_ok_then_not_found_counts() {
         assert_eq!(
             probe_count_from_sequence([
                 ProbeStep::Ok,
@@ -167,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn 首个NotFound即零() {
+    fn first_not_found_means_zero() {
         assert_eq!(
             probe_count_from_sequence([ProbeStep::NotFound]),
             ProbeOutcome::Found(0)
@@ -175,7 +175,7 @@ mod tests {
     }
 
     #[test]
-    fn 序列含Err判定端点失败() {
+    fn probe_err_means_endpoint_failed() {
         assert_eq!(
             probe_count_from_sequence([ProbeStep::Ok, ProbeStep::Err]),
             ProbeOutcome::EndpointFailed
@@ -183,19 +183,19 @@ mod tests {
     }
 
     #[test]
-    fn 超上限判超限() {
+    fn scan_over_limit_returns_exceeded() {
         // Ok × 1024 后仍继续 → 超过上限
         let steps = std::iter::repeat_n(ProbeStep::Ok, MAX_SCAN_SHARDS as usize + 1);
         assert_eq!(probe_count_from_sequence(steps), ProbeOutcome::Exceeded);
     }
 
     #[test]
-    fn 空序列判超限() {
+    fn empty_sequence_returns_exceeded() {
         assert_eq!(probe_count_from_sequence([]), ProbeOutcome::Exceeded);
     }
 
     #[test]
-    fn 分片范围全id() {
+    fn shard_scope_all_ids() {
         let scope = ShardScope {
             count: 3,
             source: ShardCountSource::Probe,

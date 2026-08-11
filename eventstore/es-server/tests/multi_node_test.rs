@@ -466,7 +466,7 @@ impl Drop for TestCluster {
 
 #[tokio::test]
 #[ignore = "需要较长时间编译与启动进程"]
-async fn 三节点能正常启动并接受连接() {
+async fn three_node_start_and_accept() {
     eprintln!("\n=== 启动 3 节点集群 ===");
     let cluster = TestCluster::start().await;
 
@@ -498,7 +498,7 @@ async fn 三节点能正常启动并接受连接() {
 
 #[tokio::test]
 #[ignore = "需启动多个进程，耗时较长"]
-async fn 三节点选主并复制日志() {
+async fn three_node_elect_and_replicate() {
     eprintln!("\n=== 启动 3 节点集群 ===");
     let cluster = TestCluster::start().await;
 
@@ -607,7 +607,7 @@ async fn 三节点选主并复制日志() {
 
 #[tokio::test]
 #[ignore = "需启动多个进程，耗时较长"]
-async fn 非leader节点拒绝写入并可从其读取() {
+async fn non_leader_write_rejected_read_ok() {
     let cluster = TestCluster::start().await;
     cluster.form_cluster().await;
     let leader = cluster.wait_for_leader(Duration::from_secs(10)).await;
@@ -717,7 +717,7 @@ async fn 非leader节点拒绝写入并可从其读取() {
 
 #[tokio::test]
 #[ignore = "需启动多个进程，耗时较长"]
-async fn 杀掉leader后重新选主且数据不丢() {
+async fn leader_killed_re_elect_data_intact() {
     let mut cluster = TestCluster::start().await;
     cluster.form_cluster().await;
 
@@ -861,7 +861,7 @@ async fn append_to(
 
 #[tokio::test]
 #[ignore = "需启动多个进程，耗时较长"]
-async fn 多分片各自选主且互不影响() {
+async fn per_shard_election_independent() {
     const SHARDS: u64 = 3;
     eprintln!("\n=== 启动 3 节点 × {SHARDS} 分片 ===");
     let cluster = TestCluster::start_with_shards(SHARDS, false).await;
@@ -1015,7 +1015,7 @@ async fn 多分片各自选主且互不影响() {
 
 #[tokio::test]
 #[ignore = "需启动多个进程，耗时较长"]
-async fn 节点重启后能重新加入并追平落后的数据() {
+async fn restart_rejoin_catchup() {
     let mut cluster = TestCluster::start().await;
     cluster.form_cluster().await;
     let leader = cluster.wait_for_leader(Duration::from_secs(10)).await;
@@ -1084,7 +1084,7 @@ async fn 节点重启后能重新加入并追平落后的数据() {
 
 #[tokio::test]
 #[ignore = "需启动多个进程，耗时较长"]
-async fn 三节点配置peers自动组建并复制数据() {
+async fn three_node_peers_bootstrap_replicate() {
     eprintln!("\n=== 启动 3 节点集群（配置完整 peers，自动组建）===");
     let cluster = TestCluster::start_auto(&[1, 2, 3]).await;
 
@@ -1136,7 +1136,7 @@ async fn 三节点配置peers自动组建并复制数据() {
 
 #[tokio::test]
 #[ignore = "需启动多个进程，耗时较长"]
-async fn 自动组建后重启节点不重复初始化() {
+async fn bootstrap_restart_no_reinit() {
     eprintln!("\n=== 启动 3 节点集群（自动组建）===");
     let mut cluster = TestCluster::start_auto(&[1, 2, 3]).await;
     let leader = cluster
@@ -1179,7 +1179,7 @@ async fn 自动组建后重启节点不重复初始化() {
 
 #[tokio::test]
 #[ignore = "需启动多个进程，耗时较长"]
-async fn 全集群重启后自动恢复() {
+async fn full_cluster_restart_recovers() {
     eprintln!("\n=== 启动 3 节点集群（自动组建）===");
     let mut cluster = TestCluster::start_auto(&[1, 2, 3]).await;
     let leader = cluster
@@ -1196,7 +1196,7 @@ async fn 全集群重启后自动恢复() {
     let leader = cluster
         .wait_cluster_formed(3, Duration::from_secs(60))
         .await;
-    eprintln!("✓ 全集群重启后自动恢复，leader = node{leader}");
+    eprintln!("✓ full_cluster_restart_recovers，leader = node{leader}");
 
     // 重启前写入的数据完好
     let events = read_stream_from(&cluster, leader, "auto-all-restart").await;
@@ -1208,7 +1208,7 @@ async fn 全集群重启后自动恢复() {
 
 #[tokio::test]
 #[ignore = "需启动多个进程，耗时较长"]
-async fn 节点乱序启动自动组建() {
+async fn out_of_order_start_bootstrap() {
     eprintln!("\n=== 乱序启动：先起 node2，再起 node1、node3 ===");
     // node2 先起：探测不到其它节点，自行用完整成员 initialize（无 quorum 条目未提交）；
     // node1/node3 起来后探测到 node2 已初始化 → 跳过自举 → 投票使其提交
@@ -1237,7 +1237,7 @@ async fn 节点乱序启动自动组建() {
 
 #[tokio::test]
 #[ignore = "需启动多个进程，耗时较长"]
-async fn 单节点peers只含自己自动自举() {
+async fn single_node_self_peer_self_bootstrap() {
     eprintln!("\n=== 启动单节点集群（peers 只含自己）===");
     let cluster = TestCluster::start_single().await;
 

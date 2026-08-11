@@ -248,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn 校验_源目录不存在() {
+    fn validate_src_dir_missing() {
         let a = args("/nonexistent-xyz", 2, "/tmp/esctl-dst-xyz", 4, true);
         let err = validate(&a);
         assert!(err.is_err());
@@ -256,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn 校验_分片数为零() {
+    fn validate_zero_shards_rejected() {
         let a = args(".", 0, "/tmp/esctl-dst-xyz", 4, true);
         assert!(validate(&a).is_err());
         let a = args(".", 2, "/tmp/esctl-dst-xyz", 0, true);
@@ -264,13 +264,13 @@ mod tests {
     }
 
     #[test]
-    fn 校验_源目标相同() {
+    fn validate_src_dst_same_rejected() {
         let a = args(".", 2, ".", 4, true);
         assert!(validate(&a).is_err());
     }
 
     #[test]
-    fn 目标目录非空检测() {
+    fn dst_dir_nonempty_detected() {
         let tmp = tempfile::tempdir().expect("临时目录");
         assert!(!dst_dir_nonempty(&args(
             tmp.path().to_str().unwrap(),

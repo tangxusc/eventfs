@@ -171,7 +171,7 @@ fn stdout(out: &Output) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "需启动多个真实进程，耗时较长"]
-async fn 三节点组建复制与成员管理() {
+async fn three_node_bootstrap_replicate_membership() {
     let cluster = TestCluster::start().await;
     let endpoints = cluster.endpoints();
 
@@ -245,7 +245,7 @@ async fn 三节点组建复制与成员管理() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "需启动多个真实进程，耗时较长"]
-async fn 非leader端点写入自动重定向() {
+async fn non_leader_write_redirected() {
     let cluster = TestCluster::start().await;
     let endpoints = cluster.endpoints();
 

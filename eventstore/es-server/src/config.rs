@@ -159,7 +159,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tls_cert_key_必须成对() {
+    fn tls_cert_key_must_be_paired() {
         let tls = TlsConfig {
             cert_file: None,
             key_file: None,
@@ -170,7 +170,7 @@ mod tests {
     }
 
     #[test]
-    fn tls_文件缺失_报错() {
+    fn tls_missing_files_errors() {
         let tls = TlsConfig {
             cert_file: Some(PathBuf::from("/nonexistent/cert.pem")),
             key_file: Some(PathBuf::from("/nonexistent/key.pem")),
@@ -180,7 +180,7 @@ mod tests {
     }
 
     #[test]
-    fn tls_client_trust_两分支() {
+    fn tls_client_trust_two_branches() {
         // 无 ca_file → 跳过校验
         let tls = TlsConfig {
             cert_file: None,
@@ -209,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn tls_ca文件读取失败_报错不降级() {
+    fn tls_ca_read_fail_no_downgrade() {
         let tls = TlsConfig {
             cert_file: None,
             key_file: None,
@@ -220,7 +220,56 @@ mod tests {
     }
 
     #[test]
-    fn num_shards为0_validate拒绝() {
+    fn tls_empty_cert_or_key_errors() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let cert = dir.path().join("cert.pem");
+        let key = dir.path().join("key.pem");
+        std::fs::write(&cert, b"").expect("写空 cert");
+        std::fs::write(&key, b"non-empty-key").expect("写 key");
+        let tls = TlsConfig {
+            cert_file: Some(cert.clone()),
+            key_file: Some(key.clone()),
+            ca_file: None,
+        };
+        let err = tls.validate().expect_err("空 cert 应报错");
+        assert!(err.contains("cert_file"), "错误应说明 cert_file: {err}");
+    }
+
+    #[test]
+    fn tls_empty_ca_errors() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let cert = dir.path().join("cert.pem");
+        let key = dir.path().join("key.pem");
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&cert, b"c").expect("写 cert");
+        std::fs::write(&key, b"k").expect("写 key");
+        std::fs::write(&ca, b"").expect("写空 ca");
+        let tls = TlsConfig {
+            cert_file: Some(cert),
+            key_file: Some(key),
+            ca_file: Some(ca),
+        };
+        let err = tls.validate().expect_err("空 ca 应报错");
+        assert!(err.contains("ca_file"), "错误应说明 ca_file: {err}");
+    }
+
+    #[test]
+    fn tls_valid_files_pass() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let cert = dir.path().join("cert.pem");
+        let key = dir.path().join("key.pem");
+        std::fs::write(&cert, b"c").expect("写 cert");
+        std::fs::write(&key, b"k").expect("写 key");
+        let tls = TlsConfig {
+            cert_file: Some(cert),
+            key_file: Some(key),
+            ca_file: None,
+        };
+        assert!(tls.validate().is_ok());
+    }
+
+    #[test]
+    fn num_shards_zero_rejected() {
         // 路由取模除零的启动期拦截（es-core::routing::route 对 0 会 panic）
         let config = Config {
             shards: ShardConfig { num_shards: 0 },
@@ -231,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn num_shards正常_validate通过() {
+    fn num_shards_valid_passes() {
         let config = Config {
             shards: ShardConfig { num_shards: 8 },
             ..Default::default()

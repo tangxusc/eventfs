@@ -209,7 +209,7 @@ impl RaftAdmin for MockAdmin {
 /// 发现 3：多端点列表里首个端点建连失败，必须故障转移到下一个端点
 /// （修复前 `event_client(&ep).await?` 在首个端点直接上抛，健康端点从未被尝试）
 #[tokio::test(flavor = "multi_thread")]
-async fn with_any_endpoint_首个端点宕机_故障转移成功() {
+async fn with_any_endpoint_first_down_failover_ok() {
     let dead = dead_addr().await;
     // status 走 get_raft_state（管理面），需同时注册 EventStore + RaftAdmin
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -237,7 +237,7 @@ async fn with_any_endpoint_首个端点宕机_故障转移成功() {
 /// 发现 5：leader unknown（选举中）退避重试不再被 tried 集合挡死
 /// （修复前 push_back 后再次 pop 被 `tried.insert` 挡下，重试永不发生）
 #[tokio::test(flavor = "multi_thread")]
-async fn with_leader_leader未知_退避重试最终成功() {
+async fn with_leader_unknown_backoff_retry_ok() {
     let mock = MockEventStore {
         unknown_appends: Arc::new(AtomicU32::new(2)),
     };
@@ -255,7 +255,7 @@ async fn with_leader_leader未知_退避重试最终成功() {
 
 /// 发现 12：with_admin_leader 的 3 轮重试覆盖 leader 探测失败（选举中）
 #[tokio::test(flavor = "multi_thread")]
-async fn with_admin_leader_leader探测失败_重试成功() {
+async fn with_admin_leader_probe_fail_retry_ok() {
     let mock = MockAdmin {
         no_leader_rounds: Arc::new(AtomicU32::new(2)),
     };
@@ -281,7 +281,7 @@ async fn with_admin_leader_leader探测失败_重试成功() {
 /// 发现 8：watch --once 在收到 caught_up 前流关闭必须非零退出
 /// （修复前返回 Ok(0)，脚本会把"未追平"误判为"已追平"）
 #[tokio::test(flavor = "multi_thread")]
-async fn watch_once_未追平流关闭_退出码1() {
+async fn watch_once_not_caught_up_exit_code_1() {
     let live = serve_event_store(MockEventStore::default()).await;
 
     let (code, _out, err) = esctl(&live, &["watch", "s", "--once", "--from-start"]);

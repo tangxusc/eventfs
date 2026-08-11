@@ -27,7 +27,7 @@ fn append_entry(
 }
 
 #[tokio::test]
-async fn 首次写入版本从0起() {
+async fn first_write_version_zero() {
     let (mut st, _d) = new_storage(0);
     let resp = st
         .apply(vec![append_entry(
@@ -62,7 +62,7 @@ async fn 首次写入版本从0起() {
 }
 
 #[tokio::test]
-async fn 连续追加版本递增不空洞() {
+async fn consecutive_appends_version_increasing() {
     let (mut st, _d) = new_storage(0);
     for i in 0..5u64 {
         st.apply(vec![append_entry(
@@ -84,7 +84,7 @@ async fn 连续追加版本递增不空洞() {
 }
 
 #[tokio::test]
-async fn no_stream对已存在流报冲突() {
+async fn no_stream_conflict_existing() {
     let (mut st, _d) = new_storage(0);
     st.apply(vec![append_entry(
         0,
@@ -119,7 +119,7 @@ async fn no_stream对已存在流报冲突() {
 }
 
 #[tokio::test]
-async fn stream_exists对不存在流报冲突() {
+async fn stream_exists_conflict_missing() {
     let (mut st, _d) = new_storage(0);
     let resp = st
         .apply(vec![append_entry(
@@ -139,7 +139,7 @@ async fn stream_exists对不存在流报冲突() {
 }
 
 #[tokio::test]
-async fn exact版本匹配与不匹配() {
+async fn exact_version_match_and_mismatch() {
     let (mut st, _d) = new_storage(0);
     st.apply(vec![append_entry(
         0,
@@ -182,7 +182,7 @@ async fn exact版本匹配与不匹配() {
 }
 
 #[tokio::test]
-async fn 相同event_id重放幂等() {
+async fn same_event_id_replay_idempotent() {
     let (mut st, _d) = new_storage(0);
     let ev = new_event("E", b"payload");
 
@@ -218,7 +218,7 @@ async fn 相同event_id重放幂等() {
 }
 
 #[tokio::test]
-async fn 同批次内多条append版本串接() {
+async fn batch_appends_version_chained() {
     let (mut st, _d) = new_storage(0);
     // 同一批 entry 里两条针对同一个 stream 的 Append，
     // 后一条必须看到前一条的版本号，否则会覆盖
@@ -246,7 +246,7 @@ async fn 同批次内多条append版本串接() {
 }
 
 #[tokio::test]
-async fn hlc随事件落盘() {
+async fn hlc_persisted_with_event() {
     let (mut st, _d) = new_storage(0);
     st.apply(vec![append_entry(
         7,
@@ -263,7 +263,7 @@ async fn hlc随事件落盘() {
 }
 
 #[tokio::test]
-async fn applied_state随apply推进并可重启恢复() {
+async fn applied_state_advances_and_recovers() {
     let dir = tempfile::tempdir().expect("临时目录");
     let path = dir.path().to_path_buf();
 
@@ -305,7 +305,7 @@ async fn applied_state随apply推进并可重启恢复() {
 }
 
 #[tokio::test]
-async fn 分片间状态机互不干扰() {
+async fn shard_sm_isolated() {
     let (mut sts, _d) = new_shared_storages(&[0, 1]);
     let (mut s1, mut s0) = (sts.pop().unwrap(), sts.pop().unwrap());
 
@@ -338,7 +338,7 @@ async fn 分片间状态机互不干扰() {
 }
 
 #[tokio::test]
-async fn 读流区间与限量() {
+async fn read_stream_range_and_limit() {
     let (mut st, _d) = new_storage(0);
     for i in 0..10u64 {
         st.apply(vec![append_entry(
@@ -363,7 +363,7 @@ async fn 读流区间与限量() {
 }
 
 #[tokio::test]
-async fn 前缀包含的流名不串数据() {
+async fn prefix_stream_names_isolated() {
     let (mut st, _d) = new_storage(0);
     // "a" 与 "ab"：无长度前缀时扫 "a" 会把 "ab" 的事件带出来
     st.apply(vec![append_entry(
@@ -393,7 +393,7 @@ async fn 前缀包含的流名不串数据() {
 }
 
 #[tokio::test]
-async fn 快照往返后数据一致() {
+async fn snapshot_roundtrip_consistent() {
     use openraft::RaftSnapshotBuilder;
 
     let (mut src, _d1) = new_storage(0);
@@ -431,7 +431,7 @@ async fn 快照往返后数据一致() {
 }
 
 #[tokio::test]
-async fn 装快照会清掉目标原有数据() {
+async fn snapshot_overwrite_clears_old() {
     use openraft::RaftSnapshotBuilder;
 
     // 源只有 s1
@@ -470,7 +470,7 @@ async fn 装快照会清掉目标原有数据() {
 }
 
 #[tokio::test]
-async fn read_all按position顺序读取() {
+async fn read_all_position_ordered() {
     use openraft::storage::RaftStateMachine;
 
     let (mut st, _d) = new_storage(0);
@@ -505,7 +505,7 @@ async fn read_all按position顺序读取() {
 }
 
 #[tokio::test]
-async fn read_all可指定起始与限量() {
+async fn read_all_from_position_with_limit() {
     use openraft::storage::RaftStateMachine;
 
     let (mut st, _d) = new_storage(0);
@@ -527,7 +527,7 @@ async fn read_all可指定起始与限量() {
     assert_eq!(events[3].position, 6);
 }
 #[tokio::test]
-async fn apply后广播新事件给订阅者() {
+async fn apply_broadcasts_to_subscribers() {
     let (mut st, _d) = new_storage(0);
 
     // 必须在 apply 前订阅：broadcast 只推送订阅之后产生的事件
@@ -553,7 +553,7 @@ async fn apply后广播新事件给订阅者() {
 }
 
 #[tokio::test]
-async fn 冲突的apply不广播事件() {
+async fn conflict_apply_no_broadcast() {
     let (mut st, _d) = new_storage(0);
 
     st.apply(vec![append_entry(

@@ -17,7 +17,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 裸地址补http前缀() {
+    fn bare_addr_gets_http_prefix() {
         assert_eq!(
             normalize_endpoint("127.0.0.1:50051"),
             "http://127.0.0.1:50051"
@@ -25,7 +25,7 @@ mod tests {
     }
 
     #[test]
-    fn 带scheme原样返回() {
+    fn scheme_preserved() {
         assert_eq!(
             normalize_endpoint("http://127.0.0.1:50051"),
             "http://127.0.0.1:50051"

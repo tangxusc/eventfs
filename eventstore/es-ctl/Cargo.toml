@@ -30,3 +30,5 @@ tempfile = { workspace = true }
 rcgen = { workspace = true }
 es-server = { workspace = true }
 es-raft = { workspace = true }
+openraft = { workspace = true }
+tokio-stream = { workspace = true }

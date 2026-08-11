@@ -94,3 +94,92 @@ impl EventBuilder {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use es_proto::eventstore::expected_version::Kind;
+
+    #[test]
+    fn expected_version_four_constructors() {
+        assert!(matches!(ExpectedVersionBuilder::any().kind, Some(Kind::Any(_))));
+        assert!(matches!(
+            ExpectedVersionBuilder::no_stream().kind,
+            Some(Kind::NoStream(_))
+        ));
+        assert!(matches!(
+            ExpectedVersionBuilder::stream_exists().kind,
+            Some(Kind::StreamExists(_))
+        ));
+        assert!(matches!(
+            ExpectedVersionBuilder::exact(7).kind,
+            Some(Kind::Exact(7))
+        ));
+    }
+
+    #[test]
+    fn event_builder_defaults_empty() {
+        let e = EventBuilder::new("T").build();
+        assert_eq!(e.event_type, "T");
+        assert!(e.data.is_empty());
+        assert!(e.metadata.is_empty());
+        assert_eq!(e.event_id.len(), 16, "默认生成 v4 UUID 的 16 字节");
+    }
+
+    #[test]
+    fn event_builder_overrides_event_id() {
+        let id = uuid::Uuid::new_v4();
+        let e = EventBuilder::new("T").event_id(id).build();
+        assert_eq!(e.event_id, id.as_bytes().to_vec());
+    }
+
+    /// 序列化必然失败的类型：验证 data_json/metadata_json 的 Err 分支
+    struct BadSerde;
+    impl serde::Serialize for BadSerde {
+        fn serialize<S: serde::Serializer>(&self, _s: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("故意失败"))
+        }
+    }
+
+    #[test]
+    fn data_json_ok_and_err() {
+        let ok = EventBuilder::new("T").data_json(&vec![1u8, 2]).expect("序列化成功");
+        assert_eq!(ok.data, b"[1,2]");
+        assert!(EventBuilder::new("T").data_json(&BadSerde).is_err());
+    }
+
+    #[test]
+    fn metadata_json_ok_and_err() {
+        let ok = EventBuilder::new("T")
+            .metadata_json(&"meta")
+            .expect("序列化成功");
+        assert_eq!(ok.metadata, b"\"meta\"");
+        assert!(EventBuilder::new("T").metadata_json(&BadSerde).is_err());
+    }
+
+    #[test]
+    fn raw_data_and_metadata_passthrough() {
+        let e = EventBuilder::new("T")
+            .data(vec![9, 9])
+            .metadata(vec![8])
+            .build();
+        assert_eq!(e.data, vec![9, 9]);
+        assert_eq!(e.metadata, vec![8]);
+    }
+
+    #[test]
+    fn chained_builder_all_effective() {
+        let id = uuid::Uuid::new_v4();
+        let e = EventBuilder::new("Chained")
+            .event_id(id)
+            .data_json(&"d")
+            .unwrap()
+            .metadata_json(&"m")
+            .unwrap()
+            .build();
+        assert_eq!(e.event_type, "Chained");
+        assert_eq!(e.event_id, id.as_bytes().to_vec());
+        assert_eq!(e.data, b"\"d\"");
+        assert_eq!(e.metadata, b"\"m\"");
+    }
+}

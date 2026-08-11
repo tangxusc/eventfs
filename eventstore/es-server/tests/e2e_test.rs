@@ -177,7 +177,7 @@ async fn read_stream(
 }
 
 #[tokio::test]
-async fn 写入并读回() {
+async fn write_and_read_back() {
     let (addr, handle, server, _dir) = start_test_server().await;
     let mut client = EventStoreClient::connect(addr).await.expect("连接");
 
@@ -220,7 +220,7 @@ async fn 写入并读回() {
 }
 
 #[tokio::test]
-async fn 乐观并发_no_stream对已存在流报冲突() {
+async fn optimistic_no_stream_conflict() {
     let (addr, handle, _server, _dir) = start_test_server().await;
     let mut client = EventStoreClient::connect(addr).await.expect("连接");
 
@@ -257,7 +257,7 @@ async fn 乐观并发_no_stream对已存在流报冲突() {
 }
 
 #[tokio::test]
-async fn 乐观并发_exact版本匹配与不匹配() {
+async fn optimistic_exact_match_and_mismatch() {
     let (addr, handle, _server, _dir) = start_test_server().await;
     let mut client = EventStoreClient::connect(addr).await.expect("连接");
 
@@ -299,7 +299,7 @@ async fn 乐观并发_exact版本匹配与不匹配() {
 }
 
 #[tokio::test]
-async fn 幂等_相同event_id重放不产生重复() {
+async fn idempotent_event_id_no_duplicate() {
     let (addr, handle, _server, _dir) = start_test_server().await;
     let mut client = EventStoreClient::connect(addr).await.expect("连接");
 
@@ -326,7 +326,7 @@ async fn 幂等_相同event_id重放不产生重复() {
 }
 
 #[tokio::test]
-async fn 分片路由_多流分散到不同分片() {
+async fn shard_routing_spreads_streams() {
     let (addr, handle, _server, _dir) = start_test_server().await;
     let mut client = EventStoreClient::connect(addr).await.expect("连接");
 
@@ -347,7 +347,7 @@ async fn 分片路由_多流分散到不同分片() {
 }
 
 #[tokio::test]
-async fn read_stream指定起始版本与限量() {
+async fn read_stream_from_version_with_limit() {
     let (addr, handle, _server, _dir) = start_test_server().await;
     let mut client = EventStoreClient::connect(addr).await.expect("连接");
 
@@ -375,7 +375,7 @@ async fn read_stream指定起始版本与限量() {
 }
 
 #[tokio::test]
-async fn read_stream读不存在的流返回空() {
+async fn read_stream_missing_stream_empty() {
     let (addr, handle, _server, _dir) = start_test_server().await;
     let mut client = EventStoreClient::connect(addr).await.expect("连接");
 
@@ -386,7 +386,7 @@ async fn read_stream读不存在的流返回空() {
 }
 
 #[tokio::test]
-async fn get_stream_meta返回存在性与版本() {
+async fn get_stream_meta_exists_and_version() {
     let (addr, handle, _server, _dir) = start_test_server().await;
     let mut client = EventStoreClient::connect(addr).await.expect("连接");
 
@@ -425,7 +425,7 @@ async fn get_stream_meta返回存在性与版本() {
 }
 
 #[tokio::test]
-async fn read_all按position跨流有序() {
+async fn read_all_position_ordered_across_streams() {
     let (addr, handle, _server, _dir) = start_test_server().await;
     let mut client = EventStoreClient::connect(addr).await.expect("连接");
 
@@ -487,7 +487,7 @@ async fn read_all按position跨流有序() {
 }
 
 #[tokio::test]
-async fn read_all指定起始position与限量() {
+async fn read_all_from_position_with_limit() {
     let (addr, handle, _server, _dir) = start_test_server().await;
     let mut client = EventStoreClient::connect(addr).await.expect("连接");
 
@@ -545,7 +545,7 @@ async fn read_all_shards(
 }
 
 #[tokio::test]
-async fn read_all跨分片归并且各分片内保持position序() {
+async fn read_all_merge_per_shard_position_order() {
     let (addr, handle, _server, _dir) = start_test_server().await;
     let mut client = EventStoreClient::connect(addr).await.expect("连接");
 
@@ -589,7 +589,7 @@ async fn read_all跨分片归并且各分片内保持position序() {
 }
 
 #[tokio::test]
-async fn read_all跨分片限量只返回前n条() {
+async fn read_all_cross_shard_limit_n() {
     let (addr, handle, _server, _dir) = start_test_server().await;
     let mut client = EventStoreClient::connect(addr).await.expect("连接");
 
@@ -604,7 +604,7 @@ async fn read_all跨分片限量只返回前n条() {
 }
 
 #[tokio::test]
-async fn read_all逐分片游标可正确翻页() {
+async fn read_all_per_shard_cursor_paging() {
     let (addr, handle, _server, _dir) = start_test_server().await;
     let mut client = EventStoreClient::connect(addr).await.expect("连接");
 
@@ -660,7 +660,7 @@ async fn read_all逐分片游标可正确翻页() {
 }
 
 #[tokio::test]
-async fn 反向读取返回倒序() {
+async fn backward_read_reversed() {
     let (addr, handle, _server, _dir) = start_test_server().await;
     let mut client = EventStoreClient::connect(addr).await.expect("连接");
 
@@ -736,7 +736,7 @@ async fn 反向读取返回倒序() {
 }
 
 #[tokio::test]
-async fn 跨分片read_all倒序() {
+async fn cross_shard_read_all_backward() {
     let (addr, handle, _server, _dir) = start_test_server().await;
     let mut client = EventStoreClient::connect(addr).await.expect("连接");
 
@@ -843,14 +843,13 @@ async fn drain_until_caught_up(s: &mut tonic::Streaming<SubscribeResponse>) -> V
         match next_sub(s).await {
             Some(subscribe_response::Payload::Event(e)) => out.push(e),
             Some(subscribe_response::Payload::CaughtUp(_)) => return out,
-            Some(_) => {}
             None => panic!("订阅流在收到 caught_up 前就结束了"),
         }
     }
 }
 
 #[tokio::test]
-async fn subscribe_先补齐历史再实时推送() {
+async fn subscribe_catchup_then_live() {
     let (addr, handle, _server, _dir) = start_test_server().await;
     let mut client = EventStoreClient::connect(addr).await.expect("连接");
 
@@ -894,7 +893,7 @@ async fn subscribe_先补齐历史再实时推送() {
 }
 
 #[tokio::test]
-async fn subscribe_可从中间版本开始() {
+async fn subscribe_from_middle_version() {
     let (addr, handle, _server, _dir) = start_test_server().await;
     let mut client = EventStoreClient::connect(addr).await.expect("连接");
 
@@ -923,7 +922,7 @@ async fn subscribe_可从中间版本开始() {
 }
 
 #[tokio::test]
-async fn subscribe_只推送本流事件() {
+async fn subscribe_only_this_stream() {
     let (addr, handle, _server, _dir) = start_test_server().await;
     let mut client = EventStoreClient::connect(addr).await.expect("连接");
 
@@ -976,7 +975,7 @@ async fn subscribe_只推送本流事件() {
 }
 
 #[tokio::test]
-async fn subscribe_all订阅分片内全部流() {
+async fn subscribe_all_shard_streams() {
     let (addr, handle, _server, _dir) = start_test_server().await;
     let mut client = EventStoreClient::connect(addr).await.expect("连接");
 

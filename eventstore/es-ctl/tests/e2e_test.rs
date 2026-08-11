@@ -137,7 +137,7 @@ fn stderr(output: &Output) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn append_read_meta_readall_数据面闭环() {
+async fn append_read_meta_readall_data_plane_roundtrip() {
     let (addr, handle, _server, _dir) = start_server().await;
 
     // append 两条事件
@@ -203,7 +203,7 @@ async fn append_read_meta_readall_数据面闭环() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn 乐观冲突_退出码1且中文提示() {
+async fn optimistic_conflict_exit_1_chinese_hint() {
     let (addr, handle, _server, _dir) = start_server().await;
 
     let out = esctl(
@@ -250,7 +250,7 @@ async fn 乐观冲突_退出码1且中文提示() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn json格式输出可解析() {
+async fn json_output_parsable() {
     let (addr, handle, _server, _dir) = start_server().await;
 
     esctl(
@@ -285,7 +285,7 @@ async fn json格式输出可解析() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn watch_追平历史后退出() {
+async fn watch_exits_after_catchup() {
     let (addr, handle, _server, _dir) = start_server().await;
 
     esctl(
@@ -317,7 +317,7 @@ async fn watch_追平历史后退出() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn status与member_list_单节点视图() {
+async fn status_and_member_list_single_node() {
     let (addr, handle, _server, _dir) = start_server().await;
 
     let out = esctl(&addr, &["status"]);
@@ -336,7 +336,7 @@ async fn status与member_list_单节点视图() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn init_初始化未自举节点() {
+async fn init_initializes_non_self_bootstrapped() {
     let (addr, handle, _server, _dir) = start_server_uninitialized(1).await;
 
     // 未自举时 status 显示可达但没有 leader
@@ -369,7 +369,7 @@ async fn init_初始化未自举节点() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn 端点不可达_退出码1() {
+async fn unreachable_endpoint_exit_1() {
     // 无服务在监听
     let out = esctl("http://127.0.0.1:59999", &["status"]);
     assert_eq!(out.status.code(), Some(1), "不可达应退出码 1");
@@ -381,7 +381,7 @@ async fn 端点不可达_退出码1() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn 参数错误_退出码2() {
+async fn bad_args_exit_2() {
     let out = esctl("http://127.0.0.1:59999", &["append", "s", "--data", "x"]);
     // 缺 --event-type：clap 报错退出码 2
     assert_eq!(out.status.code(), Some(2));
@@ -389,7 +389,7 @@ async fn 参数错误_退出码2() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn https连接_自签证书() {
+async fn https_self_signed_cert() {
     use tonic::transport::ServerTlsConfig;
 
     let dir = tempfile::tempdir().expect("临时目录");
@@ -495,7 +495,7 @@ async fn https连接_自签证书() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn readall_翻页游标提示() {
+async fn readall_paging_cursor_hint() {
     let (addr, handle, _server, _dir) = start_server().await;
 
     for i in 0..3 {
@@ -596,7 +596,7 @@ async fn start_two_nodes() -> (
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn member增删_双节点进程内全路径() {
+async fn member_add_remove_two_node_inprocess() {
     let (addr1, addr2, handles, _servers, _dirs) = start_two_nodes().await;
     let member2 = format!("2@{addr2}");
 
@@ -661,7 +661,7 @@ async fn member增删_双节点进程内全路径() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn member_learner与校验分支() {
+async fn member_learner_and_validation() {
     let (addr, handle, _server, _dir) = start_server().await;
 
     // learner-only 添加不存在的节点 2（--no-blocking 避免追平等待挂起）
@@ -705,7 +705,7 @@ async fn member_learner与校验分支() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn meta不存在流与status三格式() {
+async fn meta_missing_stream_and_status_formats() {
     let (addr, handle, _server, _dir) = start_server().await;
 
     // meta 不存在的流：exists: false
@@ -731,7 +731,7 @@ async fn meta不存在流与status三格式() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn read反向与readall游标() {
+async fn read_backward_and_readall_cursor() {
     let (addr, handle, _server, _dir) = start_server().await;
 
     esctl(
@@ -767,7 +767,7 @@ async fn read反向与readall游标() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn watch_all订阅() {
+async fn watch_all_subscribe() {
     let (addr, handle, _server, _dir) = start_server().await;
 
     esctl(
@@ -786,7 +786,7 @@ async fn watch_all订阅() {
 /// 发现 1：readall 翻页续读游标必须覆盖全部分片（偏斜数据场景），
 /// 多页续读全量到达且 (shard, position) 无重复
 #[tokio::test(flavor = "multi_thread")]
-async fn readall_偏斜数据翻页_续读覆盖全部分片无重复() {
+async fn readall_skewed_paging_no_duplicates() {
     let (addr, handle, _server, _dir) = start_server().await;
 
     // 找两个路由到不同分片的流名（2 分片集群）
@@ -877,7 +877,7 @@ async fn readall_偏斜数据翻页_续读覆盖全部分片无重复() {
 /// 发现 6：readall --backward 默认 from-position=0 时必须以 u64::MAX 起读
 /// （旧缺陷：默认反向读只返回每分片 position=0 的最旧事件/空）
 #[tokio::test(flavor = "multi_thread")]
-async fn readall_反向默认从最新读() {
+async fn readall_backward_defaults_to_latest() {
     let (addr, handle, _server, _dir) = start_server().await;
 
     for i in 0..3 {
@@ -905,7 +905,7 @@ async fn readall_反向默认从最新读() {
 /// 发现 14：watch --all --shard N 订阅指定分片的 $all（旧缺陷：参数被静默忽略，
 /// 服务端硬编码分片 0）
 #[tokio::test(flavor = "multi_thread")]
-async fn watch_all_按分片订阅() {
+async fn watch_all_per_shard() {
     let (addr, handle, _server, _dir) = start_server().await;
 
     let s1 = (0..100u64)
@@ -947,7 +947,7 @@ async fn watch_all_按分片订阅() {
 /// 发现 9：member list 全部端点不可达必须报错（旧缺陷：输出"未初始化"退出码 0，
 /// 网络故障伪装成"需要 init"）
 #[tokio::test(flavor = "multi_thread")]
-async fn member_list_全部端点不可达_退出码1() {
+async fn member_list_all_down_exit_1() {
     let out = esctl("http://127.0.0.1:59999", &["member", "list"]);
     assert_eq!(out.status.code(), Some(1), "应退出码 1: {}", stderr(&out));
     assert!(stderr(&out).contains("不可达"), "{}", stderr(&out));
@@ -956,7 +956,7 @@ async fn member_list_全部端点不可达_退出码1() {
 /// 发现 11：init --all-shards 部分初始化集群上必须补完其余分片
 /// （旧缺陷：在第一个已初始化分片处中止，其余分片永远无 leader）
 #[tokio::test(flavor = "multi_thread")]
-async fn init_all_shards_部分初始化_补完其余分片() {
+async fn init_all_shards_partial_completes_rest() {
     let (addr, handle, _server, _dir) = start_server_uninitialized(2).await;
 
     // 先只初始化分片 0
@@ -991,7 +991,7 @@ async fn init_all_shards_部分初始化_补完其余分片() {
 /// 发现 7/10：--timeout 0 = 不设超时；--shards 0 是参数错误（退出码 2，
 /// 旧缺陷：--shards 0 直接除零 panic 退出 101）
 #[tokio::test(flavor = "multi_thread")]
-async fn timeout0与shards0参数语义() {
+async fn timeout_zero_shards_zero_semantics() {
     let (addr, handle, _server, _dir) = start_server().await;
 
     // --timeout 0 = 不设超时，RPC 应正常成功（旧缺陷：Duration::ZERO 使所有 RPC 立即失败）
@@ -1023,7 +1023,7 @@ async fn timeout0与shards0参数语义() {
 /// 发现 15：change_membership CAS——陈旧 voters 快照必须拒绝（FailedPrecondition），
 /// 正确快照成功（旧缺陷：无校验，并发变更被后到者静默覆盖）
 #[tokio::test(flavor = "multi_thread")]
-async fn member_cas_陈旧快照拒绝() {
+async fn member_cas_stale_snapshot_rejected() {
     use es_proto::eventstore::raft_admin_client::RaftAdminClient;
     use es_proto::eventstore::*;
     let (addr, handle, _server, _dir) = start_server().await;

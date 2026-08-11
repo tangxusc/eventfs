@@ -219,7 +219,7 @@ mod tests {
     }
 
     #[test]
-    fn http_端点不受策略影响() {
+    fn http_endpoint_unaffected_by_policy() {
         let endpoint = Endpoint::from_shared("http://127.0.0.1:50051".to_string()).unwrap();
         let out = apply_endpoint_tls(endpoint, Some(&TlsClientConfig::Ca(vec![b'x'; 8])))
             .expect("http 端点应原样返回");
@@ -227,7 +227,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn https_skip_verify_握手成功() {
+    async fn https_skip_verify_handshake_ok() {
         let (cert, key) = gen_cert();
         let (addr, handle) = start_tls_admin_server(&cert, &key).await;
         probe_https(&addr, Some(&TlsClientConfig::SkipVerify))
@@ -237,7 +237,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn https_无策略默认跳过校验() {
+    async fn https_no_policy_defaults_to_skip_verify() {
         let (cert, key) = gen_cert();
         let (addr, handle) = start_tls_admin_server(&cert, &key).await;
         probe_https(&addr, None)
@@ -247,7 +247,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn https_ca匹配_握手成功() {
+    async fn https_ca_match_handshake_ok() {
         // 服务端与客户端信任同一张自签证书（自签证书自身即 CA）
         let (cert, key) = gen_cert();
         let (addr, handle) = start_tls_admin_server(&cert, &key).await;
@@ -258,7 +258,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn https_ca不匹配_握手失败() {
+    async fn https_ca_mismatch_handshake_fails() {
         // 服务端用一张证书，客户端信任另一张——握手必须失败
         let (cert, key) = gen_cert();
         let (addr, handle) = start_tls_admin_server(&cert, &key).await;
@@ -269,7 +269,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn https_ca_true自签证书_严格校验握手失败() {
+    async fn https_ca_true_self_signed_strict_fails() {
         // 边界：openssl req -x509 默认生成的证书带 CA:TRUE 约束，rustls 拒绝
         // CA 证书作为端实体（CaUsedAsEndEntity）——生成证书时须显式 CA:FALSE
         let (cert, key) = gen_ca_true_cert();

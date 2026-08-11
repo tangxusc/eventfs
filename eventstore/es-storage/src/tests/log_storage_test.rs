@@ -6,7 +6,7 @@ use openraft::{RaftLogReader, Vote};
 use super::*;
 
 #[tokio::test]
-async fn 空存储的日志状态为空() {
+async fn empty_storage_log_state_empty() {
     let (mut st, _d) = new_storage(0);
     let state = st.get_log_state().await.expect("读日志状态");
     assert_eq!(state.last_purged_log_id, None);
@@ -14,7 +14,7 @@ async fn 空存储的日志状态为空() {
 }
 
 #[tokio::test]
-async fn vote往返() {
+async fn vote_roundtrip() {
     let (mut st, _d) = new_storage(0);
     assert_eq!(st.read_vote().await.expect("读 vote"), None);
 
@@ -29,7 +29,7 @@ async fn vote往返() {
 }
 
 #[tokio::test]
-async fn committed往返() {
+async fn committed_roundtrip() {
     let (mut st, _d) = new_storage(0);
     assert_eq!(st.read_committed().await.expect("读 committed"), None);
 
@@ -43,7 +43,7 @@ async fn committed往返() {
 }
 
 #[tokio::test]
-async fn append后日志状态反映最大index() {
+async fn append_log_state_reflects_max_index() {
     let (mut st, _d) = new_storage(0);
     do_append(
         &mut st,
@@ -58,7 +58,7 @@ async fn append后日志状态反映最大index() {
 }
 
 #[tokio::test]
-async fn 日志index跨字节边界时仍按数值序() {
+async fn log_index_cross_byte_boundary_ordered() {
     let (mut st, _d) = new_storage(0);
     // 254/255/256/257 跨越单字节边界，若用小端或变长编码这里会错乱
     let idxs = [254u64, 255, 256, 257, 65535, 65536];
@@ -74,7 +74,7 @@ async fn 日志index跨字节边界时仍按数值序() {
 }
 
 #[tokio::test]
-async fn 范围读取各种边界() {
+async fn range_read_boundaries() {
     let (mut st, _d) = new_storage(0);
     do_append(&mut st, (0..10).map(|i| entry(1, i, "s")).collect()).await;
 
@@ -105,7 +105,7 @@ async fn 范围读取各种边界() {
 }
 
 #[tokio::test]
-async fn truncate删除指定index及其后全部() {
+async fn truncate_removes_index_and_after() {
     let (mut st, _d) = new_storage(0);
     do_append(&mut st, (0..10).map(|i| entry(1, i, "s")).collect()).await;
 
@@ -121,7 +121,7 @@ async fn truncate删除指定index及其后全部() {
 }
 
 #[tokio::test]
-async fn purge删除指定index及其前全部并记录标记() {
+async fn purge_removes_index_and_before() {
     let (mut st, _d) = new_storage(0);
     do_append(&mut st, (0..10).map(|i| entry(1, i, "s")).collect()).await;
 
@@ -138,7 +138,7 @@ async fn purge删除指定index及其前全部并记录标记() {
 }
 
 #[tokio::test]
-async fn purge全部后last_log_id回落到purged() {
+async fn purge_all_last_log_falls_back() {
     let (mut st, _d) = new_storage(0);
     do_append(&mut st, (0..5).map(|i| entry(1, i, "s")).collect()).await;
 
@@ -156,7 +156,7 @@ async fn purge全部后last_log_id回落到purged() {
 }
 
 #[tokio::test]
-async fn 分片间日志互不干扰() {
+async fn shard_logs_isolated() {
     let (mut sts, _d) = new_shared_storages(&[0, 1]);
     let (mut s1, mut s0) = (sts.pop().unwrap(), sts.pop().unwrap());
 
@@ -178,7 +178,7 @@ async fn 分片间日志互不干扰() {
 }
 
 #[tokio::test]
-async fn vote与日志不互相污染() {
+async fn vote_and_log_not_mixed() {
     let (mut st, _d) = new_storage(0);
     // vote key 是日志区的字节序后继，若上界算错会被扫进日志结果
     st.save_vote(&Vote::new(1, 1)).await.expect("写 vote");
@@ -198,7 +198,7 @@ async fn vote与日志不互相污染() {
 }
 
 #[tokio::test]
-async fn 重开存储后日志与vote仍在() {
+async fn reopen_keeps_log_and_vote() {
     let dir = tempfile::tempdir().expect("临时目录");
     let path = dir.path().to_path_buf();
 

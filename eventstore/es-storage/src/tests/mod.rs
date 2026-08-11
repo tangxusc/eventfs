@@ -5,6 +5,7 @@
 
 mod log_storage_test;
 mod state_machine_test;
+mod storage_test;
 
 use std::sync::Arc;
 

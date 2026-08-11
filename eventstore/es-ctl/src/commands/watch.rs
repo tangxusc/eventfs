@@ -97,7 +97,7 @@ mod tests {
     }
 
     #[test]
-    fn caught_up消息_三种格式() {
+    fn caught_up_message_three_formats() {
         let p = subscribe_response::Payload::CaughtUp(Empty {});
         assert_eq!(
             render_message(Format::Simple, p.clone()),
@@ -111,7 +111,7 @@ mod tests {
     }
 
     #[test]
-    fn 事件消息_json带类型标记() {
+    fn event_message_json_typed() {
         let p = subscribe_response::Payload::Event(ev());
         let json: serde_json::Value =
             serde_json::from_str(&render_message(Format::Json, p)).expect("合法 JSON");

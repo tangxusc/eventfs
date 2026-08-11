@@ -392,7 +392,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 解析leader提示_带地址() {
+    fn parse_leader_hint_with_addr() {
         assert_eq!(
             parse_leader_hint("not leader; leader_id=3 leader_addr=http://127.0.0.1:50052"),
             Some("http://127.0.0.1:50052".to_string())
@@ -400,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn 解析leader提示_地址为裸格式() {
+    fn parse_leader_hint_bare_addr() {
         assert_eq!(
             parse_leader_hint("not leader; leader_id=1 leader_addr=127.0.0.1:50051"),
             Some("127.0.0.1:50051".to_string())
@@ -408,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn 解析leader提示_选举中返回None() {
+    fn parse_leader_hint_electing_returns_none() {
         assert_eq!(
             parse_leader_hint("not leader; leader unknown, retry later"),
             None
@@ -416,7 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn 解析leader提示_噪声文本返回None() {
+    fn parse_leader_hint_noise_returns_none() {
         assert_eq!(parse_leader_hint("internal error: boom"), None);
         assert_eq!(parse_leader_hint(""), None);
         assert_eq!(
@@ -432,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn 端点归一化去重保序() {
+    fn endpoints_normalized_deduped_ordered() {
         let client = ClusterClient::new(
             &[
                 "127.0.0.1:50051".into(),
@@ -454,14 +454,14 @@ mod tests {
     }
 
     #[test]
-    fn 端点列表为空报错() {
+    fn empty_endpoints_rejected() {
         assert!(
             ClusterClient::new(&[], None, Duration::from_secs(1), Duration::from_secs(1)).is_err()
         );
     }
 
     #[test]
-    fn 轮询游标逐次后移() {
+    fn rotated_cursor_advances() {
         let client = ClusterClient::new(
             &["a:1".into(), "b:2".into()],
             None,

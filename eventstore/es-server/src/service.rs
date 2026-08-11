@@ -658,7 +658,7 @@ mod tests {
 
     /// 消费水位语义：全局截断丢弃的路不推进（None），否则下一页会丢数据
     #[test]
-    fn 归并截断_未消费路的水位为none() {
+    fn merge_truncated_unconsumed_watermark_none() {
         // 分片 0 的 HLC 最早，limit=2 时两条全来自分片 0；分片 1 被丢弃
         let streams = vec![
             vec![ev(0, 1, 100), ev(0, 2, 200), ev(0, 3, 300)],
@@ -671,7 +671,7 @@ mod tests {
 
     /// 正序：消费水位 = 最后消费的 position，续读从 +1 开始
     #[test]
-    fn 正序归并_消费水位推进() {
+    fn forward_merge_watermark_advances() {
         let streams = vec![
             vec![ev(0, 1, 100), ev(0, 2, 300)],
             vec![ev(1, 1, 200), ev(1, 2, 400)],
@@ -684,7 +684,7 @@ mod tests {
 
     /// 倒序：消费水位 = 最后消费（最小）position，续读从 -1 开始
     #[test]
-    fn 倒序归并_消费水位为最小position() {
+    fn backward_merge_watermark_min_position() {
         let streams = vec![
             vec![ev(0, 9, 100), ev(0, 8, 300), ev(0, 7, 500)],
             vec![ev(1, 5, 200)],
@@ -696,7 +696,7 @@ mod tests {
 
     /// 单路：截断后水位 = 最后输出的 position
     #[test]
-    fn 单路归并_截断后水位正确() {
+    fn single_stream_truncated_watermark() {
         let streams = vec![vec![ev(0, 1, 1), ev(0, 2, 1), ev(0, 3, 1)]];
         let (events, consumed) = merge_by_hlc(streams, 2, false);
         assert_eq!(events.len(), 2);

@@ -125,7 +125,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 期望版本映射到proto四构造() {
+    fn expected_version_maps_to_proto_four() {
         let cases = [
             (
                 ExpectedVersionArg::Any,
@@ -165,7 +165,7 @@ mod tests {
     }
 
     #[test]
-    fn 乐观冲突错误翻译() {
+    fn optimistic_conflict_error_translated() {
         let e = anyhow!("optimistic conflict: actual_version=5");
         let t = translate_append_error(e);
         assert!(t.to_string().contains("乐观并发冲突"), "{}", t);
@@ -173,7 +173,7 @@ mod tests {
     }
 
     #[test]
-    fn 非冲突错误原样保留() {
+    fn non_conflict_error_preserved() {
         let e = anyhow!("unavailable: connection refused");
         assert_eq!(
             translate_append_error(e).to_string(),
@@ -182,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn 载荷读取_字符串优先() {
+    fn payload_inline_string_preferred() {
         assert_eq!(
             load_payload(&Some("abc".into()), &None).expect("字符串"),
             b"abc"

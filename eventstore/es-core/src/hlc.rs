@@ -59,14 +59,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 无前驱时返回物理时钟() {
+    fn no_predecessor_returns_physical_clock() {
         let h = Hlc::next(None, 1000);
         assert_eq!(h.wall, 1000);
         assert_eq!(h.logical, 0);
     }
 
     #[test]
-    fn 物理时钟前进时logical归零() {
+    fn logical_resets_when_wall_advances() {
         let prev = Hlc {
             wall: 1000,
             logical: 5,
@@ -77,7 +77,7 @@ mod tests {
     }
 
     #[test]
-    fn 物理时钟未前进时logical递增() {
+    fn logical_increments_when_wall_stays() {
         let prev = Hlc {
             wall: 1000,
             logical: 5,
@@ -88,7 +88,7 @@ mod tests {
     }
 
     #[test]
-    fn 物理时钟回退时wall保持且logical递增() {
+    fn wall_holds_logical_increments_on_rewind() {
         let prev = Hlc {
             wall: 1000,
             logical: 10,
@@ -99,7 +99,7 @@ mod tests {
     }
 
     #[test]
-    fn 单调性_连续生成保证严格递增() {
+    fn monotonic_strictly_increasing() {
         let mut prev = None;
         let mut last = Hlc {
             wall: 0,

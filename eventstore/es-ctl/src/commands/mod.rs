@@ -146,13 +146,13 @@ mod tests {
     }
 
     #[test]
-    fn 游标文本格式() {
+    fn cursor_text_format() {
         assert_eq!(from_positions_text(&[(3, 10), (5, 3)]), "3:10,5:3");
         assert_eq!(from_positions_text(&[]), "");
     }
 
     #[test]
-    fn 事件表渲染() {
+    fn events_table_rendering() {
         let ev = event(1, 2);
         let table = render_events(Format::Table, &[ev]);
         assert!(table.contains("STREAM"), "应有表头");

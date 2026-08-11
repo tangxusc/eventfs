@@ -72,7 +72,7 @@ mod tests {
     }
 
     #[test]
-    fn simple_存在与不存在() {
+    fn simple_exists_and_missing() {
         assert_eq!(
             render_meta(Format::Simple, &resp(true, 4, 3)),
             "exists: true\ncurrent_version: 4\nshard_id: 3"
@@ -84,7 +84,7 @@ mod tests {
     }
 
     #[test]
-    fn table_两种状态() {
+    fn table_two_states() {
         let t = render_meta(Format::Table, &resp(true, 4, 3));
         assert!(t.contains("FIELD"), "{t}");
         assert!(t.contains("current_version"), "{t}");
@@ -93,7 +93,7 @@ mod tests {
     }
 
     #[test]
-    fn json_结构() {
+    fn json_structure() {
         let json: serde_json::Value =
             serde_json::from_str(&render_meta(Format::Json, &resp(true, 4, 3))).expect("JSON");
         assert_eq!(json["exists"], true);

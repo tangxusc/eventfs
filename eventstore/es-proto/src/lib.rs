@@ -29,10 +29,10 @@ mod tests {
     /// 固化生成代码的对外契约：四个服务类型必须存在。
     /// proto 改名或 package 变动会在此处编译失败，而非在下游 crate 里才暴露。
     #[test]
-    fn 生成代码包含四个服务类型() {
-        fn 类型存在<T>() {}
-        类型存在::<eventstore::event_store_client::EventStoreClient<tonic::transport::Channel>>();
-        类型存在::<raft::raft_internal_client::RaftInternalClient<tonic::transport::Channel>>();
+    fn generated_code_has_four_service_types() {
+        fn types_exist<T>() {}
+        types_exist::<eventstore::event_store_client::EventStoreClient<tonic::transport::Channel>>();
+        types_exist::<raft::raft_internal_client::RaftInternalClient<tonic::transport::Channel>>();
         // server 侧为泛型包装，仅断言模块路径可达
         let _ = std::any::type_name::<eventstore::AppendRequest>();
         let _ = std::any::type_name::<raft::RaftRequest>();
@@ -40,7 +40,7 @@ mod tests {
 
     /// oneof 字段生成为 Option<enum>，确认 ExpectedVersion 四种取值都可构造
     #[test]
-    fn 期望版本四种取值可构造() {
+    fn expected_version_four_variants_constructible() {
         use eventstore::expected_version::Kind;
         let kinds = [
             Kind::Any(eventstore::Empty {}),

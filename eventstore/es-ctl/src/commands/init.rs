@@ -123,7 +123,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 成员地址归一化() {
+    fn member_addr_normalized() {
         assert_eq!(
             normalize_endpoint("127.0.0.1:50052"),
             "http://127.0.0.1:50052"

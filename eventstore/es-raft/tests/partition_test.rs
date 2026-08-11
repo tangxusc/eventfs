@@ -422,7 +422,7 @@ impl Cluster {
 /// openraft 0.9 未实现基于租约的主动退位（实测 100ms 心跳下 50 个周期仍不退位）。
 /// 真正的安全性保证是「少数派无法提交日志」，本测试断言的是这一点。
 #[tokio::test]
-async fn 隔离leader后多数派选出新leader且少数派无法提交() {
+async fn isolated_leader_majority_elects_minority_cannot_commit() {
     let c = Cluster::start().await;
     let old = c.wait_leader(Duration::from_secs(5)).await;
     let term_before = c.term(old);
@@ -467,7 +467,7 @@ async fn 隔离leader后多数派选出新leader且少数派无法提交() {
 }
 
 #[tokio::test]
-async fn 分区恢复后旧leader追平多数派数据() {
+async fn healed_partition_old_leader_catches_up() {
     let c = Cluster::start().await;
     let old = c.wait_leader(Duration::from_secs(5)).await;
     let others: Vec<u64> = c.ids.iter().copied().filter(|i| *i != old).collect();
@@ -522,7 +522,7 @@ async fn 分区恢复后旧leader追平多数派数据() {
 }
 
 #[tokio::test]
-async fn 单向链路中断不影响集群可用性() {
+async fn one_way_link_cut_cluster_available() {
     let c = Cluster::start().await;
     let leader = c.wait_leader(Duration::from_secs(5)).await;
     let others: Vec<u64> = c.ids.iter().copied().filter(|i| *i != leader).collect();
@@ -560,7 +560,7 @@ async fn 单向链路中断不影响集群可用性() {
 }
 
 #[tokio::test]
-async fn 单follower慢另一个快则走快路径() {
+async fn one_slow_follower_fast_path_used() {
     // 800ms 延迟超过默认超时,用 1500ms 选举超时
     let c = Cluster::start_with_timing(Timing {
         heartbeat_ms: 200,
@@ -606,7 +606,7 @@ async fn 单follower慢另一个快则走快路径() {
 }
 
 #[tokio::test]
-async fn 落后节点通过快照追赶而非重放日志() {
+async fn lagging_node_snapshot_catchup() {
     // 快照策略:每 5 条日志建一次快照,快照后只留 2 条日志。
     // 这样被隔离的节点恢复后,它缺的日志大部分已被 purge,
     // leader 只能给它发快照——这正是快照存在的意义。
@@ -688,7 +688,7 @@ async fn 落后节点通过快照追赶而非重放日志() {
 }
 
 #[tokio::test]
-async fn 快照后日志被清理但数据完整() {
+async fn logs_purged_after_snapshot_data_intact() {
     let c = Cluster::start_with_timing(Timing {
         heartbeat_ms: 100,
         election_min_ms: 300,

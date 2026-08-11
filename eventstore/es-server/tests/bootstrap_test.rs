@@ -2,7 +2,7 @@
 //! 多进程测试一致），但全部在测试进程内运行——默认套件即可执行，且可被
 //! 覆盖率统计（多进程测试的节点进程被 SIGKILL 强杀，LLVM profile 无法落盘）。
 //!
-//! 多进程版自动组建测试见 multi_node_test.rs（`三节点配置peers自动组建并复制数据` 等）。
+//! 多进程版自动组建测试见 multi_node_test.rs（`three_node_peers_bootstrap_replicate` 等）。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -222,7 +222,7 @@ fn init_tracing() {
 }
 
 #[tokio::test]
-async fn 进程内三节点自动组建() {
+async fn inprocess_three_node_bootstrap() {
     init_tracing();
     eprintln!("\n=== 进程内 3 节点（配置完整 peers，自动组建）===");
     let ports: Vec<u16> = (0..3).map(|_| alloc_port()).collect();
@@ -273,7 +273,7 @@ async fn 进程内三节点自动组建() {
 }
 
 #[tokio::test]
-async fn 进程内乱序启动自动组建() {
+async fn inprocess_out_of_order_bootstrap() {
     eprintln!("\n=== 进程内乱序启动：先起 node2，再起 node1、node3 ===");
     let ports: Vec<u16> = (0..3).map(|_| alloc_port()).collect();
     let addrs: Vec<String> = ports.iter().map(|p| format!("127.0.0.1:{}", p)).collect();
@@ -353,7 +353,7 @@ async fn start_https_cluster(strict: bool) -> (Vec<TestNode>, u64, String) {
 }
 
 #[tokio::test]
-async fn 进程内三节点全https严格校验自动组建() {
+async fn inprocess_three_node_https_strict_bootstrap() {
     init_tracing();
     eprintln!("\n=== 进程内 3 节点全 https（ca_file 严格校验）自动组建 ===");
     let (nodes, leader, ca_all) = start_https_cluster(true).await;
@@ -381,7 +381,7 @@ async fn 进程内三节点全https严格校验自动组建() {
     }
     assert_eq!(leaders.len(), 1, "只能有一个 leader: {leaders:?}");
 
-    // 用 es-client SDK 经 https 写入并读回（覆盖客户端 API 的 TLS 链路）
+    // 用 es-client SDK 经 https write_and_read_back（覆盖客户端 API 的 TLS 链路）
     eprintln!("\n=== es-client 经 https 写读 ===");
     let leader_addr = nodes[(leader - 1) as usize].addr.clone();
     let mut client = es_client::EventStoreClient::connect_with_tls(
@@ -416,7 +416,7 @@ async fn 进程内三节点全https严格校验自动组建() {
 }
 
 #[tokio::test]
-async fn 进程内三节点全https默认跳过校验自动组建() {
+async fn inprocess_three_node_https_skip_bootstrap() {
     init_tracing();
     eprintln!("\n=== 进程内 3 节点全 https（无 ca_file，默认跳过校验）自动组建 ===");
     let (nodes, leader, _) = start_https_cluster(false).await;

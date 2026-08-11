@@ -22,6 +22,9 @@ mod commands;
 mod output;
 mod shards;
 
+#[cfg(test)]
+mod tests_e2e;
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();

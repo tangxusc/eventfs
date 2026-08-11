@@ -141,7 +141,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 方向参数映射() {
+    fn direction_arg_mapping() {
         assert_eq!(direction(false), Direction::Forward as i32);
         assert_eq!(direction(true), Direction::Backward as i32);
     }

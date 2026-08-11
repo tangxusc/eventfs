@@ -278,7 +278,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn u64编码往返() {
+    fn u64_encode_roundtrip() {
         for v in [0, 1, 42, u64::MAX / 2, u64::MAX - 1, u64::MAX] {
             let enc = encode_u64_be(v);
             let dec = decode_u64_be(&enc).unwrap();
@@ -287,7 +287,7 @@ mod tests {
     }
 
     #[test]
-    fn 排序性质_u64字节序等于数值序() {
+    fn byte_order_matches_numeric_order() {
         // 这是设计文档 9 节明确要求的测试：大端编码的字节序必须等于数值序
         let nums = [0u64, 1, 10, 100, 255, 256, 1000, 65535, 65536, u64::MAX];
         let mut encoded: Vec<_> = nums.iter().map(|&n| encode_u64_be(n)).collect();
@@ -300,7 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn 排序性质_随机index排序后字节序一致() {
+    fn random_indices_byte_order_consistent() {
         use proptest::prelude::*;
         proptest!(|(indices in prop::collection::vec(0u64..10000, 10..50))| {
             let mut by_num = indices.clone();
@@ -313,19 +313,19 @@ mod tests {
     }
 
     #[test]
-    fn successor_正常情况() {
+    fn successor_normal() {
         assert_eq!(successor(&[0x01, 0x02]), Some(vec![0x01, 0x03]));
         assert_eq!(successor(&[0x01, 0xFF]), Some(vec![0x02]));
         assert_eq!(successor(&[0xFE, 0xFF, 0xFF]), Some(vec![0xFF]));
     }
 
     #[test]
-    fn successor_全0xFF返回None() {
+    fn successor_all_ff_returns_none() {
         assert_eq!(successor(&[0xFF, 0xFF, 0xFF]), None);
     }
 
     #[test]
-    fn raft_log_entry按index有序() {
+    fn raft_log_entry_ordered_by_index() {
         let k0 = raft_log_entry(1, 0);
         let k1 = raft_log_entry(1, 1);
         let k100 = raft_log_entry(1, 100);
@@ -334,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    fn sm_event同stream不同version有序() {
+    fn sm_event_ordered_by_version() {
         let e0 = sm_event(1, "test", 0);
         let e1 = sm_event(1, "test", 1);
         let e100 = sm_event(1, "test", 100);
@@ -343,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn 长度前缀隔离不同长度stream() {
+    fn length_prefix_isolates_streams() {
         // stream "a" 与 "ab" 前缀包含,长度前缀必须将它们隔离
         let _a0 = sm_event(1, "a", 0);
         let a1 = sm_event(1, "a", 1);
@@ -353,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn sm_event_prefix正确覆盖stream所有版本() {
+    fn sm_event_prefix_covers_all_versions() {
         let prefix = sm_event_prefix(1, "test");
         let e0 = sm_event(1, "test", 0);
         let e100 = sm_event(1, "test", 100);
@@ -365,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn 不同分片隔离() {
+    fn shards_isolated() {
         let s1 = sm_event(1, "test", 0);
         let s2 = sm_event(2, "test", 0);
         assert_ne!(s1, s2);
@@ -373,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn 日志上界恰好排除vote_key() {
+    fn log_upper_excludes_vote_key() {
         let upper = raft_log_upper(7);
         // 上界即 vote key，因 range 左闭右开，vote 本身不会被扫进来
         assert_eq!(upper, raft_vote(7));
@@ -384,7 +384,7 @@ mod tests {
     }
 
     #[test]
-    fn 日志前缀覆盖所有index含MAX() {
+    fn log_prefix_covers_all_indices() {
         let prefix = raft_log_prefix(3);
         for idx in [0u64, 1, u64::MAX - 1, u64::MAX] {
             assert!(raft_log_entry(3, idx).starts_with(&prefix));
@@ -394,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn upper_including在MAX边界仍正确() {
+    fn upper_including_max_boundary() {
         // version = MAX 时 successor 会向前进位越界，upper_including 不会
         let at_max = sm_event(3, "s", u64::MAX);
         let upper = upper_including(&at_max);
@@ -413,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn upper_including不越界到下一个version() {
+    fn upper_including_no_version_overflow() {
         let k5 = sm_event(1, "s", 5);
         let k6 = sm_event(1, "s", 6);
         let upper = upper_including(&k5);
@@ -422,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_meta_key解码往返() {
+    fn stream_meta_key_decode_roundtrip() {
         for name in ["", "a", "订单-123", "a\u{0}b"] {
             let k = sm_stream_meta(7, name);
             assert_eq!(decode_stream_meta_key(&k).as_deref(), Some(name));
@@ -432,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn 区段前缀互不包含() {
+    fn sub_prefixes_disjoint() {
         let meta = sm_stream_meta_prefix(2);
         let pos = sm_position_prefix(2);
         let idem = sm_idempotency_prefix(2);
@@ -444,13 +444,29 @@ mod tests {
     }
 
     #[test]
-    fn 日志index解码往返() {
+    fn log_index_decode_roundtrip() {
         for idx in [0u64, 1, 42, u64::MAX] {
             let k = raft_log_entry(9, idx);
             assert_eq!(decode_log_index(&k), Some(idx));
         }
         // 长度不符返回 None，避免把 vote key 误认成日志
         assert_eq!(decode_log_index(&raft_vote(9)), None);
+    }
+
+    #[test]
+    fn decode_u64_be_wrong_len_errors() {
+        for bad in [&[][..], &[0x01][..], &[0u8; 7][..], &[0u8; 9][..]] {
+            let err = decode_u64_be(bad).expect_err("长度 != 8 应报错");
+            assert!(err.to_string().contains("期望 8 字节"), "{err}");
+        }
+    }
+
+    #[test]
+    fn decode_stream_meta_key_short_returns_none() {
+        // HEAD(10) + slen(8) = 18 字节以下的 key 直接拒绝
+        assert_eq!(decode_stream_meta_key(&[]), None);
+        assert_eq!(decode_stream_meta_key(&[0u8; 10]), None);
+        assert_eq!(decode_stream_meta_key(&[0u8; 17]), None);
     }
 }
 

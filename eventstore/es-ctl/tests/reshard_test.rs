@@ -172,7 +172,7 @@ fn key_prefix(shard_id: u64) -> Vec<u8> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn reshard_2到4_数据完整() {
+async fn reshard_2_to_4_data_intact() {
     let (dir, _server, total) = start_and_write().await;
 
     let dst_dir = tempfile::tempdir().expect("目标临时目录");
@@ -216,7 +216,7 @@ async fn reshard_2到4_数据完整() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn reshard_负例拒绝() {
+async fn reshard_negative_cases_rejected() {
     let (dir, _server, _) = start_and_write().await;
 
     // src == dst
@@ -268,7 +268,7 @@ async fn reshard_负例拒绝() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn reshard_目标目录非空需确认() {
+async fn reshard_dst_nonempty_requires_confirm() {
     let (dir, _server, _) = start_and_write().await;
 
     // 目标目录已存在且有文件
@@ -306,7 +306,7 @@ async fn reshard_目标目录非空需确认() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn reshard_停机约束_lock被占用() {
+async fn reshard_lock_held_rejected() {
     let dir = tempfile::tempdir().expect("临时目录");
     let config = Config {
         node: NodeConfig {
@@ -368,7 +368,7 @@ async fn reshard_停机约束_lock被占用() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn reshard_json输出格式() {
+async fn reshard_json_output_format() {
     let (dir, _server, _) = start_and_write().await;
     let dst_dir = tempfile::tempdir().expect("目标临时目录");
 
@@ -400,7 +400,7 @@ async fn reshard_json输出格式() {
 /// TreeBuilder 会创建（旧缺陷：canonicalize 对不存在路径报错，
 /// 文档示例流程直接失败）
 #[tokio::test(flavor = "multi_thread")]
-async fn reshard_全新目标目录无需预建() {
+async fn reshard_fresh_dst_no_precreate() {
     let (dir, _server, total) = start_and_write().await;
 
     // dst 路径不存在：validate 的 canonicalize 曾对它报 NotFound
@@ -435,7 +435,7 @@ async fn reshard_全新目标目录无需预建() {
 /// （旧缺陷：少报分片数时，哈希落在枚举范围之外的分片数据被静默跳过，
 /// 且 src/dst 计数来自同一枚举子集，完整性校验拦不住）
 #[tokio::test(flavor = "multi_thread")]
-async fn reshard_src分片数不匹配_拒绝() {
+async fn reshard_src_shard_mismatch_rejected() {
     let (dir, _server, _) = start_and_write().await;
     let dst_dir = tempfile::tempdir().expect("目标临时目录");
 

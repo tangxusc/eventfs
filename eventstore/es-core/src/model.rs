@@ -57,3 +57,75 @@ impl Default for StreamMeta {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_meta_new_and_default_version_zero() {
+        assert_eq!(StreamMeta::new().current_version, 0);
+        assert_eq!(StreamMeta::default().current_version, 0);
+        assert_eq!(StreamMeta::default().current_version, StreamMeta::new().current_version);
+    }
+
+    #[test]
+    fn event_serde_roundtrip() {
+        let e = Event {
+            stream_id: "s1".to_string(),
+            version: 3,
+            event_id: Uuid::new_v4(),
+            event_type: "UserCreated".to_string(),
+            data: b"data".to_vec(),
+            metadata: b"meta".to_vec(),
+            hlc: Hlc::next(None, 42),
+            position: 7,
+        };
+        let bytes = serde_json::to_vec(&e).expect("序列化");
+        let back: Event = serde_json::from_slice(&bytes).expect("反序列化");
+        assert_eq!(back.stream_id, e.stream_id);
+        assert_eq!(back.version, e.version);
+        assert_eq!(back.event_id, e.event_id);
+        assert_eq!(back.event_type, e.event_type);
+        assert_eq!(back.data, e.data);
+        assert_eq!(back.metadata, e.metadata);
+        assert_eq!(back.hlc, e.hlc);
+        assert_eq!(back.position, e.position);
+    }
+
+    #[test]
+    fn new_event_serde_roundtrip() {
+        let ne = NewEvent {
+            event_id: Uuid::new_v4(),
+            event_type: "X".to_string(),
+            data: vec![1, 2, 3],
+            metadata: vec![],
+        };
+        let bytes = serde_json::to_vec(&ne).expect("序列化");
+        let back: NewEvent = serde_json::from_slice(&bytes).expect("反序列化");
+        assert_eq!(back.event_id, ne.event_id);
+        assert_eq!(back.event_type, ne.event_type);
+        assert_eq!(back.data, ne.data);
+    }
+
+    #[test]
+    fn expected_version_all_variants_serde_roundtrip() {
+        for v in [
+            ExpectedVersion::Any,
+            ExpectedVersion::NoStream,
+            ExpectedVersion::StreamExists,
+            ExpectedVersion::Exact(99),
+        ] {
+            let bytes = serde_json::to_vec(&v).expect("序列化");
+            let back: ExpectedVersion = serde_json::from_slice(&bytes).expect("反序列化");
+            assert_eq!(back, v);
+        }
+    }
+
+    #[test]
+    fn stream_meta_serde_roundtrip() {
+        let m = StreamMeta { current_version: 5 };
+        let back: StreamMeta = serde_json::from_slice(&serde_json::to_vec(&m).unwrap()).unwrap();
+        assert_eq!(back.current_version, 5);
+    }
+}

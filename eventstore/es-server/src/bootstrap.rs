@@ -435,7 +435,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_clients_坏CA不阻塞构建() {
+    async fn build_clients_bad_ca_non_blocking() {
         let members = BTreeMap::from([(1u64, BasicNode { addr: "https://127.0.0.1:1".into() })]);
         // tonic 的 Certificate::from_pem 构造时不解析，CA 解析延迟到握手时
         // （TlsConnector::new）——构建阶段不报错；握手失败由 es-proto tls 测试覆盖
@@ -444,7 +444,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_clients_https无策略默认跳过校验() {
+    async fn build_clients_https_no_policy_skip_verify() {
         let members = BTreeMap::from([(1u64, BasicNode { addr: "https://127.0.0.1:1".into() })]);
         // 无信任策略：https 端点默认跳过校验，构建成功（connect_lazy 无 I/O）
         let clients = build_clients(&members, None).expect("应成功");
@@ -452,7 +452,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_tls配置无效_跳过自动组建() {
+    async fn run_tls_invalid_skips_bootstrap() {
         // ca_file 指向不存在文件 → client_trust 失败 → 打 error 日志后跳过组建（不 panic、不降级）
         let mut cfg = config_with_peers(vec![(1, "127.0.0.1:50051")]);
         cfg.tls = Some(crate::config::TlsConfig {

@@ -151,23 +151,23 @@ mod tests {
     }
 
     #[test]
-    fn hex_输出小写16进制() {
+    fn hex_output_lowercase() {
         assert_eq!(hex(&[0x0f, 0xAB, 0x01]), "0fab01");
         assert_eq!(hex(&[]), "");
     }
 
     #[test]
-    fn utf8数据原样输出() {
+    fn utf8_data_passthrough() {
         assert_eq!(event_data_text(b"hello"), "hello");
     }
 
     #[test]
-    fn 二进制数据hex输出() {
+    fn binary_data_hex_output() {
         assert_eq!(event_data_text(&[0xff, 0x00, 0x1a]), "hex:ff001a");
     }
 
     #[test]
-    fn hlc毫秒转rfc3339() {
+    fn hlc_millis_to_rfc3339() {
         assert_eq!(
             hlc_to_rfc3339(1_700_000_000_123),
             "2023-11-14T22:13:20.123+00:00"
@@ -175,7 +175,7 @@ mod tests {
     }
 
     #[test]
-    fn 事件simple行格式() {
+    fn event_simple_line_format() {
         let line = event_simple_line(&event(3, "OrderPlaced", b"abc"));
         let parts: Vec<&str> = line.split('\t').collect();
         assert_eq!(parts[0], "3");
@@ -184,7 +184,7 @@ mod tests {
     }
 
     #[test]
-    fn 事件json结构() {
+    fn event_json_structure() {
         let v = event_to_json(&event(1, "T", b"d"));
         assert_eq!(v["stream_id"], "s/1");
         assert_eq!(v["version"], 1);
@@ -193,7 +193,7 @@ mod tests {
     }
 
     #[test]
-    fn 表格对齐() {
+    fn table_alignment() {
         let table = render_table(
             &["A", "BB"],
             &[
@@ -208,7 +208,7 @@ mod tests {
     }
 
     #[test]
-    fn 表格空行() {
+    fn table_empty_rows() {
         let table = render_table(&["A", "B"], &[]);
         assert_eq!(table, "A  B\n");
     }

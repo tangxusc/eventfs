@@ -10,6 +10,7 @@ use es_proto::tls::{apply_endpoint_tls, TlsClientConfig};
 /// EventStore 客户端
 ///
 /// 提供连接管理、分片路由与 leader 重定向。
+#[derive(Debug)]
 pub struct EventStoreClient {
     /// 节点地址 -> gRPC 客户端映射
     clients: HashMap<String, GrpcClient<Channel>>,

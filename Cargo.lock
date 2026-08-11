@@ -656,6 +656,7 @@ version = "0.1.0"
 dependencies = [
  "proptest",
  "serde",
+ "serde_json",
  "thiserror 2.0.20",
  "tracing",
  "uuid",
@@ -674,6 +675,7 @@ dependencies = [
  "es-raft",
  "es-server",
  "es-storage",
+ "openraft",
  "rcgen",
  "serde",
  "serde_json",

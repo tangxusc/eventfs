@@ -7,7 +7,7 @@ use es_server::config::{Config, NodeConfig, ShardConfig, StorageConfig};
 use es_server::Server;
 
 #[tokio::test]
-async fn 服务器能启动并初始化raft节点() {
+async fn server_starts_and_inits_raft() {
     let _guard = tracing_subscriber::fmt()
         .with_test_writer()
         .with_max_level(tracing::Level::INFO)

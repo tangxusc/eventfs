@@ -287,7 +287,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reshard_空到空无错误() {
+    async fn reshard_empty_to_empty_ok() {
         let src = tmp_tree();
         let dst = tmp_tree();
 
@@ -300,7 +300,7 @@ mod tests {
     /// 而不是按数据推断的分片数（旧实现用 infer_shard_count 推断 = 最大分片 + 1，
     /// 稀疏时低估，哈希路由与落盘时不符，数据被读错分片而丢失）。
     #[tokio::test]
-    async fn reshard_稀疏布局_按声明分片数路由不丢数据() {
+    async fn reshard_sparse_layout_declared_shards_no_loss() {
         use openraft::storage::RaftStateMachine;
 
         use crate::tests::{entry_with, new_event, new_shared_storages};

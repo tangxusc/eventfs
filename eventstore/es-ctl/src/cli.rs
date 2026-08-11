@@ -447,7 +447,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 期望版本解析_四种取值() {
+    fn expected_version_parse_four_variants() {
         assert_eq!(
             ExpectedVersionArg::from_str("any"),
             Ok(ExpectedVersionArg::Any)
@@ -467,21 +467,21 @@ mod tests {
     }
 
     #[test]
-    fn 期望版本解析_非法值拒绝() {
+    fn expected_version_parse_rejects_invalid() {
         assert!(ExpectedVersionArg::from_str("foo").is_err());
         assert!(ExpectedVersionArg::from_str("-1").is_err());
         assert!(ExpectedVersionArg::from_str("").is_err());
     }
 
     #[test]
-    fn 成员解析_id与地址() {
+    fn member_parse_id_and_addr() {
         let m = MemberArg::from_str("2@127.0.0.1:50052").expect("合法成员");
         assert_eq!(m.node_id, 2);
         assert_eq!(m.addr, "127.0.0.1:50052");
     }
 
     #[test]
-    fn 成员解析_非法值拒绝() {
+    fn member_parse_rejects_invalid() {
         assert!(MemberArg::from_str("abc@x").is_err(), "ID 非数字");
         assert!(MemberArg::from_str("1").is_err(), "缺 @");
         assert!(MemberArg::from_str("1@").is_err(), "地址为空");
@@ -489,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn 游标解析_多分片() {
+    fn positions_parse_multiple_shards() {
         assert_eq!(parse_shard_positions("3:7,5:2"), Ok(vec![(3, 7), (5, 2)]));
         assert_eq!(parse_shard_positions(" 3 : 7 "), Ok(vec![(3, 7)]));
         assert_eq!(parse_shard_positions(""), Ok(vec![]));
@@ -498,7 +498,7 @@ mod tests {
     }
 
     #[test]
-    fn 分片列表解析() {
+    fn shard_ids_parse() {
         assert_eq!(parse_shard_ids("0,1,3"), Ok(vec![0, 1, 3]));
         assert_eq!(parse_shard_ids(""), Ok(vec![]));
         assert!(parse_shard_ids("0,x").is_err());
