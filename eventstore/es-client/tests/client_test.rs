@@ -22,9 +22,11 @@ struct StubState {
     read_stream_calls: usize,
     /// 建立 read_stream 流时返回的错误（None = 正常建立）
     read_stream_error: Option<Status>,
-    /// read_stream 预设流内容（空 = 空流）
-    read_stream_pages: Vec<ReadEventsResponse>,
+    /// read_stream 预设流内容（Err = 流中途错误；空 = 空流）
+    read_stream_items: Vec<Result<ReadEventsResponse, Status>>,
     read_all_calls: usize,
+    /// 建立 read_all 流时返回的错误（None = 正常建立）
+    read_all_error: Option<Status>,
     /// read_all 预设流内容队列（空 = 空流）
     read_all_queue: VecDeque<Vec<ReadEventsResponse>>,
     /// read_all 收到的全部请求（断言翻页透传）
@@ -90,8 +92,8 @@ impl EventStore for StubServer {
             return Err(status.clone());
         }
         let (tx, rx) = tokio::sync::mpsc::channel(16);
-        for page in &state.read_stream_pages {
-            let _ = tx.try_send(Ok(page.clone()));
+        for item in &state.read_stream_items {
+            let _ = tx.try_send(item.clone());
         }
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
@@ -104,6 +106,9 @@ impl EventStore for StubServer {
     ) -> Result<Response<Self::ReadAllStream>, Status> {
         let mut state = self.state.lock().expect("stub 锁");
         state.read_all_calls += 1;
+        if let Some(status) = &state.read_all_error {
+            return Err(status.clone());
+        }
         state.read_all_requests.push(request.into_inner());
         let pages = state.read_all_queue.pop_front().unwrap_or_default();
         let (tx, rx) = tokio::sync::mpsc::channel(16);
@@ -367,8 +372,14 @@ async fn append_failed_precondition_raised() {
         .expect_err("FailedPrecondition 应上抛");
 
     assert!(
-        matches!(err, es_client::ClientError::RpcFailed(ref msg) if msg.contains("版本冲突")),
-        "错误消息保留: {err:?}"
+        matches!(
+            err,
+            es_client::ClientError::RpcFailed {
+                code: tonic::Code::FailedPrecondition,
+                ref message,
+            } if message.contains("版本冲突")
+        ),
+        "FailedPrecondition 上抛且保留码与消息: {err:?}"
     );
     assert_eq!(state.lock().expect("stub 锁").append_calls, 1);
 }
@@ -468,17 +479,80 @@ async fn read_all_passes_through_from_positions() {
 
 #[tokio::test]
 async fn read_all_all_nodes_failed() {
-    // 全部节点失败 → 汇总 AllNodesFailed
+    // read_all 全部节点失败（建立流阶段）→ 汇总 AllNodesFailed
+    let (addr_b, state_b) = start_stub_server().await;
+    let (addr_a, state_a) = start_stub_server().await;
+    state_a.lock().expect("stub 锁").read_all_error = Some(Status::internal("a 故障"));
+    state_b.lock().expect("stub 锁").read_all_error = Some(Status::internal("b 故障"));
+
+    let mut client = es_client::EventStoreClient::connect(vec![addr_a, addr_b])
+        .await
+        .expect("连接 stub");
+    let err = client
+        .read_all(vec![0], 0, 10, es_client::Direction::Forward, vec![])
+        .await
+        .expect_err("全部节点失败应报错");
+
+    assert!(
+        matches!(err, es_client::ClientError::AllNodesFailed(ref msg) if msg.contains("a 故障") && msg.contains("b 故障")),
+        "错误汇总两个节点: {err:?}"
+    );
+    assert_eq!(state_a.lock().expect("stub 锁").read_all_calls, 1);
+    assert_eq!(state_b.lock().expect("stub 锁").read_all_calls, 1);
+}
+
+#[tokio::test]
+async fn read_all_permanent_error_not_rotated() {
+    // 永久错误（InvalidArgument 等）不轮换节点：换节点结果相同，直接上抛
     let (addr_b, state_b) = start_stub_server().await;
     let (addr_a, state_a) = start_stub_server().await;
     state_a
         .lock()
         .expect("stub 锁")
-        .read_stream_error = Some(Status::internal("a 故障"));
-    state_b
-        .lock()
-        .expect("stub 锁")
-        .read_stream_error = Some(Status::internal("b 故障"));
+        .read_all_error = Some(Status::invalid_argument("shard_ids 与 from_positions 不能同时为空"));
+
+    let mut client = es_client::EventStoreClient::connect(vec![addr_a, addr_b])
+        .await
+        .expect("连接 stub");
+    let err = client
+        .read_all(vec![], 0, 10, es_client::Direction::Forward, vec![])
+        .await
+        .expect_err("InvalidArgument 应上抛");
+
+    assert!(
+        matches!(
+            err,
+            es_client::ClientError::RpcFailed {
+                code: tonic::Code::InvalidArgument,
+                ..
+            }
+        ),
+        "永久错误应保留码并上抛，不包装成 AllNodesFailed: {err:?}"
+    );
+    assert_eq!(
+        state_a.lock().expect("stub 锁").read_all_calls,
+        1,
+        "节点 A 只被调用一次（不轮换）"
+    );
+    assert_eq!(
+        state_b.lock().expect("stub 锁").read_all_calls,
+        0,
+        "节点 B 不被尝试"
+    );
+}
+
+#[tokio::test]
+async fn read_stream_mid_stream_error_not_rerouted() {
+    // 流建立成功后的中途错误：不轮换节点整页重读，直接上抛
+    let (addr_b, state_b) = start_stub_server().await;
+    let (addr_a, state_a) = start_stub_server().await;
+    state_a.lock().expect("stub 锁").read_stream_items = vec![
+        Ok(ReadEventsResponse {
+            events: vec![sample_event(1)],
+            next_positions: vec![],
+        }),
+        Err(Status::internal("流中途断开")),
+    ];
 
     let mut client = es_client::EventStoreClient::connect(vec![addr_a, addr_b])
         .await
@@ -486,11 +560,27 @@ async fn read_all_all_nodes_failed() {
     let err = client
         .read_stream("s1".to_string(), 0, 10, es_client::Direction::Forward)
         .await
-        .expect_err("全部节点失败应报错");
+        .expect_err("中途错误应上抛");
 
     assert!(
-        matches!(err, es_client::ClientError::AllNodesFailed(ref msg) if msg.contains("a 故障") && msg.contains("b 故障")),
-        "错误汇总两个节点: {err:?}"
+        matches!(
+            err,
+            es_client::ClientError::RpcFailed {
+                code: tonic::Code::Internal,
+                ref message,
+            } if message.contains("流中途断开")
+        ),
+        "中途错误保留码上抛: {err:?}"
+    );
+    assert_eq!(
+        state_a.lock().expect("stub 锁").read_stream_calls,
+        1,
+        "节点 A 只调用一次（中途错误不轮换重读）"
+    );
+    assert_eq!(
+        state_b.lock().expect("stub 锁").read_stream_calls,
+        0,
+        "节点 B 不被尝试"
     );
 }
 
@@ -546,13 +636,54 @@ async fn subscribe_stream_error_raised_without_resubscribe() {
 
     let err = stream.next().await.expect("流内错误").expect_err("错误应上抛");
     assert!(
-        matches!(err, es_client::ClientError::RpcFailed(ref msg) if msg.contains("订阅者落后")),
-        "流内错误映射 RpcFailed: {err:?}"
+        matches!(
+            err,
+            es_client::ClientError::RpcFailed {
+                code: tonic::Code::Internal,
+                ref message,
+            } if message.contains("订阅者落后")
+        ),
+        "流内错误映射 RpcFailed 且保留码: {err:?}"
     );
     assert_eq!(
         state.lock().expect("stub 锁").subscribe_calls,
         1,
         "不自动重订阅"
+    );
+}
+
+#[tokio::test]
+async fn append_cluster_unreachable_distinguished() {
+    // 节点 A 一直「leader unknown」（可达但选举中），节点 B 不可达（懒连接失败）：
+    // 预算耗尽时带建连失败详情而非 NotLeader(None)——区分「集群不可达」与「选举中」
+    let (addr_a, state_a) = start_stub_server().await;
+    for _ in 0..3 {
+        state_a.lock().expect("stub 锁").append_queue.push_back(Err(
+            Status::unavailable("not leader; leader unknown, retry later"),
+        ));
+    }
+
+    let mut client = es_client::EventStoreClient::connect(vec![
+        addr_a,
+        "http://127.0.0.1:1".to_string(), // 无服务监听，懒连接必拒
+    ])
+    .await
+    .expect("连接（预热 A 成功，B 懒连接）");
+    let err = client
+        .append(
+            "s1".to_string(),
+            es_client::ExpectedVersionBuilder::any(),
+            vec![],
+        )
+        .await
+        .expect_err("集群不可达应报错");
+
+    assert!(
+        matches!(
+            err,
+            es_client::ClientError::RpcFailed { ref message, .. } if message.contains("连接失败")
+        ),
+        "建连失败应带错误详情而非 NotLeader: {err:?}"
     );
 }
 

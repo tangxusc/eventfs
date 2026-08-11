@@ -38,10 +38,12 @@ pub fn parse_leader_hint(msg: &str) -> Option<String> {
 ///
 /// 语义约定:
 /// - [`Self::next`] 每取一个目标(含被去重跳过的)消耗 1 份预算
-/// - [`Self::redirect_to`] 重定向地址插队到队首(即使已试过,可能正处选举中,
-///   由去重兜底,避免无限循环)
+/// - [`Self::redirect_to`] 重定向地址插队到队首;**即使已尝试过也允许重试**
+///   (集群可能正处于选举/故障恢复中,重定向提示本身说明状态已变化;
+///   预算有界兜底,不会无限循环)
 /// - [`Self::retry_later`] 目标先移出已试集合再入队尾,否则重入队后会被
-///   去重挡下、重试永远不会发生(es-ctl 记录过的死代码陷阱)
+///   去重挡下、重试永远不会发生(es-ctl 记录过的死代码陷阱);
+///   下次轮到它时 [`Self::needs_backoff`] 返回 true,调用方应退避后再试
 pub struct LeaderRetryPlan {
     /// 剩余尝试预算
     budget: usize,
@@ -49,6 +51,8 @@ pub struct LeaderRetryPlan {
     queue: VecDeque<String>,
     /// 已尝试过的目标
     tried: HashSet<String>,
+    /// 最近一次 [`Self::retry_later`] 的目标:下次轮到它时需要退避
+    backoff_target: Option<String>,
 }
 
 impl LeaderRetryPlan {
@@ -65,6 +69,7 @@ impl LeaderRetryPlan {
             budget,
             queue,
             tried: HashSet::new(),
+            backoff_target: None,
         }
     }
 
@@ -72,6 +77,7 @@ impl LeaderRetryPlan {
     ///
     /// 每调用一次消耗 1 份预算;队列耗尽(无目标)或预算耗尽时返回 `None`。
     /// 目标可能因重定向/重入队出现多次,已尝试过的会被跳过(同样消耗预算)。
+    /// 取出后可用 [`Self::needs_backoff`] 判断本次是否需退避再发请求。
     pub fn next(&mut self) -> Option<String> {
         loop {
             if self.budget == 0 {
@@ -86,17 +92,31 @@ impl LeaderRetryPlan {
     }
 
     /// 重定向地址插队到队首,优先尝试。
+    ///
+    /// 已尝试过的目标同样入队并允许重试(集群状态可能已变化),
+    /// 由预算有界兜底。
     pub fn redirect_to(&mut self, addr: String) {
+        self.tried.remove(&addr);
         self.queue.push_front(addr);
     }
 
     /// 目标稍后重试:移出已试集合后入队尾。
     ///
     /// 用于选举中(`leader unknown`)等暂时性失败;队尾顺序保证先试完
-    /// 队列里其它端点,避免死等。
+    /// 队列里其它端点,避免死等。下次轮到该目标时 [`Self::needs_backoff`]
+    /// 返回 true。
     pub fn retry_later(&mut self, target: String) {
         self.tried.remove(&target);
+        self.backoff_target = Some(target.clone());
         self.queue.push_back(target);
+    }
+
+    /// 本次取出的目标是否刚被 [`Self::retry_later`] 重入队(应退避后再发请求)。
+    ///
+    /// 仅在最近一次重入队的目标上返回 true:队列里其它节点先被取到时
+    /// 无需退避,避免无谓延迟("先把其它节点试完")。
+    pub fn needs_backoff(&self, target: &str) -> bool {
+        self.backoff_target.as_deref() == Some(target)
     }
 }
 
@@ -178,12 +198,31 @@ mod tests {
     }
 
     #[test]
-    fn plan_duplicate_redirect_skipped() {
+    fn plan_redirect_back_to_tried_retries() {
+        // 重定向回已试过的 a:允许重试(集群状态可能已变化),预算有界兜底
         let mut plan = LeaderRetryPlan::new(["a".into(), "b".into()]);
         assert_eq!(plan.next(), Some("a".to_string()));
-        // 重定向回已试过的 a:去重跳过,消耗预算,继续尝试 b
         plan.redirect_to("a".into());
+        assert_eq!(
+            plan.next(),
+            Some("a".to_string()),
+            "重定向到已试目标应允许重试"
+        );
+    }
+
+    #[test]
+    fn plan_needs_backoff_only_for_requeued() {
+        // 重入队的目标再次轮到时才需要退避;队列里其它节点无需退避
+        let mut plan = LeaderRetryPlan::new(["a".into(), "b".into()]);
+        assert_eq!(plan.next(), Some("a".to_string()));
+        assert!(!plan.needs_backoff("a"), "首次尝试无需退避");
+        plan.retry_later("a".into());
+
         assert_eq!(plan.next(), Some("b".to_string()));
+        assert!(!plan.needs_backoff("b"), "其它节点无需退避");
+
+        assert_eq!(plan.next(), Some("a".to_string()));
+        assert!(plan.needs_backoff("a"), "重入队目标再次轮到应退避");
     }
 
     #[test]

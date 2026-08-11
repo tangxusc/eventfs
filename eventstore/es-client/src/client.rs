@@ -134,13 +134,18 @@ impl EventStoreClient {
 
     /// 读操作：在任一可达节点执行。
     ///
-    /// 依序尝试全部节点（轮询起点后移），建连失败与 RPC 错误都换下一节点
-    /// （读走本地存储，follower 也服务，天然幂等故不可重试）；全部失败时
-    /// 汇总为 [`ClientError::AllNodesFailed`]。
+    /// 依序尝试全部节点（轮询起点后移）。闭包返回双层结果：
+    /// - 外层 `Err(Status)`：请求**发出前**的节点级失败（建连失败/建立流失败），
+    ///   其中 [`is_node_failure`] 的码（Unavailable/DeadlineExceeded）换下一节点
+    ///   轮换，其它码（InvalidArgument/NotFound 等永久错误）换节点无意义，直接上抛
+    /// - 内层 `Err(ClientError)`：调用方已定性的不可轮换错误（如流中途错误），
+    ///   直接上抛，不换节点重试
+    ///
+    /// 全部节点轮换完仍失败时汇总为 [`ClientError::AllNodesFailed`]。
     async fn with_any_node<T, F, Fut>(&mut self, f: F) -> Result<T, ClientError>
     where
         F: Fn(GrpcClient<Channel>) -> Fut,
-        Fut: Future<Output = Result<T, Status>>,
+        Fut: Future<Output = Result<Result<T, ClientError>, Status>>,
     {
         let mut errors: Vec<String> = Vec::new();
         for node in self.rotated_nodes() {
@@ -153,8 +158,19 @@ impl EventStoreClient {
                 }
             };
             match f(client).await {
-                Ok(v) => return Ok(v),
-                Err(status) => errors.push(format!("{node}: {}", status.message())),
+                // 调用成功
+                Ok(Ok(v)) => return Ok(v),
+                // 调用方定性的不可轮换错误（永久错误/流中途错误），直接上抛
+                Ok(Err(e)) => return Err(e),
+                Err(status) => {
+                    if is_node_failure(status.code()) {
+                        // 节点级故障：换下一节点
+                        errors.push(format!("{node}: {}", status.message()));
+                        continue;
+                    }
+                    // 永久 gRPC 错误：换节点无意义，直接上抛
+                    return Err(ClientError::from_status(status));
+                }
             }
         }
         Err(ClientError::AllNodesFailed(format!(
@@ -192,11 +208,23 @@ impl EventStoreClient {
         // 重定向地址可能不在初始节点列表，预算 = 节点数 × 2 + 2
         let mut plan = LeaderRetryPlan::new(self.rotated_nodes());
         let mut last_redirect: Option<String> = None;
+        let mut errors: Vec<String> = Vec::new();
 
         while let Some(target) = plan.next() {
-            // 建连失败：本节点不可用，继续试下一个（不重入队，避免空转）
-            let Ok(client) = self.get_or_connect(&target).await else {
-                continue;
+            // 仅重入队的目标再次轮到时才退避，队列里其它节点先试（不无谓延迟）
+            if plan.needs_backoff(&target) {
+                tokio::time::sleep(ELECTION_RETRY_DELAY).await;
+            }
+            // 建连失败：重入队稍后重试（预算有界防空转）。不重入队的话
+            // 队列会提前清空——单节点场景下健康节点（选举后即成新 leader）
+            // 永不再试。
+            let client = match self.get_or_connect(&target).await {
+                Ok(c) => c,
+                Err(e) => {
+                    errors.push(format!("{target}: 连接失败: {e}"));
+                    plan.retry_later(target);
+                    continue;
+                }
             };
             match client.clone().append(request.clone()).await {
                 Ok(resp) => return Ok(resp.into_inner()),
@@ -205,25 +233,34 @@ impl EventStoreClient {
                         Some(addr) => {
                             let norm = normalize_endpoint(&addr);
                             last_redirect = Some(norm.clone());
-                            // 重定向地址优先尝试；即使已试过也可能正处选举中，
-                            // 由 plan 的去重兜底，重试有界（预算 2N+2）
+                            // 重定向地址优先尝试；已试过也允许重试（集群状态
+                            // 可能已变化），由预算有界兜底
                             plan.redirect_to(norm);
                         }
                         // 提示缺失（选举中 leader unknown，或 leader_addr 为空）：
                         // 本节点稍后重试，但先把队列里其它节点试完，避免死等。
                         None => {
                             plan.retry_later(target);
-                            tokio::time::sleep(ELECTION_RETRY_DELAY).await;
                         }
                     }
                 }
                 Err(status) => {
                     // FailedPrecondition（乐观冲突）等不可重试错误原样上抛
-                    return Err(ClientError::RpcFailed(status.message().to_string()));
+                    return Err(ClientError::from_status(status));
                 }
             }
         }
-        Err(ClientError::NotLeader(last_redirect))
+        // 预算耗尽：区分「集群不可达」与「可达但选举中」——
+        // 收到过重定向地址报 NotLeader；从未收到且全是建连失败报错误详情；
+        // 全可达但选举中报 NotLeader(None)
+        match (last_redirect, errors.is_empty()) {
+            (Some(addr), _) => Err(ClientError::NotLeader(Some(addr))),
+            (None, false) => Err(ClientError::RpcFailed {
+                code: Code::Unavailable,
+                message: errors.join("；"),
+            }),
+            (None, true) => Err(ClientError::NotLeader(None)),
+        }
     }
 
     /// 读取流事件。
@@ -250,12 +287,22 @@ impl EventStoreClient {
                 direction: direction as i32,
             };
             async move {
-                let mut stream = client.read_stream(request).await?.into_inner();
+                // 建立流失败：外层 Err，由 with_any_node 按码分类轮换/上抛
+                let mut stream = match client.read_stream(request).await {
+                    Ok(s) => s.into_inner(),
+                    Err(status) => return Err(status),
+                };
                 let mut events = Vec::new();
-                while let Some(response) = stream.message().await? {
+                loop {
+                    let resp = match stream.message().await {
+                        // 流中途错误：不可轮换（已收部分结果，重读语义不明确），上抛
+                        Err(e) => return Ok(Err(ClientError::from_status(e))),
+                        Ok(resp) => resp,
+                    };
+                    let Some(response) = resp else { break };
                     events.extend(response.events);
                 }
-                Ok(events)
+                Ok(Ok(events))
             }
         })
         .await
@@ -294,17 +341,26 @@ impl EventStoreClient {
                 from_positions: from_positions.clone(),
             };
             async move {
-                let mut stream = client.read_all(request).await?.into_inner();
+                let mut stream = match client.read_all(request).await {
+                    Ok(s) => s.into_inner(),
+                    Err(status) => return Err(status),
+                };
                 let mut events = Vec::new();
                 let mut next_positions = Vec::new();
-                while let Some(response) = stream.message().await? {
+                loop {
+                    let resp = match stream.message().await {
+                        // 流中途错误：不可轮换（已收部分结果，重读语义不明确），上抛
+                        Err(e) => return Ok(Err(ClientError::from_status(e))),
+                        Ok(resp) => resp,
+                    };
+                    let Some(response) = resp else { break };
                     events.extend(response.events);
                     // 与 es-ctl collect_page 同语义：非空才更新，避免空页清掉游标
                     if !response.next_positions.is_empty() {
                         next_positions = response.next_positions;
                     }
                 }
-                Ok((events, next_positions))
+                Ok(Ok((events, next_positions)))
             }
         })
         .await
@@ -317,7 +373,8 @@ impl EventStoreClient {
     ///
     /// # 参数
     /// - `target`: 订阅单个流或全部分片
-    /// - `from_exclusive`: 订阅流时按 version、订阅 all 时按 position（不含起点）
+    /// - `from_exclusive`: 订阅流时按 version、订阅 all 时按 position（不含起点）。
+    ///   注意服务端会对其 +1 作为起始，**不要传 `u64::MAX`**（会回绕到 0 从头重放）
     /// - `from_start`: true 从头开始，忽略 `from_exclusive`
     pub async fn subscribe(
         &mut self,
@@ -343,12 +400,14 @@ impl EventStoreClient {
         self.with_any_node(|mut client| {
             let request = request.clone();
             async move {
-                let stream = client.subscribe(request).await?.into_inner();
+                // 建立流失败：外层 Err，由 with_any_node 分类轮换/上抛
+                let stream = match client.subscribe(request).await {
+                    Ok(s) => s.into_inner(),
+                    Err(status) => return Err(status),
+                };
                 // 流内错误映射为 ClientError 上抛（不重订阅）
-                let mapped = stream.map(|item| {
-                    item.map_err(|e| ClientError::RpcFailed(e.to_string()))
-                });
-                Ok(Box::pin(mapped) as SubscribeStream)
+                let mapped = stream.map(|item| item.map_err(ClientError::from_status));
+                Ok(Ok(Box::pin(mapped) as SubscribeStream))
             }
         })
         .await
@@ -365,10 +424,29 @@ impl EventStoreClient {
             let request = GetStreamMetaRequest {
                 stream_id: stream_id.clone(),
             };
-            async move { Ok(client.get_stream_meta(request).await?.into_inner()) }
+            async move {
+                match client.get_stream_meta(request).await {
+                    Ok(resp) => Ok(Ok(resp.into_inner())),
+                    // 建立调用失败：外层 Err，由 with_any_node 分类轮换/上抛
+                    Err(status) => Err(status),
+                }
+            }
         })
         .await
     }
+}
+
+/// gRPC 错误码是否为节点级故障（可换节点轮换重试）。
+///
+/// 读方法换节点只对节点级故障有意义：Unavailable（节点/集群不可用）、
+/// DeadlineExceeded（超时）、Internal（该节点内部故障，如本地存储损坏——
+/// 换节点可能读到健康副本）。请求级错误（InvalidArgument/NotFound/
+/// FailedPrecondition 等）换节点结果相同，直接上抛。
+fn is_node_failure(code: Code) -> bool {
+    matches!(
+        code,
+        Code::Unavailable | Code::DeadlineExceeded | Code::Internal
+    )
 }
 
 /// 客户端错误
@@ -380,8 +458,15 @@ pub enum ClientError {
     #[error("Connection failed: {0}")]
     ConnectionFailed(String),
 
-    #[error("RPC failed: {0}")]
-    RpcFailed(String),
+    /// RPC 失败，保留 gRPC 状态码与消息（调用方可按码区分
+    /// 可重试/永久错误，如 FailedPrecondition 乐观冲突）
+    #[error("RPC failed ({code:?}): {message}")]
+    RpcFailed {
+        /// gRPC 状态码
+        code: Code,
+        /// 服务端错误消息
+        message: String,
+    },
 
     /// append 重试预算耗尽仍未成功（集群可能长期处于选举中），
     /// 附最近一次收到的重定向地址
@@ -391,4 +476,14 @@ pub enum ClientError {
     /// 读方法轮换全部节点后仍失败，附各节点错误详情
     #[error("All nodes failed: {0}")]
     AllNodesFailed(String),
+}
+
+impl ClientError {
+    /// 由 gRPC Status 构造 RpcFailed（保留码与消息）
+    fn from_status(status: Status) -> Self {
+        ClientError::RpcFailed {
+            code: status.code(),
+            message: status.message().to_string(),
+        }
+    }
 }

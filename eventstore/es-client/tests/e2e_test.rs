@@ -67,10 +67,26 @@ async fn start_test_server() -> (
             .await;
     });
 
-    // 等 gRPC 服务器真正开始监听
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // 轮询等待 gRPC 服务器就绪（替代固定 sleep，抗 CI 高负载）
+    wait_server_ready(&addr, Duration::from_secs(10)).await;
 
     (addr, handle, server, dir)
+}
+
+/// 轮询建连直到 gRPC 服务器就绪或超时。
+async fn wait_server_ready(addr: &str, timeout: Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let endpoint = tonic::transport::Endpoint::from_shared(addr.to_string())
+            .expect("测试地址合法");
+        match endpoint.connect().await {
+            Ok(_channel) => return,
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("等待 gRPC 服务器就绪超时: {e}"),
+        }
+    }
 }
 
 /// 追加 1 条事件（期望版本 any）
@@ -166,12 +182,18 @@ async fn subscribe_catch_up_then_live() {
     assert_eq!(history[1].data, vec![1]);
     assert_eq!(history[2].data, vec![2]);
 
-    // live 阶段：新写入应被推送
-    append_one(&mut client, "sub", 99).await;
-    let live = stream.next().await.expect("收到推送").expect("无错误");
-    match live.payload {
-        Some(subscribe_response::Payload::Event(e)) => assert_eq!(e.data, vec![99]),
-        other => panic!("应收到 live 事件: {other:?}"),
+    // live 阶段：新写入应被推送（连发多条，验证恰好一次、无重复无丢失）
+    for i in 0..5 {
+        append_one(&mut client, "sub", 100 + i).await;
+    }
+    for i in 0..5 {
+        let live = stream.next().await.expect("收到推送").expect("无错误");
+        match live.payload {
+            Some(subscribe_response::Payload::Event(e)) => {
+                assert_eq!(e.data, vec![100 + i], "第 {i} 条 live 事件")
+            }
+            other => panic!("应收到 live 事件: {other:?}"),
+        }
     }
 }
 

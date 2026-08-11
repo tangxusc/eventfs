@@ -461,10 +461,11 @@ impl EventStore for EsService {
                     .map_err(|e| Status::internal(format!("route failed: {}", e)))?;
 
                 // 起始位置：from_start=true 从头，否则用 from_exclusive+1
+                // （saturating_add 防 u64::MAX 溢出回绕）
                 let from_version = if req.from_start {
                     0
                 } else {
-                    req.from_exclusive + 1
+                    req.from_exclusive.saturating_add(1)
                 };
 
                 (Some(sid), shard.id(), from_version)
@@ -475,7 +476,7 @@ impl EventStore for EsService {
                 let from_position = if req.from_start {
                     0
                 } else {
-                    req.from_exclusive + 1
+                    req.from_exclusive.saturating_add(1)
                 };
                 (None, req.shard_id, from_position)
             }
@@ -493,6 +494,12 @@ impl EventStore for EsService {
         // 启动后台任务处理订阅
         let storage = shard.storage.clone();
         tokio::spawn(async move {
+            // Phase 0: 先注册实时广播接收器——必须在读历史之前。
+            // 若注册在「读历史 → 发 caught_up」之后,窗口内提交的事件
+            // 既不在快照也不在广播里(broadcast 对无接收者的 send 直接丢弃),
+            // 订阅者会在无感知的情况下永久丢失事件。
+            let mut event_rx = storage.subscribe_events();
+
             // Phase 1: Catch-up（补齐历史）
             let historical = match stream_id {
                 Some(ref sid) => {
@@ -509,6 +516,11 @@ impl EventStore for EsService {
                         .unwrap_or_default()
                 }
             };
+
+            // 历史尾水位：Phase 2 消费实时事件时跳过注册与快照之间的
+            // 重复窗口（注册先于快照，窗口内提交的事件缓冲与快照各有一份）。
+            let last_version = historical.last().map(|e| e.version);
+            let last_position = historical.last().map(|e| e.position);
 
             // 发送历史事件
             for ev in historical {
@@ -551,15 +563,19 @@ impl EventStore for EsService {
             }
 
             // Phase 2: Live（实时推送）
-            let mut event_rx = storage.subscribe_events();
             loop {
                 match event_rx.recv().await {
                     Ok(ev) => {
-                        // 过滤：如果订阅的是单流，只推送该流的事件
+                        // 跳过快照已含的事件（注册先于快照的重复窗口），
+                        // 再按订阅目标过滤
                         if let Some(ref sid) = stream_id {
-                            if ev.stream_id != *sid {
+                            if ev.stream_id != *sid
+                                || last_version.is_some_and(|v| ev.version <= v)
+                            {
                                 continue;
                             }
+                        } else if last_position.is_some_and(|p| ev.position <= p) {
+                            continue;
                         }
 
                         let proto_event = Event {
