@@ -86,16 +86,19 @@ pub async fn reshard(
         }
     }
 
-    // 2. 逐个新分片处理:读旧数据 → K 路归并 → 写新分片
+    // 2. 逐个新分片处理:读旧数据 → K 路归并 → 写新分片。
+    //    源读计数与目标写计数分开统计:写侧若出现过滤/截断等静默差异,
+    //    下面的事件数校验才能真实拦截(共用同一计数则恒等,校验形同虚设)。
     let mut dst_streams_total = 0;
     let mut dst_events_total = 0;
 
     for (new_shard, streams) in streams_by_new_shard {
-        let (n_streams, n_events) =
-            process_shard(new_shard, streams, src_tree.clone(), dst_tree.clone()).await?;
+        let (n_streams, src_read, dst_written) =
+            process_shard(new_shard, streams, src_tree.clone(), dst_tree.clone(), src_num_shards)
+                .await?;
         dst_streams_total += n_streams;
-        dst_events_total += n_events;
-        src_events_total += n_events; // 顺便统计源总数(从各旧分片累加)
+        dst_events_total += dst_written;
+        src_events_total += src_read;
     }
 
     // 3. 校验完整性
@@ -120,22 +123,27 @@ pub async fn reshard(
 }
 
 /// 处理一个新分片:读属于它的全部流 → 归并 → 写入
+///
+/// 返回 `(目标流数, 源侧读回事件数, 目标侧写入事件数)`。
+/// 读事件按 `src_num_shards` 路由——与枚举旧分片用同一套分片数,
+/// 避免此前用启发式推断(`infer_shard_count`)导致稀疏布局下读错分片。
 async fn process_shard(
     new_shard: u64,
     streams: Vec<(String, StreamMeta)>,
     src_tree: Arc<surrealkv::Tree>,
     dst_tree: Arc<surrealkv::Tree>,
-) -> es_core::Result<(usize, usize)> {
+    src_num_shards: u64,
+) -> es_core::Result<(usize, usize, usize)> {
     // 读取所有流的事件(从各自所在的旧分片)
     let mut all_events: Vec<Event> = Vec::new();
     for (stream_id, _meta) in &streams {
-        let old_shard = es_core::route(stream_id, infer_old_shard_count(&src_tree)?);
+        let old_shard = es_core::route(stream_id, src_num_shards);
         let old_store = EsStorage::new(old_shard, src_tree.clone())?;
         let events = old_store.read_stream_events(stream_id, 0, 0)?;
         all_events.extend(events);
     }
 
-    let n_events = all_events.len();
+    let src_read = all_events.len();
 
     // K 路归并:按 (HLC, stream_id, version) 升序
     all_events.sort_by(|a, b| {
@@ -151,18 +159,20 @@ async fn process_shard(
     }
 
     // 写入新分片
-    write_shard(new_shard, &streams, &all_events, dst_tree).await?;
+    let dst_written = write_shard(new_shard, &streams, &all_events, dst_tree).await?;
 
-    Ok((streams.len(), n_events))
+    Ok((streams.len(), src_read, dst_written))
 }
 
-/// 写入新分片的全部数据:事件、position 指针、StreamMeta、幂等索引、next_position
+/// 写入新分片的全部数据:事件、position 指针、StreamMeta、幂等索引、next_position。
+///
+/// 返回实际写入的事件数(写侧独立计数,供事件数完整性校验)。
 async fn write_shard(
     shard: u64,
     streams: &[(String, StreamMeta)],
     events: &[Event],
     tree: Arc<surrealkv::Tree>,
-) -> es_core::Result<()> {
+) -> es_core::Result<usize> {
     let mut txn = tree
         .begin()
         .map_err(|e| es_core::Error::Storage(format!("begin 失败: {e}")))?;
@@ -221,11 +231,14 @@ async fn write_shard(
     txn.commit().await
         .map_err(|e| es_core::Error::Storage(format!("commit 失败: {e}")))?;
 
-    Ok(())
+    Ok(events.len())
 }
 
-/// 从源 tree 推断旧分片数(启发式:找最大的分片 ID + 1)
-fn infer_old_shard_count(tree: &surrealkv::Tree) -> es_core::Result<u64> {
+/// 从源 tree 推断数据布局中的分片数(启发式:扫 TAG_SM 段找最大的分片 ID + 1)。
+///
+/// 供离线工具校验 `--src-shards` 与目录实际布局一致,防止少报分片数时
+/// 哈希落在枚举范围之外的分片数据被静默跳过。
+pub fn infer_shard_count(tree: &surrealkv::Tree) -> es_core::Result<u64> {
     use surrealkv::LSMIterator;
 
     // 扫 TAG_SM 段的全部分片前缀,解出 shard_id
@@ -281,5 +294,65 @@ mod tests {
         let report = reshard(src, 2, dst, 2).await.expect("reshard");
         assert_eq!(report.src_streams, 0);
         assert_eq!(report.src_events, 0);
+    }
+
+    /// 稀疏布局（部分分片无数据）时，读事件必须按声明的 src_num_shards 路由，
+    /// 而不是按数据推断的分片数（旧实现用 infer_shard_count 推断 = 最大分片 + 1，
+    /// 稀疏时低估，哈希路由与落盘时不符，数据被读错分片而丢失）。
+    #[tokio::test]
+    async fn reshard_稀疏布局_按声明分片数路由不丢数据() {
+        use openraft::storage::RaftStateMachine;
+
+        use crate::tests::{entry_with, new_event, new_shared_storages};
+        use es_core::ExpectedVersion;
+
+        // 流名 A：route(A,4)==0 且 route(A,2)==0（两种路由一致）；
+        // 流名 B：route(B,4)==3 且 route(B,2)==1——若用推断值 2 路由会去分片 1 读
+        let a = (0..1000u64)
+            .map(|i| format!("sparse-a/{i}"))
+            .find(|n| es_core::route(n, 4) == 0 && es_core::route(n, 2) == 0)
+            .expect("应有路由一致的流名");
+        let b = (0..1000u64)
+            .map(|i| format!("sparse-b/{i}"))
+            .find(|n| es_core::route(n, 4) == 3 && es_core::route(n, 2) == 1)
+            .expect("应有路由不一致的流名");
+
+        // 4 分片布局，只写分片 0 与 3（分片 1、2 无数据 → 推断分片数为 2）
+        let (mut sts, _dir) = new_shared_storages(&[0, 3]);
+        sts[0]
+            .apply(vec![entry_with(
+                1,
+                0,
+                &a,
+                ExpectedVersion::NoStream,
+                vec![new_event("E", b"a1"), new_event("E", b"a2")],
+            )])
+            .await
+            .expect("写分片 0");
+        sts[1]
+            .apply(vec![entry_with(
+                1,
+                0,
+                &b,
+                ExpectedVersion::NoStream,
+                vec![new_event("E", b"b1")],
+            )])
+            .await
+            .expect("写分片 3");
+
+        let src_tree = sts[0].tree().clone();
+        assert_eq!(infer_shard_count(&src_tree).expect("推断"), 4, "数据在分片 0、3，推断应为 4");
+
+        // 稀疏布局场景：--src-shards 用声明值 4（不匹配的 2 会被 es-ctl 拒绝）
+        let dst = tmp_tree();
+        let report = reshard(src_tree, 4, dst.clone(), 2).await.expect("reshard");
+        assert_eq!(report.src_events, 3, "源应有 3 条事件");
+        assert_eq!(report.dst_events, 3, "目标应写入 3 条事件");
+
+        // 流 B 必须迁移成功（旧实现从分片 1 读 B → 事件丢失）
+        let dst_store = EsStorage::new(es_core::route(&b, 2), dst).expect("目标存储");
+        let evs = dst_store.read_stream_events(&b, 0, 0).expect("读流 B");
+        assert_eq!(evs.len(), 1, "流 B 的事件不应丢失");
+        assert_eq!(evs[0].data, b"b1");
     }
 }
