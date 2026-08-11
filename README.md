@@ -155,7 +155,7 @@ let resp = client.append(
 println!("shard={} position={}", resp.shard_id, resp.first_position);
 ```
 
-完整示例：`cargo run --example client_example`（需先启动并组建好集群）。
+完整示例：`cargo run -p es-server --example client_example`（需先启动并组建好集群）。
 
 连接 https 节点：`connect` 对 https 地址默认跳过证书校验；需要严格校验时用
 `connect_with_tls`（CA 为 PEM 字节，可含多张证书）：
