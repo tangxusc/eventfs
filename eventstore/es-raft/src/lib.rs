@@ -8,7 +8,7 @@ pub mod shard;
 
 pub use admin_service::RaftAdminService;
 pub use manager::ShardManager;
-pub use network::{GrpcConnection, GrpcNetwork};
+pub use network::{normalize_endpoint, GrpcConnection, GrpcNetwork};
 pub use rpc_service::RaftRpcService;
 pub use shard::Shard;
 

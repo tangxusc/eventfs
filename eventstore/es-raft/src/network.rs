@@ -41,6 +41,18 @@ impl RaftNetworkFactory<TypeConfig> for GrpcNetwork {
     }
 }
 
+/// BasicNode.addr 可能不带 scheme，补上 http:// 才是合法的 tonic endpoint。
+///
+/// 写入 membership 的地址与网络层回连必须遵循同一规则（单一来源），
+/// 启动时按配置自动组建集群（bootstrap）也要用它。
+pub fn normalize_endpoint(addr: &str) -> String {
+    if addr.starts_with("http://") || addr.starts_with("https://") {
+        addr.to_string()
+    } else {
+        format!("http://{}", addr)
+    }
+}
+
 /// 指向单个目标节点的连接。
 pub struct GrpcConnection {
     shard_id: u64,
@@ -74,11 +86,7 @@ impl GrpcConnection {
         }
 
         // BasicNode.addr 可能不带 scheme，补上 http:// 才是合法的 endpoint
-        let uri = if self.addr.starts_with("http://") || self.addr.starts_with("https://") {
-            self.addr.clone()
-        } else {
-            format!("http://{}", self.addr)
-        };
+        let uri = normalize_endpoint(&self.addr);
 
         let endpoint = tonic::transport::Endpoint::from_shared(uri.clone()).map_err(|e| {
             RPCError::Network(NetworkError::new(&std::io::Error::other(format!(
