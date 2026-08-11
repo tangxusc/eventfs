@@ -1,0 +1,1008 @@
+//! 多节点集成测试：验证 Raft 共识与网络层
+
+use std::collections::HashMap;
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
+
+use es_proto::eventstore::event_store_client::EventStoreClient;
+use es_proto::eventstore::raft_admin_client::RaftAdminClient;
+use es_proto::eventstore::*;
+
+/// 测试固定用分片 0（集群按 num_shards=1 启动）
+const SHARD: u64 = 0;
+
+/// 测试集群：3 个节点
+struct TestCluster {
+    /// 节点进程
+    nodes: HashMap<u64, NodeHandle>,
+    /// 分片总数
+    num_shards: u64,
+    /// 临时目录（drop 时自动删除）。重启节点要复用同一目录才能验证数据恢复，
+    /// 因此必须持有到测试结束。
+    _dirs: Vec<tempfile::TempDir>,
+}
+
+struct NodeHandle {
+    /// 对外地址，形如 http://127.0.0.1:50051
+    addr: String,
+    /// 监听端口，重启后仍用同一个（membership 里记的是这个地址）
+    port: u16,
+    /// 配置文件路径，重启时复用
+    config_path: std::path::PathBuf,
+    process: Child,
+}
+
+/// 启动一个 eventstored 子进程
+fn spawn_node(config_path: &std::path::Path) -> Child {
+    Command::new("cargo")
+        .args([
+            "run",
+            "--quiet",
+            "--bin",
+            "eventstored",
+            "--",
+            "--config",
+            config_path.to_str().expect("配置路径非 UTF-8"),
+        ])
+        .env("RUST_LOG", "warn")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("启动节点进程")
+}
+
+/// 检测端口是否可连接（进程是否真正启动）
+async fn wait_for_port(port: u16, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if tokio::time::Instant::now() > deadline {
+            return false;
+        }
+        match tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port)).await {
+            Ok(_) => return true,
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+}
+
+impl TestCluster {
+    /// 启动 3 节点单分片集群
+    async fn start() -> Self {
+        Self::start_with_shards(1).await
+    }
+
+    /// 启动 3 节点集群，指定分片数（未初始化 Raft 成员关系）
+    async fn start_with_shards(num_shards: u64) -> Self {
+        let mut nodes = HashMap::new();
+        let mut dirs = Vec::new();
+
+        // 为 3 个节点分配端口
+        let ports: Vec<u16> = (0..3)
+            .map(|_| {
+                let listener =
+                    std::net::TcpListener::bind("127.0.0.1:0").expect("绑定临时端口");
+                let port = listener.local_addr().expect("取地址").port();
+                drop(listener);
+                // 等待端口真正释放
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                port
+            })
+            .collect();
+
+        // 构建 peers 列表（不包含自己）
+        let build_peers = |exclude_idx: usize| -> Vec<serde_json::Value> {
+            ports
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != exclude_idx)
+                .map(|(i, p)| {
+                    serde_json::json!({
+                        "id": (i + 1) as u64,
+                        "addr": format!("127.0.0.1:{}", p),
+                    })
+                })
+                .collect()
+        };
+
+        for (i, &port) in ports.iter().enumerate() {
+            let node_id = (i + 1) as u64;
+            let dir = tempfile::tempdir().expect("创建临时目录");
+
+            // 创建配置文件
+            let config = serde_json::json!({
+                "node": {
+                    "id": node_id,
+                    "listen_addr": format!("127.0.0.1:{}", port),
+                    "peers": build_peers(i),
+                },
+                "storage": {
+                    "data_dir": dir.path().to_str().unwrap(),
+                },
+                "shards": {
+                    "num_shards": num_shards,
+                },
+            });
+
+            let config_path = dir.path().join("config.json");
+            std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap())
+                .expect("写配置文件");
+
+            let child = spawn_node(&config_path);
+
+            // 等待该节点端口可连接（最多 10 秒）
+            if !wait_for_port(port, Duration::from_secs(10)).await {
+                panic!("节点 {} 启动超时（端口 {} 不可达）", node_id, port);
+            }
+
+            eprintln!("✓ 节点 {} 已启动（端口 {}）", node_id, port);
+
+            nodes.insert(
+                node_id,
+                NodeHandle {
+                    addr: format!("http://127.0.0.1:{}", port),
+                    port,
+                    config_path,
+                    process: child,
+                },
+            );
+            dirs.push(dir);
+        }
+
+        eprintln!("✓ 全部 3 个节点已启动（{num_shards} 个分片）");
+
+        Self {
+            nodes,
+            num_shards,
+            _dirs: dirs,
+        }
+    }
+
+    /// 重启节点：复用原配置与数据目录，验证能否从本地日志恢复
+    async fn restart_node(&mut self, node_id: u64) {
+        let (config_path, port) = {
+            let n = self.nodes.get_mut(&node_id).expect("节点不存在");
+            let _ = n.process.kill();
+            let _ = n.process.wait();
+            (n.config_path.clone(), n.port)
+        };
+        eprintln!("↻ 已停止 node{node_id}，准备重启");
+
+        // 等端口释放，否则新进程 bind 会失败
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let child = spawn_node(&config_path);
+        self.nodes.get_mut(&node_id).expect("节点不存在").process = child;
+
+        if !wait_for_port(port, Duration::from_secs(15)).await {
+            panic!("node{node_id} 重启后端口 {port} 不可达");
+        }
+        eprintln!("✓ node{node_id} 已重启");
+    }
+
+    /// 获取某节点的客户端
+    async fn client(&self, node_id: u64) -> EventStoreClient<tonic::transport::Channel> {
+        let handle = self.nodes.get(&node_id).expect("节点不存在");
+        EventStoreClient::connect(handle.addr.clone())
+            .await
+            .expect("连接节点")
+    }
+
+    /// 获取某节点的管理客户端
+    async fn admin(&self, node_id: u64) -> RaftAdminClient<tonic::transport::Channel> {
+        let handle = self.nodes.get(&node_id).expect("节点不存在");
+        RaftAdminClient::connect(handle.addr.clone())
+            .await
+            .expect("连接管理接口")
+    }
+
+    /// 节点的对外地址（供 membership 记录，其它节点据此回连）
+    fn addr_of(&self, node_id: u64) -> String {
+        self.nodes.get(&node_id).expect("节点不存在").addr.clone()
+    }
+
+    /// 查询某节点在分片 0 上的 Raft 状态
+    async fn raft_state(&self, node_id: u64) -> GetRaftStateResponse {
+        self.raft_state_of(node_id, SHARD).await
+    }
+
+    /// 查询某节点在指定分片上的 Raft 状态
+    async fn raft_state_of(&self, node_id: u64, shard_id: u64) -> GetRaftStateResponse {
+        self.admin(node_id)
+            .await
+            .get_raft_state(GetRaftStateRequest { shard_id })
+            .await
+            .expect("查 Raft 状态")
+            .into_inner()
+    }
+
+    /// 轮询直到指定分片出现 leader，返回其 node_id
+    async fn wait_leader_of_shard(&self, shard_id: u64, timeout: Duration) -> u64 {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            for id in 1..=3u64 {
+                if let Ok(mut a) = RaftAdminClient::connect(self.addr_of(id)).await {
+                    if let Ok(resp) = a.get_raft_state(GetRaftStateRequest { shard_id }).await {
+                        let s = resp.into_inner();
+                        if s.is_leader {
+                            return s.node_id;
+                        }
+                    }
+                }
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!("分片 {shard_id} 等待选主超时（{timeout:?}）");
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// 组建 3 节点集群。
+    ///
+    /// 采用 openraft 推荐的自举流程：先在 node1 上以单成员初始化，
+    /// 它立刻成为 leader；再把 2、3 加为学习者追平日志；
+    /// 最后一次性提升为投票成员。这样全程都有 leader，
+    /// 避免三个空节点同时竞选导致的选举活锁。
+    async fn form_cluster(&self) {
+        // 每个分片是一个独立的 Raft group，必须各自初始化并各自选主。
+        // 分片之间不共享 membership，也不共享 leader。
+        for shard_id in 0..self.num_shards {
+            self.form_shard(shard_id).await;
+        }
+        eprintln!("✓ 集群组建完成（{} 个分片）", self.num_shards);
+    }
+
+    /// 组建单个分片的 Raft group
+    async fn form_shard(&self, shard_id: u64) {
+        let mut admin1 = self.admin(1).await;
+
+        admin1
+            .initialize(InitializeRequest {
+                shard_id,
+                members: vec![RaftMember {
+                    node_id: 1,
+                    addr: self.addr_of(1),
+                }],
+            })
+            .await
+            .unwrap_or_else(|e| panic!("分片 {shard_id} initialize 失败: {e}"));
+
+        // 等 node1 真正当上 leader 再加成员，否则 add_learner 会被拒
+        self.wait_leader_of_shard(shard_id, Duration::from_secs(10))
+            .await;
+
+        for id in [2u64, 3] {
+            admin1
+                .add_learner(AddLearnerRequest {
+                    shard_id,
+                    member: Some(RaftMember {
+                        node_id: id,
+                        addr: self.addr_of(id),
+                    }),
+                    blocking: true,
+                })
+                .await
+                .unwrap_or_else(|e| panic!("分片 {shard_id} add_learner node{id} 失败: {e}"));
+        }
+
+        admin1
+            .change_membership(ChangeMembershipRequest {
+                shard_id,
+                voter_ids: vec![1, 2, 3],
+                retain: false,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("分片 {shard_id} change_membership 失败: {e}"));
+
+        eprintln!("  ✓ 分片 {shard_id} 就绪");
+    }
+
+    /// 轮询直到出现 leader，返回其 node_id
+    async fn wait_for_leader(&self, timeout: Duration) -> u64 {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            for id in 1..=3u64 {
+                // 节点可能还在启动，查询失败就跳过重试
+                if let Ok(mut a) = RaftAdminClient::connect(self.addr_of(id)).await {
+                    if let Ok(resp) = a
+                        .get_raft_state(GetRaftStateRequest { shard_id: SHARD })
+                        .await
+                    {
+                        let s = resp.into_inner();
+                        if s.is_leader {
+                            return s.node_id;
+                        }
+                    }
+                }
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!("等待选主超时（{timeout:?}）");
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// 轮询直到某节点的 last_applied 追上目标值
+    async fn wait_applied(&self, node_id: u64, want: u64, timeout: Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let s = self.raft_state(node_id).await;
+            if s.has_last_applied && s.last_applied >= want {
+                return;
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!(
+                    "节点 {node_id} 等待 last_applied>={want} 超时，当前 {}",
+                    s.last_applied
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// 杀掉指定节点，模拟进程崩溃
+    fn kill_node(&mut self, node_id: u64) {
+        let node = self.nodes.get_mut(&node_id).expect("节点不存在");
+        let _ = node.process.kill();
+        let _ = node.process.wait();
+        eprintln!("✗ 已杀掉 node{node_id}");
+    }
+
+    /// 轮询直到在指定候选节点中出现 leader
+    async fn wait_leader_among(&self, candidates: &[u64], timeout: Duration) -> u64 {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            for &id in candidates {
+                if let Ok(mut a) = RaftAdminClient::connect(self.addr_of(id)).await {
+                    if let Ok(resp) = a
+                        .get_raft_state(GetRaftStateRequest { shard_id: SHARD })
+                        .await
+                    {
+                        let s = resp.into_inner();
+                        if s.is_leader {
+                            return s.node_id;
+                        }
+                    }
+                }
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!("在 {candidates:?} 中等待新 leader 超时（{timeout:?}）");
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// 关闭集群
+    fn shutdown(mut self) {
+        for (node_id, node) in self.nodes.iter_mut() {
+            let _ = node.process.kill();
+            let _ = node.process.wait();
+            eprintln!("✓ 节点 {} 已关闭", node_id);
+        }
+    }
+}
+
+impl Drop for TestCluster {
+    fn drop(&mut self) {
+        for (_, node) in self.nodes.iter_mut() {
+            let _ = node.process.kill();
+            let _ = node.process.wait();
+        }
+    }
+}
+
+
+#[tokio::test]
+#[ignore = "需要较长时间编译与启动进程"]
+async fn 三节点能正常启动并接受连接() {
+    eprintln!("\n=== 启动 3 节点集群 ===");
+    let cluster = TestCluster::start().await;
+
+    eprintln!("\n=== 测试各节点连通性 ===");
+    for node_id in 1..=3 {
+        let mut client = cluster.client(node_id).await;
+
+        // 尝试调用 GetStreamMeta（不需要 Raft 初始化就能响应）
+        let result = client
+            .get_stream_meta(GetStreamMetaRequest {
+                stream_id: "test".to_string(),
+            })
+            .await;
+
+        match result {
+            Ok(resp) => {
+                eprintln!("✓ 节点 {} 响应正常: exists={}", node_id, resp.into_inner().exists);
+            }
+            Err(e) => {
+                eprintln!("✗ 节点 {} 响应失败: {}", node_id, e);
+                panic!("节点 {} 不可达", node_id);
+            }
+        }
+    }
+
+    eprintln!("\n=== 测试通过：3 个节点均可连接 ===");
+    cluster.shutdown();
+}
+
+#[tokio::test]
+#[ignore = "需启动多个进程，耗时较长"]
+async fn 三节点选主并复制日志() {
+    eprintln!("\n=== 启动 3 节点集群 ===");
+    let cluster = TestCluster::start().await;
+
+    eprintln!("\n=== 组建集群 ===");
+    cluster.form_cluster().await;
+
+    eprintln!("\n=== 校验选主结果 ===");
+    let leader = cluster.wait_for_leader(Duration::from_secs(10)).await;
+    eprintln!("✓ leader 是 node{leader}");
+
+    // 恰好一个 leader，且三个节点都认同它
+    let mut leaders = Vec::new();
+    for id in 1..=3u64 {
+        let s = cluster.raft_state(id).await;
+        eprintln!(
+            "  node{}: state={} term={} leader={:?} voters={:?}",
+            s.node_id,
+            s.server_state,
+            s.current_term,
+            if s.has_leader {
+                Some(s.current_leader)
+            } else {
+                None
+            },
+            s.voter_ids
+        );
+        if s.is_leader {
+            leaders.push(s.node_id);
+        }
+        assert!(s.has_leader, "node{id} 应已知 leader");
+        assert_eq!(s.current_leader, leader, "node{id} 认同的 leader 应一致");
+        assert_eq!(
+            s.voter_ids.len(),
+            3,
+            "node{id} 的投票成员应为 3 个，实际 {:?}",
+            s.voter_ids
+        );
+    }
+    assert_eq!(leaders.len(), 1, "同一 term 只能有一个 leader: {leaders:?}");
+
+    eprintln!("\n=== 向 leader 写入 ===");
+    let mut client = cluster.client(leader).await;
+    let resp = client
+        .append(AppendRequest {
+            stream_id: "replicated".to_string(),
+            expected_version: Some(ExpectedVersion {
+                kind: Some(expected_version::Kind::NoStream(Empty {})),
+            }),
+            events: vec![
+                NewEvent {
+                    event_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+                    event_type: "E".to_string(),
+                    data: b"one".to_vec(),
+                    metadata: vec![],
+                },
+                NewEvent {
+                    event_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+                    event_type: "E".to_string(),
+                    data: b"two".to_vec(),
+                    metadata: vec![],
+                },
+            ],
+        })
+        .await
+        .expect("append 到 leader")
+        .into_inner();
+    assert_eq!(resp.next_expected_version, 1);
+    eprintln!("✓ 写入成功，version=0..=1");
+
+    eprintln!("\n=== 校验日志已复制到 follower ===");
+    let applied = cluster.raft_state(leader).await.last_applied;
+    for id in 1..=3u64 {
+        if id == leader {
+            continue;
+        }
+        // 复制是异步的，轮询等 follower 追平
+        cluster.wait_applied(id, applied, Duration::from_secs(10)).await;
+
+        // 直接读 follower 的本地状态机，确认数据真的落到了对端
+        let mut c = cluster.client(id).await;
+        let mut s = c
+            .read_stream(ReadStreamRequest {
+                stream_id: "replicated".to_string(),
+                from_version: 0,
+                max_count: 0,
+                direction: Direction::Forward as i32,
+            })
+            .await
+            .expect("从 follower 读流")
+            .into_inner();
+
+        let mut events = Vec::new();
+        while let Some(r) = s.message().await.expect("读流式响应") {
+            events.extend(r.events);
+        }
+
+        assert_eq!(events.len(), 2, "follower node{id} 应有 2 条事件");
+        assert_eq!(events[0].data, b"one");
+        assert_eq!(events[1].data, b"two");
+        eprintln!("✓ node{id} 已复制 2 条事件");
+    }
+
+    eprintln!("\n=== 测试通过 ===");
+    cluster.shutdown();
+}
+
+#[tokio::test]
+#[ignore = "需启动多个进程，耗时较长"]
+async fn 非leader节点拒绝写入并可从其读取() {
+    let cluster = TestCluster::start().await;
+    cluster.form_cluster().await;
+    let leader = cluster.wait_for_leader(Duration::from_secs(10)).await;
+
+    // 先经 leader 写入
+    let mut lc = cluster.client(leader).await;
+    lc.append(AppendRequest {
+        stream_id: "s".to_string(),
+        expected_version: Some(ExpectedVersion {
+            kind: Some(expected_version::Kind::NoStream(Empty {})),
+        }),
+        events: vec![NewEvent {
+            event_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+            event_type: "E".to_string(),
+            data: b"x".to_vec(),
+            metadata: vec![],
+        }],
+    })
+    .await
+    .expect("leader 写入");
+
+    let follower = (1..=3u64).find(|id| *id != leader).expect("应有 follower");
+    let applied = cluster.raft_state(leader).await.last_applied;
+    cluster
+        .wait_applied(follower, applied, Duration::from_secs(10))
+        .await;
+
+    // 写请求打到 follower 必须被拒，且要告诉客户端 leader 在哪，
+    // 否则客户端只能盲目轮询其它节点
+    let mut fc = cluster.client(follower).await;
+    let err = fc
+        .append(AppendRequest {
+            stream_id: "s2".to_string(),
+            expected_version: Some(ExpectedVersion {
+                kind: Some(expected_version::Kind::Any(Empty {})),
+            }),
+            events: vec![NewEvent {
+                event_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+                event_type: "E".to_string(),
+                data: b"y".to_vec(),
+                metadata: vec![],
+            }],
+        })
+        .await
+        .expect_err("写 follower 应失败");
+
+    assert_eq!(
+        err.code(),
+        tonic::Code::Unavailable,
+        "非 leader 应返回可重试的 Unavailable，实际: {:?}",
+        err.code()
+    );
+    assert!(
+        err.message().contains("not leader"),
+        "错误信息应说明不是 leader: {}",
+        err.message()
+    );
+    // 必须带上 leader 地址，客户端据此重定向
+    let leader_addr = cluster.addr_of(leader);
+    assert!(
+        err.message().contains(&leader_addr),
+        "错误信息应含 leader 地址 {leader_addr}，实际: {}",
+        err.message()
+    );
+    eprintln!("✓ follower 拒绝写入并给出 leader 地址: {}", err.message());
+
+    // 客户端按提示重定向到 leader，应当成功
+    let mut redirected = cluster.client(leader).await;
+    redirected
+        .append(AppendRequest {
+            stream_id: "s2".to_string(),
+            expected_version: Some(ExpectedVersion {
+                kind: Some(expected_version::Kind::Any(Empty {})),
+            }),
+            events: vec![NewEvent {
+                event_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+                event_type: "E".to_string(),
+                data: b"y".to_vec(),
+                metadata: vec![],
+            }],
+        })
+        .await
+        .expect("重定向到 leader 后应写入成功");
+    eprintln!("✓ 重定向到 leader 后写入成功");
+
+    // 但读取可以走 follower（读本地已复制的状态机）
+    let mut s = fc
+        .read_stream(ReadStreamRequest {
+            stream_id: "s".to_string(),
+            from_version: 0,
+            max_count: 0,
+            direction: Direction::Forward as i32,
+        })
+        .await
+        .expect("从 follower 读")
+        .into_inner();
+    let mut events = Vec::new();
+    while let Some(r) = s.message().await.expect("读响应") {
+        events.extend(r.events);
+    }
+    assert_eq!(events.len(), 1, "follower 应能读到已复制的数据");
+    assert_eq!(events[0].data, b"x");
+    eprintln!("✓ follower 可读已复制数据");
+
+    cluster.shutdown();
+}
+
+#[tokio::test]
+#[ignore = "需启动多个进程，耗时较长"]
+async fn 杀掉leader后重新选主且数据不丢() {
+    let mut cluster = TestCluster::start().await;
+    cluster.form_cluster().await;
+
+    let old_leader = cluster.wait_for_leader(Duration::from_secs(10)).await;
+    eprintln!("✓ 初始 leader 是 node{old_leader}");
+
+    // 写入两条，确认已复制到全部 follower 再杀 leader，
+    // 这样才能断言「数据不丢」而非「数据还没来得及复制」
+    let mut lc = cluster.client(old_leader).await;
+    lc.append(AppendRequest {
+        stream_id: "failover".to_string(),
+        expected_version: Some(ExpectedVersion {
+            kind: Some(expected_version::Kind::NoStream(Empty {})),
+        }),
+        events: vec![
+            NewEvent {
+                event_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+                event_type: "E".to_string(),
+                data: b"before".to_vec(),
+                metadata: vec![],
+            },
+            NewEvent {
+                event_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+                event_type: "E".to_string(),
+                data: b"crash".to_vec(),
+                metadata: vec![],
+            },
+        ],
+    })
+    .await
+    .expect("写入旧 leader");
+
+    let applied = cluster.raft_state(old_leader).await.last_applied;
+    let survivors: Vec<u64> = (1..=3u64).filter(|id| *id != old_leader).collect();
+    for &id in &survivors {
+        cluster.wait_applied(id, applied, Duration::from_secs(10)).await;
+    }
+    eprintln!("✓ 数据已复制到 {survivors:?}");
+
+    // 杀掉 leader。剩下 2 个节点在 3 成员集群中仍构成多数派，应能选出新 leader
+    cluster.kill_node(old_leader);
+
+    let new_leader = cluster
+        .wait_leader_among(&survivors, Duration::from_secs(20))
+        .await;
+    assert_ne!(new_leader, old_leader, "新 leader 不该是被杀的节点");
+    eprintln!("✓ 新 leader 是 node{new_leader}");
+
+    // 崩溃前已提交的数据必须仍在
+    let mut nc = cluster.client(new_leader).await;
+    let mut s = nc
+        .read_stream(ReadStreamRequest {
+            stream_id: "failover".to_string(),
+            from_version: 0,
+            max_count: 0,
+            direction: Direction::Forward as i32,
+        })
+        .await
+        .expect("从新 leader 读")
+        .into_inner();
+    let mut events = Vec::new();
+    while let Some(r) = s.message().await.expect("读响应") {
+        events.extend(r.events);
+    }
+    assert_eq!(events.len(), 2, "崩溃前已提交的 2 条数据不能丢");
+    assert_eq!(events[0].data, b"before");
+    assert_eq!(events[1].data, b"crash");
+    eprintln!("✓ 崩溃前数据完好");
+
+    // 新 leader 应能继续接受写入，版本号从旧数据之后接续
+    let resp = nc
+        .append(AppendRequest {
+            stream_id: "failover".to_string(),
+            expected_version: Some(ExpectedVersion {
+                kind: Some(expected_version::Kind::Exact(1)),
+            }),
+            events: vec![NewEvent {
+                event_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+                event_type: "E".to_string(),
+                data: b"after".to_vec(),
+                metadata: vec![],
+            }],
+        })
+        .await
+        .expect("新 leader 应能写入")
+        .into_inner();
+    assert_eq!(resp.next_expected_version, 2, "版本号应接续到 2");
+    eprintln!("✓ 新 leader 可继续写入，version=2");
+
+    cluster.shutdown();
+}
+
+/// 从指定节点读取某个流的全部事件
+async fn read_stream_from(
+    cluster: &TestCluster,
+    node_id: u64,
+    stream_id: &str,
+) -> Vec<Event> {
+    let mut c = cluster.client(node_id).await;
+    let mut s = c
+        .read_stream(ReadStreamRequest {
+            stream_id: stream_id.to_string(),
+            from_version: 0,
+            max_count: 0,
+            direction: Direction::Forward as i32,
+        })
+        .await
+        .expect("read_stream")
+        .into_inner();
+    let mut out = Vec::new();
+    while let Some(r) = s.message().await.expect("读响应") {
+        out.extend(r.events);
+    }
+    out
+}
+
+/// 往指定节点写一条事件
+async fn append_to(
+    cluster: &TestCluster,
+    node_id: u64,
+    stream_id: &str,
+    data: &[u8],
+) -> AppendResponse {
+    let mut c = cluster.client(node_id).await;
+    c.append(AppendRequest {
+        stream_id: stream_id.to_string(),
+        expected_version: Some(ExpectedVersion {
+            kind: Some(expected_version::Kind::Any(Empty {})),
+        }),
+        events: vec![NewEvent {
+            event_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+            event_type: "E".to_string(),
+            data: data.to_vec(),
+            metadata: vec![],
+        }],
+    })
+    .await
+    .unwrap_or_else(|e| panic!("向 node{node_id} 写 {stream_id} 失败: {e}"))
+    .into_inner()
+}
+
+#[tokio::test]
+#[ignore = "需启动多个进程，耗时较长"]
+async fn 多分片各自选主且互不影响() {
+    const SHARDS: u64 = 3;
+    eprintln!("\n=== 启动 3 节点 × {SHARDS} 分片 ===");
+    let cluster = TestCluster::start_with_shards(SHARDS).await;
+    cluster.form_cluster().await;
+
+    eprintln!("\n=== 校验每个分片各自选出 leader ===");
+    let mut leaders = Vec::new();
+    for shard_id in 0..SHARDS {
+        let leader = cluster
+            .wait_leader_of_shard(shard_id, Duration::from_secs(15))
+            .await;
+        leaders.push(leader);
+
+        // 每个分片内部：唯一 leader、三节点认同一致、voters 为 3
+        let mut count = 0;
+        for id in 1..=3u64 {
+            let s = cluster.raft_state_of(id, shard_id).await;
+            if s.is_leader {
+                count += 1;
+            }
+            assert!(s.has_leader, "分片 {shard_id} node{id} 应已知 leader");
+            assert_eq!(
+                s.current_leader, leader,
+                "分片 {shard_id} 各节点认同的 leader 应一致"
+            );
+            assert_eq!(s.voter_ids.len(), 3, "分片 {shard_id} 应有 3 个投票成员");
+        }
+        assert_eq!(count, 1, "分片 {shard_id} 只能有一个 leader");
+        eprintln!("  ✓ 分片 {shard_id} leader = node{leader}");
+    }
+
+    eprintln!("\n=== 校验分片间数据隔离 ===");
+    // 写足够多的流，确保覆盖到多个分片
+    let mut by_shard: std::collections::HashMap<u64, Vec<String>> =
+        std::collections::HashMap::new();
+    for i in 0..30 {
+        let name = format!("ms-{i}");
+        // 写请求可能打到非 leader，逐节点重试直到成功
+        let mut done = None;
+        for node in 1..=3u64 {
+            let mut c = cluster.client(node).await;
+            if let Ok(r) = c
+                .append(AppendRequest {
+                    stream_id: name.clone(),
+                    expected_version: Some(ExpectedVersion {
+                        kind: Some(expected_version::Kind::NoStream(Empty {})),
+                    }),
+                    events: vec![NewEvent {
+                        event_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+                        event_type: "E".to_string(),
+                        data: name.as_bytes().to_vec(),
+                        metadata: vec![],
+                    }],
+                })
+                .await
+            {
+                done = Some(r.into_inner());
+                break;
+            }
+        }
+        let r = done.unwrap_or_else(|| panic!("{name} 在所有节点上都写入失败"));
+        by_shard.entry(r.shard_id).or_default().push(name);
+    }
+
+    assert!(
+        by_shard.len() >= 2,
+        "30 个流应至少落在 2 个分片上，实际 {:?}",
+        by_shard.keys().collect::<Vec<_>>()
+    );
+    eprintln!(
+        "  ✓ 流分布：{:?}",
+        by_shard
+            .iter()
+            .map(|(k, v)| (k, v.len()))
+            .collect::<Vec<_>>()
+    );
+
+    // 每个分片的 ReadAll 只应看到属于自己的流
+    for (shard_id, names) in &by_shard {
+        let mut c = cluster.client(1).await;
+        let mut s = c
+            .read_all(ReadAllRequest {
+                shard_ids: vec![*shard_id],
+                from_position: 0,
+                max_count: 0,
+                direction: Direction::Forward as i32,
+                from_positions: vec![],
+            })
+            .await
+            .expect("read_all")
+            .into_inner();
+        let mut got = Vec::new();
+        while let Some(r) = s.message().await.expect("读响应") {
+            got.extend(r.events);
+        }
+
+        let got_names: std::collections::HashSet<&str> =
+            got.iter().map(|e| e.stream_id.as_str()).collect();
+        let want_names: std::collections::HashSet<&str> =
+            names.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            got_names, want_names,
+            "分片 {shard_id} 的 ReadAll 应恰好含本分片的流"
+        );
+        // 分片内 position 严格递增
+        for w in got.windows(2) {
+            assert!(
+                w[1].position > w[0].position,
+                "分片 {shard_id} position 应严格递增"
+            );
+        }
+    }
+    eprintln!("  ✓ 各分片 ReadAll 数据互不串");
+
+    eprintln!("\n=== 校验跨分片 ReadAll 汇总全部数据 ===");
+    let all_shards: Vec<u64> = (0..SHARDS).collect();
+    let mut c = cluster.client(1).await;
+    let mut s = c
+        .read_all(ReadAllRequest {
+            shard_ids: all_shards,
+            from_position: 0,
+            max_count: 0,
+            direction: Direction::Forward as i32,
+            from_positions: vec![],
+        })
+        .await
+        .expect("跨分片 read_all")
+        .into_inner();
+    let mut merged = Vec::new();
+    while let Some(r) = s.message().await.expect("读响应") {
+        merged.extend(r.events);
+    }
+    assert_eq!(merged.len(), 30, "跨分片应汇总全部 30 条");
+
+    // 归并后各分片子序列仍保持 position 序
+    for shard_id in 0..SHARDS {
+        let seq: Vec<u64> = merged
+            .iter()
+            .filter(|e| e.shard_id == shard_id)
+            .map(|e| e.position)
+            .collect();
+        let mut sorted = seq.clone();
+        sorted.sort_unstable();
+        assert_eq!(seq, sorted, "分片 {shard_id} 在归并结果中应保持 position 序");
+    }
+    eprintln!("  ✓ 跨分片归并 30 条，各分片内序不乱");
+
+    eprintln!("\n=== 测试通过 ===");
+    cluster.shutdown();
+}
+
+#[tokio::test]
+#[ignore = "需启动多个进程，耗时较长"]
+async fn 节点重启后能重新加入并追平落后的数据() {
+    let mut cluster = TestCluster::start().await;
+    cluster.form_cluster().await;
+    let leader = cluster.wait_for_leader(Duration::from_secs(10)).await;
+    eprintln!("✓ leader = node{leader}");
+
+    // 选一个 follower 作为待重启节点
+    let victim = (1..=3u64).find(|id| *id != leader).expect("应有 follower");
+
+    // 第一批：重启前写入，重启后必须仍在（验证本地日志恢复）
+    append_to(&cluster, leader, "restart", b"before-1").await;
+    append_to(&cluster, leader, "restart", b"before-2").await;
+    let applied_before = cluster.raft_state(leader).await.last_applied;
+    cluster
+        .wait_applied(victim, applied_before, Duration::from_secs(10))
+        .await;
+    eprintln!("✓ 重启前 2 条已复制到 node{victim}");
+
+    // 停掉 victim
+    cluster.restart_node(victim).await;
+
+    // 重启后节点需要重新连上 leader 并追平。
+    // 期间 leader 仍在，剩余 2 节点构成多数派，写入不应受影响。
+    let applied_mid = cluster.raft_state(leader).await.last_applied;
+    assert_eq!(
+        applied_mid, applied_before,
+        "重启一个 follower 不应影响 leader 的已应用位置"
+    );
+
+    // 第二批：在 victim 停机期间写入，重启后应通过日志复制追上
+    append_to(&cluster, leader, "restart", b"during-1").await;
+    append_to(&cluster, leader, "restart", b"during-2").await;
+    append_to(&cluster, leader, "restart", b"during-3").await;
+    let applied_after = cluster.raft_state(leader).await.last_applied;
+    eprintln!("✓ 停机期间又写入 3 条，leader applied={applied_after}");
+
+    // 重启后的节点应追平到最新
+    cluster
+        .wait_applied(victim, applied_after, Duration::from_secs(20))
+        .await;
+    eprintln!("✓ node{victim} 已追平到 applied={applied_after}");
+
+    // 从重启后的节点读，5 条数据顺序完整
+    let events = read_stream_from(&cluster, victim, "restart").await;
+    let datas: Vec<&[u8]> = events.iter().map(|e| e.data.as_slice()).collect();
+    assert_eq!(
+        datas,
+        vec![
+            b"before-1".as_ref(),
+            b"before-2".as_ref(),
+            b"during-1".as_ref(),
+            b"during-2".as_ref(),
+            b"during-3".as_ref()
+        ],
+        "重启节点应恢复重启前数据并追平停机期间的数据"
+    );
+
+    // 版本号连续无空洞
+    let versions: Vec<u64> = events.iter().map(|e| e.version).collect();
+    assert_eq!(versions, vec![0, 1, 2, 3, 4], "版本应连续");
+    eprintln!("✓ 重启节点数据完整且版本连续");
+
+    cluster.shutdown();
+}

@@ -1,0 +1,17 @@
+[package]
+name = "es-core"
+description = "EventStore 核心领域模型：事件、流、乐观并发、HLC、分片路由"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+xxhash-rust = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

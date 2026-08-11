@@ -1,0 +1,5 @@
+# Rust 编译产物
+/target
+
+# 本地配置（含密钥/地址等敏感信息，提交前必须复制为 config.example.toml）
+/config.toml

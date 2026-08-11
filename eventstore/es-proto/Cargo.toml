@@ -1,0 +1,15 @@
+[package]
+name = "es-proto"
+description = "EventStore gRPC 协议定义与生成代码"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+prost = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }

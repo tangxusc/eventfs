@@ -1,0 +1,28 @@
+[package]
+name = "es-raft"
+description = "EventStore 共识层：TypeConfig、multi-raft 分片管理、gRPC RaftNetwork"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+es-core = { workspace = true }
+es-storage = { workspace = true }
+es-proto = { workspace = true }
+openraft = { workspace = true }
+surrealkv = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+uuid = { workspace = true }

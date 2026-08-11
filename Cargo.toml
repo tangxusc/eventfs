@@ -1,0 +1,72 @@
+[workspace]
+resolver = "3"
+members = [
+    "eventstore/es-proto",
+    "eventstore/es-core",
+    "eventstore/es-storage",
+    "eventstore/es-raft",
+    "eventstore/es-server",
+    "eventstore/es-client",
+]
+# 注：eventfs-fuse 目录已预留（FUSE daemon，把聚合根与事件映射为文件），
+# 尚未设计与实现，故暂不列为 workspace 成员，避免空目录导致 workspace 解析失败。
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# ---- 内部 crate ----
+es-proto = { path = "eventstore/es-proto" }
+es-core = { path = "eventstore/es-core" }
+es-storage = { path = "eventstore/es-storage" }
+es-raft = { path = "eventstore/es-raft" }
+es-client = { path = "eventstore/es-client" }
+
+# ---- 共识 ----
+# storage-v2：启用 RaftLogStorage/RaftStateMachine 为 v2 存储（详见 docs/design.md 2.2）
+# serde：为 Vote/Entry/AppendEntriesRequest 派生序列化，持久化与 gRPC payload 依赖
+openraft = { version = "0.9.25", features = ["storage-v2", "serde"] }
+
+# ---- 存储 ----
+surrealkv = "0.21.3"
+
+# ---- gRPC：tonic 0.14 已将 prost codec 拆为独立 crate ----
+tonic = "0.14.6"
+tonic-prost = "0.14.6"
+tonic-prost-build = "0.14.6"
+prost = "0.14.4"
+
+# ---- 异步运行时 ----
+tokio = { version = "1.48", features = ["full"] }
+tokio-stream = "0.1.19"
+futures = "0.3.33"
+async-trait = "0.1.92"
+
+# ---- 序列化 ----
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = { version = "2.0", features = ["serde"] }
+toml = "0.9"
+
+# ---- 工具 ----
+# xxh3 算法固定，跨版本稳定，可安全用于持久化分片路由
+xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
+uuid = { version = "1.11", features = ["v4", "serde"] }
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.6", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# ---- 测试 ----
+tempfile = "3.14"
+proptest = "1.5"
+
+# 磁盘空间有限：只保留行号表，backtrace 仍能定位到文件与行号，
+# 体积远小于完整调试信息。profile.test 继承 dev。
+[profile.dev]
+debug = "line-tables-only"

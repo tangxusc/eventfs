@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package eventstore.raft.v1;
+
+// 节点间 Raft 通信。每条消息携带 shard_id，用于路由到本节点对应的 Raft 实例。
+service RaftInternal {
+  rpc Vote(RaftRequest) returns (RaftReply);
+  rpc AppendEntries(RaftRequest) returns (RaftReply);
+  rpc InstallSnapshot(RaftRequest) returns (RaftReply);
+}
+
+// payload 采用序列化字节而非逐字段映射 protobuf。
+// 理由：openraft 的 VoteRequest/AppendEntriesRequest 等类型含大量泛型与内部结构，
+// 手工映射到 protobuf 会在 openraft 升级时全面失效，且极易出现字段遗漏这类静默错误。
+// 代价是抓包不能直接读出字段内容，仅影响可观测性，不影响功能完整性。
+message RaftRequest {
+  uint64 shard_id = 1;
+  bytes payload = 2;
+}
+
+message RaftReply {
+  // 成功时为序列化的响应；失败时为空
+  bytes payload = 1;
+  // 非空表示远端处理出错，内容为错误描述
+  string error = 2;
+}

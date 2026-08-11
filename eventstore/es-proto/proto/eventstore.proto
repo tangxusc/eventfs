@@ -1,0 +1,258 @@
+syntax = "proto3";
+
+package eventstore.v1;
+
+// 客户端 API：事件溯源读写与订阅
+service EventStore {
+  // 追加事件，携带乐观并发期望版本
+  rpc Append(AppendRequest) returns (AppendResponse);
+  // 读取单个流的事件区间，流式返回
+  rpc ReadStream(ReadStreamRequest) returns (stream ReadEventsResponse);
+  // 读取分片内 $all 流；跨分片仅按 (shard_id, position) 归并，非严格全序
+  rpc ReadAll(ReadAllRequest) returns (stream ReadEventsResponse);
+  // 订阅：先补齐历史（catch-up），追平后转为实时推送
+  rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
+  // 查询流元数据（当前版本等）
+  rpc GetStreamMeta(GetStreamMetaRequest) returns (GetStreamMetaResponse);
+}
+
+// 混合逻辑时钟：由 leader 在写入前分配并随事件落盘
+message Hlc {
+  uint64 wall = 1;    // 物理时间，毫秒
+  uint32 logical = 2; // 同毫秒内逻辑计数
+}
+
+// 乐观并发期望版本
+message ExpectedVersion {
+  oneof kind {
+    Empty any = 1;           // 不校验
+    Empty no_stream = 2;     // 要求流不存在
+    Empty stream_exists = 3; // 要求流已存在
+    uint64 exact = 4;        // 要求当前版本恰为该值
+  }
+}
+
+message Empty {}
+
+// 待写入事件，version/position/hlc 由服务端分配
+message NewEvent {
+  bytes event_id = 1;    // 16 字节 UUID，用于幂等去重
+  string event_type = 2;
+  bytes data = 3;
+  bytes metadata = 4;
+}
+
+// 已持久化事件
+message Event {
+  string stream_id = 1;
+  uint64 version = 2;
+  bytes event_id = 3;
+  string event_type = 4;
+  bytes data = 5;
+  bytes metadata = 6;
+  Hlc hlc = 7;
+  uint64 position = 8; // 分片内提交位置
+  uint64 shard_id = 9;
+}
+
+message AppendRequest {
+  string stream_id = 1;
+  ExpectedVersion expected_version = 2;
+  repeated NewEvent events = 3;
+}
+
+message AppendResponse {
+  uint64 next_expected_version = 1; // 追加后的当前版本
+  uint64 first_position = 2;        // 本批首条事件的分片内位置
+  uint64 last_position = 3;
+  uint64 shard_id = 4;
+}
+
+// 读取方向
+enum Direction {
+  DIRECTION_FORWARD = 0;
+  DIRECTION_BACKWARD = 1;
+}
+
+message ReadStreamRequest {
+  string stream_id = 1;
+  uint64 from_version = 2;
+  // 0 表示不限量，由服务端按流控上限截断
+  uint64 max_count = 3;
+  Direction direction = 4;
+}
+
+// 单个分片的读取游标
+message ShardPosition {
+  uint64 shard_id = 1;
+  // 起始 position（含）
+  uint64 from_position = 2;
+}
+
+message ReadAllRequest {
+  repeated uint64 shard_ids = 1;
+  // 所有分片统一的起始 position。
+  // 各分片的 position 序列相互独立，此字段表示「每个分片都从该值开始读」，
+  // 仅适合首页查询。翻页请用 from_positions。
+  uint64 from_position = 2;
+  uint64 max_count = 3;
+  Direction direction = 4;
+  // 逐分片游标。非空时覆盖 shard_ids 与 from_position。
+  //
+  // 翻页必须用它：跨分片归并后，各分片被消费到的位置不同，
+  // 用单一 from_position 续读会重复或漏掉事件。
+  // 客户端可从上一页结果中按 shard_id 取各自最大的 position + 1 构造。
+  repeated ShardPosition from_positions = 5;
+}
+
+message ReadEventsResponse {
+  repeated Event events = 1;
+}
+
+message SubscribeRequest {
+  oneof target {
+    string stream_id = 1; // 订阅单个流
+    Empty all = 2;        // 订阅全部分片
+  }
+  // 起始位置：订阅流时按 version，订阅 all 时按 position
+  uint64 from_exclusive = 3;
+  // true 表示从头开始，忽略 from_exclusive
+  bool from_start = 4;
+}
+
+message SubscribeResponse {
+  oneof payload {
+    Event event = 1;
+    // catch-up 阶段结束、转入实时推送的分界信号
+    Empty caught_up = 2;
+  }
+}
+
+message GetStreamMetaRequest {
+  string stream_id = 1;
+}
+
+message GetStreamMetaResponse {
+  bool exists = 1;
+  // 仅当 exists 为 true 时有意义
+  uint64 current_version = 2;
+  uint64 shard_id = 3;
+}
+
+// ============================================================================
+// Raft 内部 RPC：节点间复制与选举（不暴露给客户端）
+// ============================================================================
+
+// Raft 节点间通信服务
+service RaftRpc {
+  // 追加日志条目（含心跳）
+  rpc AppendEntries(RaftAppendEntriesRequest) returns (RaftAppendEntriesResponse);
+  // 请求投票
+  rpc Vote(RaftVoteRequest) returns (RaftVoteResponse);
+  // 安装快照
+  rpc InstallSnapshot(RaftInstallSnapshotRequest) returns (RaftInstallSnapshotResponse);
+}
+
+// AppendEntries RPC：leader 向 follower 复制日志
+//
+// 每个请求都必须带 shard_id：本节点为每个分片各持有一个独立的 Raft 实例，
+// 收到消息后要据此路由到对应实例。缺了它就只能硬编码到某个分片，
+// 多分片下会把所有 Raft 消息都投递给错误的实例。
+message RaftAppendEntriesRequest {
+  uint64 shard_id = 1;
+  // 序列化的 openraft::AppendEntriesRequest<TypeConfig>
+  // 用 bincode 序列化，避免在 proto 中展开泛型类型
+  bytes payload = 2;
+}
+
+message RaftAppendEntriesResponse {
+  bytes payload = 1; // openraft::AppendEntriesResponse
+}
+
+// Vote RPC：candidate 请求投票
+message RaftVoteRequest {
+  uint64 shard_id = 1;
+  bytes payload = 2; // openraft::VoteRequest
+}
+
+message RaftVoteResponse {
+  bytes payload = 1; // openraft::VoteResponse
+}
+
+// InstallSnapshot RPC：leader 向落后节点发送快照
+message RaftInstallSnapshotRequest {
+  uint64 shard_id = 1;
+  bytes payload = 2; // openraft::InstallSnapshotRequest
+}
+
+message RaftInstallSnapshotResponse {
+  bytes payload = 1; // openraft::InstallSnapshotResponse
+}
+
+// ============================================================================
+// Raft 集群管理 API：组建集群与查询状态
+// ============================================================================
+
+service RaftAdmin {
+  // 初始化集群：把给定成员写入首条 membership 日志。只需在一个节点上调用一次。
+  rpc Initialize(InitializeRequest) returns (InitializeResponse);
+  // 添加学习者：仅接收日志，不参与投票，用于新节点追平数据
+  rpc AddLearner(AddLearnerRequest) returns (AddLearnerResponse);
+  // 变更成员：把学习者提升为投票成员，或移除成员
+  rpc ChangeMembership(ChangeMembershipRequest) returns (ChangeMembershipResponse);
+  // 查询某分片的 Raft 运行状态
+  rpc GetRaftState(GetRaftStateRequest) returns (GetRaftStateResponse);
+}
+
+// 集群成员：node_id 与其 Raft RPC 地址
+message RaftMember {
+  uint64 node_id = 1;
+  // 形如 "http://127.0.0.1:50051"，供其它节点回连
+  string addr = 2;
+}
+
+message InitializeRequest {
+  uint64 shard_id = 1;
+  repeated RaftMember members = 2;
+}
+
+message InitializeResponse {}
+
+message AddLearnerRequest {
+  uint64 shard_id = 1;
+  RaftMember member = 2;
+  // true 表示等该学习者追平日志后再返回
+  bool blocking = 3;
+}
+
+message AddLearnerResponse {}
+
+message ChangeMembershipRequest {
+  uint64 shard_id = 1;
+  // 变更后的完整投票成员集合
+  repeated uint64 voter_ids = 2;
+  // true 表示被移除的成员降级为学习者而非直接剔除
+  bool retain = 3;
+}
+
+message ChangeMembershipResponse {}
+
+message GetRaftStateRequest {
+  uint64 shard_id = 1;
+}
+
+message GetRaftStateResponse {
+  uint64 node_id = 1;
+  // "Leader" / "Follower" / "Candidate" / "Learner"
+  string server_state = 2;
+  bool is_leader = 3;
+  // 当前已知的 leader，未知时 has_leader 为 false
+  bool has_leader = 4;
+  uint64 current_leader = 5;
+  uint64 current_term = 6;
+  bool has_last_log_index = 7;
+  uint64 last_log_index = 8;
+  bool has_last_applied = 9;
+  uint64 last_applied = 10;
+  repeated uint64 voter_ids = 11;
+}
