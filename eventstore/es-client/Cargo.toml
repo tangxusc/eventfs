@@ -18,3 +18,8 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# e2e 测试起进程内真实服务器（测试专用依赖环，es-ctl 已有先例）
+es-server = { workspace = true }
+tempfile = { workspace = true }

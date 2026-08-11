@@ -260,8 +260,8 @@ cargo bench -p es-storage
 以下为未实现的功能与计划（不承诺时间）：
 
 **客户端 SDK**
-- [ ] `es-client` 封装剩余 API：`ReadAll` / `Subscribe` / `GetStreamMeta`（当前需直接用 `es-proto` 生成的 gRPC 客户端）
-- [ ] `es-client` 内置 leader 重定向重试（当前需调用方处理 `Unavailable` 响应中的 `leader_addr`）
+- [x] `es-client` 封装剩余 API：`ReadAll` / `Subscribe` / `GetStreamMeta`（此前需直接用 `es-proto` 生成的 gRPC 客户端）
+- [x] `es-client` 内置 leader 重定向重试（此前需调用方处理 `Unavailable` 响应中的 `leader_addr`）
 - [ ] 多语言客户端（Python / Go / Java）
 
 **存储与快照**
@@ -291,7 +291,9 @@ cargo bench -p es-storage
 ## 已知限制
 
 - **写入必须打到 leader**：服务端不做透明转发。非 leader 返回 `Unavailable`，
-  message 中带 `leader_addr=...`，客户端据此重定向。`es-client` 尚未内置该重试逻辑。
+  message 中带 `leader_addr=...`。`es-client`（append）与 `es-ctl`（with_leader）
+  均已内置重定向重试（策略共用 `es-core::redirect`）；直接使用 gRPC 客户端的
+  调用方需自行处理。
 - **向被隔离的旧 leader 写入会挂起而非快速失败**：openraft 0.9 无租约退位机制，
   被隔离的 leader 在自己视角里仍是 leader。客户端必须设写超时。
 - **跨分片非严格全序**：`ReadAll` 按 HLC 归并，只保证分片内严格按 position。

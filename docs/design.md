@@ -3,7 +3,7 @@
 分布式事件存储中间件。独立进程启动，多节点集群，基于 openraft 共识与 surrealkv 嵌入式存储，
 客户端与节点间通信统一使用 gRPC。
 
-- 文档版本：1.1（2026-08-11 同步实现现状）
+- 文档版本：1.2（2026-08-11 es-client 完整 API + 内置 leader 重定向）
 - 建立日期：2026-08-10
 - 状态：已实现，本文与代码现状一致；标注「已实现」的章节以代码为准
 
@@ -295,8 +295,8 @@ pub fn route(stream_id: &str, shard_count: u64) -> u64 {
 ```protobuf
 service EventStore {
   rpc Append(AppendRequest) returns (AppendResponse);
-  rpc ReadStream(ReadStreamRequest) returns (stream ReadStreamResponse);
-  rpc ReadAll(ReadAllRequest) returns (stream ReadStreamResponse);
+  rpc ReadStream(ReadStreamRequest) returns (stream ReadEventsResponse);
+  rpc ReadAll(ReadAllRequest) returns (stream ReadEventsResponse);
   rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
   rpc GetStreamMeta(GetStreamMetaRequest) returns (GetStreamMetaResponse);
 }
@@ -304,7 +304,9 @@ service EventStore {
 
 写请求打到非 leader 时，返回 `Unavailable`（gRPC 可重试语义），message 中携带
 `leader_addr=...`，由客户端重定向重试。服务端不做透明转发，避免持有到其它节点的
-业务连接而扩大故障域。
+业务连接而扩大故障域。`es-client`（append）与 `es-ctl`（with_leader）均已内置
+重定向重试，解析与预算制重试队列下沉为 `es-core::redirect` 共用；直接使用
+gRPC 客户端的调用方需自行解析重定向。
 
 ### 7.2 节点间 Raft API
 
