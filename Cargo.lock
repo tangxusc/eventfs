@@ -639,9 +639,11 @@ version = "0.1.0"
 dependencies = [
  "es-core",
  "es-proto",
+ "es-server",
  "futures",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
