@@ -114,6 +114,24 @@ addr = "127.0.0.1:50053"
 直接 `Initialize([1,2,3])` 也收敛（随机化选举超时，已实测），单成员自举可保证
 全程有 leader，便于排障。参考实现见 `es-server/tests/multi_node_test.rs` 的 `form_shard`。
 
+### TLS（https，可选）
+
+配置 `[tls]`（`cert_file` + `key_file`，PEM）即启用 TLS 监听；**TLS 部署时所有节点
+`peers.addr` 必须显式写 `https://` 前缀**（裸地址会被补成 `http://`，节点间会以明文
+直连 TLS 端口而失败）。证书可用 openssl 生成自签：
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -keyout server.key -out server.crt \
+  -days 365 -subj "/CN=127.0.0.1" -addext "subjectAltName=IP:127.0.0.1"
+```
+
+信任策略（节点间 RPC、RaftAdmin 探测、客户端 API 统一）：
+- **默认跳过证书校验**（自签友好，等价 curl -k）——仅建议内网/开发环境
+- 配置 `ca_file` 后**严格校验**对端证书链（生产建议）——多自签节点需把全部节点证书
+  拼接进同一 ca 文件，或使用真实 CA 签发
+
+示例见 `config.example.toml`。证书轮换需重启节点生效。
+
 ### 客户端
 
 ```rust
@@ -138,6 +156,18 @@ println!("shard={} position={}", resp.shard_id, resp.first_position);
 ```
 
 完整示例：`cargo run --example client_example`（需先启动并组建好集群）。
+
+连接 https 节点：`connect` 对 https 地址默认跳过证书校验；需要严格校验时用
+`connect_with_tls`（CA 为 PEM 字节，可含多张证书）：
+
+```rust
+use es_client::{EventStoreClient, TlsClientConfig};
+
+let mut client = EventStoreClient::connect_with_tls(
+    vec!["https://127.0.0.1:50051".to_string()],
+    Some(TlsClientConfig::Ca(std::fs::read("ca.crt")?)),
+).await?;
+```
 
 ## 测试
 
@@ -235,7 +265,8 @@ cargo bench -p es-storage
 | Rust | 1.88+ / edition 2024 | |
 | openraft | 0.9.25 | features: `storage-v2`, `serde` |
 | surrealkv | 0.21.3 | 单 Tree 多分片，key 前缀隔离 |
-| tonic | 0.14.6 | prost codec 已拆为 `tonic-prost` |
+| tonic | 0.14.6 | features: `tls-ring`（https 节点间通信与客户端 API） |
+| rustls | 0.23 | ring 后端；TLS 信任策略封装在 es-proto |
 | tokio | 1.48 | |
 | xxhash-rust | 0.8.18 | xxh3 算法固定，可安全用于持久化路由 |
 

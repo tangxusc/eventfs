@@ -68,6 +68,26 @@
 
 仅加 `tonic` + `prost` 可以编译通过（spike 即如此），但一旦真正生成并使用 gRPC 代码就会失败。
 
+**TLS（https）**：tonic 需显式开 `tls-ring` feature（rustls ring 后端，tokio-rustls 0.26 →
+rustls 0.23）；rustls 直接依赖仅 es-proto 一处（`NoCertVerify` 内部实现，类型不外泄）。
+客户端跳过校验的唯一官方路径是 `Endpoint::tls_config_with_verifier` + 自定义
+`ServerCertVerifier`——注意 tonic 生成代码的 `connect` 对 https 自动套空 roots
+（自签必然失败），所有 https 装配必须统一走 `es_proto::tls::apply_endpoint_tls`。
+
+## 2.3 TLS 信任策略与地址语义
+
+- **监听协议**由 `[tls]`（cert_file+key_file）存在性决定；`listen_addr` 保持裸 bind 地址。
+- **对端协议**由 `peers.addr` 的 scheme 决定（`normalize_endpoint` 保留 http/https 前缀，
+  裸地址补 http）——**TLS 部署必须显式写 `https://`**，混合 http/https 集群按 peer
+  scheme 逐端应用，天然支持。
+- **信任策略**：`[tls].ca_file` 存在 → 严格校验对端证书链（PEM 可含多张，多自签节点
+  需拼接全部证书）；缺省 → 跳过校验（自签友好，等价 curl -k，仅建议内网/开发）。
+  读取失败绝不静默降级（bootstrap 跳过组建并告警）。
+- **es-client**：`connect` 对 https 默认跳过校验；`connect_with_tls(nodes, Ca(pem))`
+  严格校验。
+- **安全含义**：跳过校验的部署可被中间人攻击；生产建议 ca_file 严格校验。
+  证书轮换需重启节点生效（serve 每次从磁盘重读）。
+
 ## 3. 整体架构
 
 ```

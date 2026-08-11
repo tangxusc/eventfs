@@ -6,19 +6,30 @@ listen_addr = "127.0.0.1:50051"
 
 # 集群节点列表（3 节点示例）。非空即触发启动时自动组建集群（etcd 静态引导语义）：
 # - 必须包含本节点，且所有节点配置完全一致（不一致可能形成双集群）
-# - addr 可省略 http:// 前缀
+# - addr 可省略 http:// 前缀（省略时按 http 处理）；TLS 部署必须显式写 https://
 # - 留空则不自动组建，需经 RaftAdmin 手动组建
 [[node.peers]]
 id = 1
-addr = "127.0.0.1:50051"
+addr = "https://127.0.0.1:50051"
 
 [[node.peers]]
 id = 2
-addr = "127.0.0.1:50052"
+addr = "https://127.0.0.1:50052"
 
 [[node.peers]]
 id = 3
-addr = "127.0.0.1:50053"
+addr = "https://127.0.0.1:50053"
+
+# TLS 配置（可选）。配置即启用 TLS 监听（listen_addr 变为 https 服务）：
+# - cert_file / key_file 必须成对提供（PEM 格式）
+# - ca_file 可选：配置后节点间 RPC / 客户端 API 对 https:// 对端严格校验证书链；
+#   缺省跳过校验（自签证书场景，等价 curl -k）
+# - TLS 部署时所有节点 peers 的 addr 必须写 https:// 前缀（裸地址会被补成 http://）
+# - 证书轮换需要重启节点生效
+[tls]
+cert_file = "./certs/server.crt"
+key_file = "./certs/server.key"
+ca_file = "./certs/ca.crt"   # 可选；删掉本行则跳过校验
 
 [storage]
 data_dir = "./data/node1"
