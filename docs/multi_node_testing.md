@@ -178,7 +178,7 @@ CI 中应作为独立阶段执行。
 | **反向读取** | `read_*_backward` 倒扫 | 2 项 e2e | 实现细节在 `key.rs` / `state_machine.rs` 注释 |
 | **在线迁移** | esctl migrate（状态机 + Migration 原语） | e2e（`es-ctl/tests/e2e_test.rs`） | 见 `migrate.md` 完整设计 |
 
-**测试总数:默认套件 85 项 + 多节点 6 项(`--ignored`),全部通过。**
+**测试总数：全量 422 项（含多节点 12 项 `--ignored`）全部通过。**
 
 ## 跨分片 ReadAll 设计要点
 

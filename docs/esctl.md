@@ -57,7 +57,7 @@ esctl meta <STREAM>
 ```
 
 - `read` 与 `readall` 走本地副本，follower 也可读（任一可达端点即可）
-- `read`/`meta` 读未创建（路由表无记录）的流 → NotFound（退出码 1）
+- `read` 读未创建（路由表无记录）的流 → NotFound（退出码 1）；`meta` 读未创建流 → `exists: false`（退出码 0）
 - `--max-count 0` 表示不限量；`--backward` 反向读，未指定 `--from-version` 时从最新开始
 - `readall` 的 `--from-positions` 非空时覆盖 `--from-position` 与 `--shard-ids`；
   `--max-count` 取满时输出下一页续读游标（json 为 `next_from_positions` 字段，
@@ -140,14 +140,14 @@ esctl snapshot restore <data_dir> <snapshot_file> [--snapshot-dir <DIR>] [--yes]
 ### 流路由表
 
 ```
-esctl route [--recount] [--check]
+esctl route [--show] [--recount] [--check]
 ```
 
 查看/校准流路由表（stream → shard 归属）。
 
 - 默认展示路由表：逐条 `stream -> shard N` + 表版本（`version=N`）；
   json 格式含 `streams` 与 `shard_stream_counts`
-- `--recount`：校准 per-shard 流计数（从路由表重建，版本不变），并输出校准后的表
+- `--recount`：校准 per-shard 流计数（从路由表重建，**版本 +1 并广播**——否则校准只对本节点生效），并输出校准后的表
 - `--check`（与 `--recount` 互斥）：**孤儿流检测**——枚举各分片实际存储的流
   （`ListStreams`，打各 shard leader）与路由表对比：
   - **孤儿**：存储中有但路由表无记录（隐式建流跨节点竞态等残留），

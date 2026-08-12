@@ -45,7 +45,8 @@ memtable_arena_bytes = 4194304
 
 # 分片放置表（替代旧 [shards] num_shards）：
 # - 每个 shard 一个 raft group，成员 = 放置表中承载它的全部节点
-# - replication_factor：每个 shard 的投票成员数（primary + replica 合计），默认 2
+# - replication_factor：每个 shard 的投票成员数（primary + replica 合计），默认 1
+#   （示例中显式配置为 2，生产建议 2+ 副本）
 # - primary：主承载（管理偏好标签，leader 仍由 raft 选举产生）
 # - replica：副本承载
 # - 不变式（启动校验强制）：primary 分区互斥、每 shard 承载数 == replication_factor

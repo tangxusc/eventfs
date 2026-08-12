@@ -5,7 +5,7 @@
 
 - 文档版本：1.3（2026-08-12 显式放置表 + 流路由表 + 在线迁移）
 - 建立日期：2026-08-10
-- 状态：已实现，本文与代码现状一致；标注「已实现」的章节以代码为准
+- 状态：已实现；标注「已实现」的章节**以代码为准**
 
 ## 1. 已确认的设计决策
 
@@ -303,7 +303,7 @@ pub struct Hlc {
 按已确认方案，`$all` **不提供跨分片严格全序**。服务端提供：
 
 - 分片内严格有序：按 `position` 递增，与 Raft 提交顺序一致
-- 跨分片：`ReadAll` 按 `(shard_id, position)` 归并，并暴露 HLC 供消费者按需排序
+- 跨分片：`ReadAll` 按 **HLC 归并**（每路内部保持 position 序；shard_id/position 仅作并列定序），HLC 随事件暴露供消费者按需排序
 
 消费者（含 `eventfs-fuse`）需接受跨分片存在有界乱序。
 per-stream 顺序始终严格，因为单 stream 恒在单一分片内。
@@ -332,14 +332,14 @@ pub struct RouteTable {
 - 已存在的流返回现有归属（写锁内双检查），不重复分配、不 bump 版本。
 - 计数允许漂移（删除/迁移不精确扣减），由 `Migration.RecountStreams` 校准
   （`esctl route recount`）。
-- 分配成功后版本 +1、落盘（temp + rename 原子写）、整表广播到全部 peers。
+- 分配成功后版本 +1、落盘（temp + rename **+ 文件/目录 fsync**——掉电后路由回退会让流被重新分配、旧事件成孤儿）、整表广播到全部 peers。
 
 ### 6.2 跨节点收敛
 
 - **整表广播 + 版本仲裁**：变更节点 `PushRouteTable` 全表广播，接收方
-  **只采纳版本更高的表**（幂等，重复广播无害）；广播失败仅告警，下次变更
+  **只采纳版本更高的表**（幂等，重复广播无害）；广播/拉取带 **2s 超时**（peer 挂起不阻塞本节点路由表操作）；广播失败仅告警，下次变更
   全表重发自愈。
-- **启动加载**：本地 `routes.json` 优先；缺失（新节点）时向 peers 拉取
+- **启动加载**：本地文件与 peers 取**版本最高**的表（本地缺失时向 peers 拉取；本地存在时也比对——节点离线期间集群路由表可能已前进）
   （`GetRouteTable`，首个成功者）。
 - **本地文件热更新**：watcher 监听 routes.json，运维手工修改文件（版本更高）
   同样生效；损坏文件保留内存旧表并告警。
@@ -350,9 +350,11 @@ pub struct RouteTable {
 - **写**（Append）：路由表命中直接返回归属；未命中 = **隐式建流**，分配并记录
   （锁内双检查，同节点并发不重复分配）。写请求打到未承载该 shard 的节点时，
   返回与本地 ForwardToLeader 同格式的 leader 重定向提示。
-- **读**（ReadStream / GetStreamMeta）：**只查不分配**（读无副作用）；未知流
-  （从未创建或路由表缺失）→ **NotFound**——显式分配语义：流必须先创建
+- **读**（ReadStream / GetStreamMeta）：**只查不分配**（读无副作用）。未知流
+  （从未创建或路由表缺失）→ ReadStream 返回 **NotFound**；GetStreamMeta 返回
+  `exists=false`（不报错，退出码 0）——显式分配语义：流必须先创建
   （CreateStream 或首次写入）才能读。
+- `event_id` 必须是合法 **16 字节 UUID**，否则 Append/CreateStream 相关写入返回 `InvalidArgument`（静默替换会破坏幂等去重）。
 - 服务端是路由的**唯一权威**。es-core 仍保留 `hash(stream_id) % count` 的
   `route()` 函数，但仅作 esctl 的**客户端预选提示**（选起始探测端点、
   预显示分片，以服务端落盘为准），不参与数据寻址。
@@ -371,8 +373,16 @@ pub struct RouteTable {
 加节点 = 更新**所有节点**配置（新增节点 + 新增 shards 行）→ 各节点 watcher
 热加载配置（fail-soft：解析/校验失败保留旧配置、服务不受影响）→ diff 出新增的
 本地 shards → 逐个 `factory::create_shard`（与启动共用单一代码路径）→ 注册 →
-单分片自举（`bootstrap_new_shard`，幂等）。配置中移除的 shard 仅告警，
-数据目录保留，重新加入时幂等打开恢复。**全程无需重启**。
+单分片自举（`bootstrap_new_shard`，幂等）。配置中移除的 shard 仅告警（提示
+`route check` 检测残留流），数据目录保留，重新加入时幂等打开恢复。**全程无需重启**。
+
+实现细节（评审修复）：
+- 热更新按**实际节点 id** 计算 local_shards（`--node-id` 覆盖启动时不用文件里的
+  node.id，避免把别的节点的分片创建/自举到本节点形成幽灵 raft group）
+- **分配池延迟到全部新 shards 创建成功后才更新**——避免扩容窗口内新流被
+  分配到尚未就绪的 shard（append 重定向失败且流永久钉在新建分片上）
+- watcher 事件**前置过滤**（FSEvents 目录 watch 是递归的，surrealkv 写活动
+  产生事件风暴会挤掉配置变更事件）
 
 ## 7. gRPC 接口
 
@@ -473,7 +483,7 @@ catch-up 与 live 两阶段：
 2. 追平后切到 `tokio::sync::broadcast`（每分片一个通道）接收实时事件
 
 切换点需处理边界：先订阅 broadcast 再做最后一段扫描，避免两阶段之间漏事件。
-broadcast 落后（`RecvError::Lagged`）时退回扫描存储补齐，不直接断开订阅。
+广播落后（`RecvError::Lagged`）时直接关闭订阅，客户端需重新订阅（`--once` 场景以退出码 1 报错）。
 
 ### 7.5 路由表同步与在线迁移 API（Migration 服务，节点间）
 
@@ -483,7 +493,7 @@ broadcast 落后（`RecvError::Lagged`）时退回扫描存储补齐，不直接
 |---|---|
 | `GetRouteTable` / `PushRouteTable` | 拉取/推送路由表（整表广播；接收方按版本仲裁采纳，见 §6.2） |
 | `SetStreamShard` | 原子切换流归属（迁移切换点），路由表版本 +1 并广播 |
-| `RecountStreams` | 校准 per-shard 流计数（版本不变） |
+| `RecountStreams` | 校准 per-shard 流计数（**版本 +1 并广播**——同版本会被接收方忽略，校准只对本节点生效） |
 | `AppendMigrated` | 迁移复制写入：单事件一条 raft 日志、**保留源 HLC**、按显式 shard 寻址（不走路由表、不隐式建流） |
 | `DeleteStreamFromShard` | 迁移清尾：删除源 shard 上的流（幂等 no-op） |
 | `ReadStreamFromShard` | 显式 shard 读流（迁移排水/校验用；路由表已切换时仍可读源） |
@@ -518,7 +528,7 @@ memtable_arena_bytes = 4194304    # 每 shard 的 LSM memtable arena（默认 4M
 
 # 分片放置表（替代旧 [shards] num_shards；完整示例见 config.example.toml）
 # - 每个 shard 一个 raft group，成员 = 放置表中承载它的全部节点
-# - replication_factor：每 shard 投票成员数（primary + replica 合计），默认 2
+# - replication_factor：每 shard 投票成员数（primary + replica 合计），默认 1
 # - primary 是管理偏好标签（leader 仍由 raft 选举产生）
 # - 不变式（启动校验强制）：primary 分区互斥、每 shard 承载数 == rf
 # - 配置变更（加节点/加 shards）由 watcher 热加载后运行期生效，无需重启（见 6.5）
@@ -547,7 +557,7 @@ replica = [2, 3]
 | 单元测试 | key 编码往返与**排序性质**（随机 index 排序后字节序须一致）、路由表分配与版本仲裁（最少流、双检查、recount、跨节点仲裁）、HLC 单调性、`ExpectedVersion` 校验矩阵 |
 | 存储层测试 | RaftLogStorage 语义（append/truncate/purge/无空洞不变量）、apply 幂等性、快照往返 |
 | 端到端测试 | 3 节点真实集群：启动选主、写读一致性、乐观并发冲突、leader 故障转移、重启恢复、订阅 catch-up 到 live 切换、显式建流/隐式建流/读未建流 NotFound、在线迁移（esctl migrate） |
-| 模糊测试 | 随机 stream 名（含 Unicode、前缀包含、空串）、随机并发 Append、随机 `expected_version`，断言不变量：版本连续无空洞、无重复、per-stream 严格有序 |
+| 模糊测试 | 路由表分配不变量（proptest 随机流名/计数）；随机 Append/DeleteStream 序列（确定性 LCG），断言不变量：版本连续无空洞、per-stream 严格有序 |
 
 key 编码的排序性质测试是重点：第 2.1 节的大端约束若被破坏，
 错误表现为范围扫描静默返回错误数据，而非崩溃，只有排序性质断言能捕获。

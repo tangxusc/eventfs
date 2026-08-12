@@ -136,7 +136,7 @@ last_applied 的快照文件（restore/崩溃残留的「更新」文件与状�
 恢复后:单节点以快照点直接恢复领导（vote 保留）;多节点由 leader 复制快照点
 之后的日志或新快照。**需集群停机**（LOCK 安全网,在线执行直接拒绝）。
 
-### 生产配置（`es-server/src/server.rs`）
+### 生产配置（`es-server/src/factory.rs`）
 
 ```rust
 openraft::Config {

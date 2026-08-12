@@ -27,7 +27,7 @@ Preparing → FullCopying → Tailing → Switching → Draining → Verifying �
 | 阶段 | 动作 | 失败语义 |
 |---|---|---|
 | **Preparing** | 路由表查源归属（无记录 = 孤儿流 → 枚举分片自动定位）；**源 == 目标不报错**——检查其它分片是否有残留数据，有则直接进入排水收尾（上次切换后中断的自愈），无则提示完成；目标分片存在性检查；读源/目标元数据得版本差（dry-run 只报告此差） | 未产生任何写入，重跑安全 |
-| **FullCopying** | 从「目标当前版本 +1」读源 `[from, to]` 补差（每批 500 条，打源 leader 本地存储读），逐条写目标（Exact 版本链）；循环直到追平源当前版本 | 已写事件被幂等索引挡住，重跑从目标当前版本续 |
+| **FullCopying** | 从「目标当前版本 +1」读源 `[from, to]` 补差（每批 500 条，打源 leader 本地存储读），逐条写目标（Exact 版本链）；**追平判据 = 连续 3 轮复制后源版本无增长**；源持续生产（复制速率 < 生产速率）由 100 轮上限兜底——强制切换，剩余差量在排水期收敛 | 已写事件被幂等索引挡住，重跑从目标当前版本续 |
 | **Tailing** | 与 FullCopying 同一循环——FullCopying 追平时窗口内新写可能已落源，循环直到版本再次收敛 | 同上 |
 | **Switching** | `SetStreamShard` 原子切换路由表（版本 +1 + 落盘 + 整表广播），**切换点** | 失败则未切换，重跑从 Preparing 开始 |
 | **Draining** | 切换后客户端新写直达目标（路由已切）；复制从目标当前版本续，天然兼容并发写入；**客户端写入占用版本槽（Exact 冲突）时自动改用 Any 兜底**——目标分配新版本，事件载荷/event_id/hlc 保真，version 允许重排（数据保真优先）；收敛判据 = **目标版本 ≥ 源版本且源连续 N 轮安静**（`--drain-quiet-rounds`，间隔 2s） | 排水超时（`--drain-timeout-secs`，默认 300s）退出：数据无害（源未动、目标只多不少），可重跑完成排水 |
@@ -42,7 +42,7 @@ Preparing → FullCopying → Tailing → Switching → Draining → Verifying �
 
 | 原语 | 幂等性保证 |
 |---|---|
-| `AppendMigrated` | 单事件一条 raft 日志，**hlc 保留源值**（迁移保真要求），期望版本链由工具驱动（version 0 用 `NoStream`，其余 `Exact(v-1)`）；**排水阶段冲突时工具自动改用 Any 兜底**；幂等索引逐事件记录 → 重放返回原结果，**断点续传不重复** |
+| `AppendMigrated` | 单事件一条 raft 日志，**hlc 保留源值**（迁移保真要求），期望版本链由工具驱动（version 0 用 `NoStream`，其余 `Exact(v-1)`）；**排水阶段冲突时工具自动改用 Any 兜底**；幂等索引逐事件记录 → 重放返回原结果，**断点续传不重复**；`event_id` 必须是合法 16 字节 UUID（否则 InvalidArgument） |
 | `SetStreamShard` | 切换是路由表版本号原子点；同值切换不重复 bump；接收方按版本仲裁，重复广播无害 |
 | `DeleteStreamFromShard` | 不存在的流 no-op |
 

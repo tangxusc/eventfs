@@ -1,6 +1,6 @@
 [package]
 name = "es-ctl"
-description = "EventStore 命令行管理工具（参照 etcdctl）：数据面读写、订阅、集群管理、离线 reshard"
+description = "EventStore 命令行管理工具（参照 etcdctl）：数据面读写、订阅、集群管理、在线迁移"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -520,29 +520,6 @@ pub struct MemberListArgs {}
 #[derive(Args, Debug)]
 pub struct StatusArgs {}
 
-#[derive(Args, Debug)]
-pub struct ReshardArgs {
-    /// 源数据目录（旧分片布局）
-    #[arg(long)]
-    pub src_dir: PathBuf,
-
-    /// 源分片数
-    #[arg(long)]
-    pub src_shards: u64,
-
-    /// 目标数据目录（新分片布局，须与源目录不同）
-    #[arg(long)]
-    pub dst_dir: PathBuf,
-
-    /// 目标分片数
-    #[arg(long)]
-    pub dst_shards: u64,
-
-    /// 跳过确认提示（目录非空时也继续）
-    #[arg(long)]
-    pub yes: bool,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
