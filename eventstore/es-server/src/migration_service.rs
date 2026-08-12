@@ -151,12 +151,21 @@ impl Migration for MigrationService {
             None => return Err(Status::invalid_argument("expected_version 不能为空")),
         };
 
+        // event_id 必须是合法 16 字节 UUID（幂等索引以它为键，静默替换
+        // 会让重试重复追加）
+        let event_id = uuid::Uuid::from_slice(&ev.event_id).map_err(|_| {
+            Status::invalid_argument(format!(
+                "event_id 必须是 16 字节 UUID，实际 {} 字节",
+                ev.event_id.len()
+            ))
+        })?;
+
         let shard = self.shard(req.shard_id).await?;
         let es_req = es_storage::EsRequest::Append {
             stream_id: req.stream_id,
             expected_version: expected,
             events: vec![es_core::NewEvent {
-                event_id: uuid::Uuid::from_slice(&ev.event_id).unwrap_or_else(|_| uuid::Uuid::new_v4()),
+                event_id,
                 event_type: ev.event_type,
                 data: ev.data,
                 metadata: ev.metadata,
@@ -209,42 +218,49 @@ impl Migration for MigrationService {
 
     /// 显式 shard 读流：本地存储读（不走路由表——排水/校验阶段路由表
     /// 已指向目标，按流名读会落错分片）。
+    ///
+    /// 分块发送：整条流打包进单条 gRPC 消息会突破 8MB 消息上限
+    /// （大流迁移/校验必然失败），按 CHUNK 条一块流式发送。
     async fn read_stream_from_shard(
         &self,
         request: Request<ReadStreamFromShardRequest>,
     ) -> Result<Response<Self::ReadStreamFromShardStream>, Status> {
+        const CHUNK: usize = 200;
+
         let req = request.into_inner();
-        let shard = self.shard(req.shard_id).await?;
+        let shard_id = req.shard_id;
+        let shard = self.shard(shard_id).await?;
         let events = shard
             .storage
             .read_stream_events(&req.stream_id, req.from_version, req.max_count)
             .map_err(|e| Status::internal(format!("read_stream_events 失败: {e}")))?;
 
-        let proto_events: Vec<Event> = events
-            .into_iter()
-            .map(|e| Event {
-                stream_id: e.stream_id,
-                version: e.version,
-                event_id: e.event_id.as_bytes().to_vec(),
-                event_type: e.event_type,
-                data: e.data,
-                metadata: e.metadata,
-                hlc: Some(Hlc {
-                    wall: e.hlc.wall,
-                    logical: e.hlc.logical,
-                }),
-                position: e.position,
-                shard_id: req.shard_id,
-            })
-            .collect();
+        let to_proto = move |e: es_core::Event| Event {
+            stream_id: e.stream_id,
+            version: e.version,
+            event_id: e.event_id.as_bytes().to_vec(),
+            event_type: e.event_type,
+            data: e.data,
+            metadata: e.metadata,
+            hlc: Some(Hlc {
+                wall: e.hlc.wall,
+                logical: e.hlc.logical,
+            }),
+            position: e.position,
+            shard_id,
+        };
 
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
         tokio::spawn(async move {
-            let resp = ReadEventsResponse {
-                events: proto_events,
-                next_positions: Vec::new(),
-            };
-            let _ = tx.send(Ok(resp)).await;
+            for chunk in events.chunks(CHUNK) {
+                let resp = ReadEventsResponse {
+                    events: chunk.iter().cloned().map(to_proto).collect(),
+                    next_positions: Vec::new(),
+                };
+                if tx.send(Ok(resp)).await.is_err() {
+                    return; // 客户端断开
+                }
+            }
         });
         Ok(Response::new(ReceiverStream::new(rx)))
     }

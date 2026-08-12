@@ -71,14 +71,16 @@ impl RouteTableManager {
         })
     }
 
-    /// 启动加载：本地文件优先；缺失（新节点）时向 peers 拉取。
+    /// 启动加载：本地文件与 peers 中取版本最高的表。
+    ///
+    /// 本地文件存在时**也要**与 peers 比对版本——节点离线期间集群路由表
+    /// 可能已前进（迁移切换等），直接用本地旧表会长期服务过期路由，
+    /// 把新 append 写到已迁走的分片（静默数据分裂）。
     pub async fn load(&self) -> Result<(), String> {
-        if let Some(t) = self.load_local()? {
-            tracing::info!("路由表从本地加载：version={}", t.version);
-            *self.mem.write().await = t;
-            return Ok(());
-        }
-        // 本地无文件：向 peers 拉取（首个成功者）
+        let local = self.load_local()?;
+        let mut best = local.clone();
+
+        // 向 peers 拉取（首个成功者即可——版本仲裁会拒绝更旧的）
         for (id, addr) in &self.peers {
             if *id == self.self_id {
                 continue;
@@ -90,14 +92,31 @@ impl RouteTableManager {
             match client.get_route_table(GetRouteTableRequest {}).await {
                 Ok(resp) => {
                     let t = proto_to_table(resp.into_inner().table);
-                    tracing::info!("路由表从节点 {id} 拉取：version={}", t.version);
-                    self.apply_remote(t).await?;
-                    return Ok(());
+                    let t_version = t.version;
+                    let is_newer = best.as_ref().map_or(true, |b| t_version > b.version);
+                    if is_newer {
+                        best = Some(t);
+                    }
+                    tracing::info!(
+                        "路由表从节点 {id} 拉取：version={}（本地 {}）",
+                        t_version,
+                        local.as_ref().map(|b| b.version).unwrap_or(0)
+                    );
+                    break; // 任意一个 peer 即可，版本仲裁保证收敛
                 }
                 Err(_) => continue,
             }
         }
-        tracing::info!("无本地路由表且 peers 不可达，以空表启动（version=0）");
+
+        match best {
+            Some(t) => {
+                tracing::info!("路由表加载完成：version={}", t.version);
+                *self.mem.write().await = t;
+            }
+            None => {
+                tracing::info!("无本地路由表且 peers 不可达，以空表启动（version=0）");
+            }
+        }
         Ok(())
     }
     /// 读本地文件；文件缺失返回 Ok(None)，损坏返回 Err（调用方保留内存旧表）。
@@ -113,15 +132,29 @@ impl RouteTableManager {
         }
     }
 
-    /// 原子落盘：temp + rename（同目录，rename 原子）。
+    /// 原子落盘：temp + rename（同目录，rename 原子）+ fsync。
+    ///
+    /// routes.json 是流归属的唯一权威，掉电后回退会让流被重新分配、
+    /// 旧事件成孤儿——文件与目录都必须 fsync（write 后 rename 前各一次）。
     fn persist(&self, table: &RouteTable) -> Result<(), String> {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| format!("建路由表目录失败: {e}"))?;
         }
         let tmp = self.path.with_extension("json.tmp");
         let json = serde_json::to_vec_pretty(table).map_err(|e| format!("序列化失败: {e}"))?;
-        std::fs::write(&tmp, json).map_err(|e| format!("写临时文件失败: {e}"))?;
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp).map_err(|e| format!("创建临时文件失败: {e}"))?;
+            f.write_all(&json).map_err(|e| format!("写临时文件失败: {e}"))?;
+            f.sync_all().map_err(|e| format!("临时文件 fsync 失败: {e}"))?;
+        }
         std::fs::rename(&tmp, &self.path).map_err(|e| format!("rename 失败: {e}"))?;
+        // 目录 fsync：保证 rename 的目录项也落盘
+        if let Some(dir) = self.path.parent() {
+            if let Ok(d) = std::fs::File::open(dir) {
+                let _ = d.sync_all();
+            }
+        }
         Ok(())
     }
 
@@ -184,6 +217,8 @@ impl RouteTableManager {
         let table = mem.clone();
         drop(mem);
         self.persist(&table)?;
+        // 广播在锁外：不阻塞其它路由表操作（peer 挂起有超时兜底，
+        // 乱序由版本仲裁收敛——接收方只采纳更高版本）
         self.broadcast(&table).await;
         Ok((shard, inserted))
     }
@@ -204,7 +239,7 @@ impl RouteTableManager {
         let table = mem.clone();
         drop(mem);
         self.persist(&table)?;
-        self.broadcast(&table).await;
+        self.broadcast(&table).await; // 锁外广播（版本仲裁收敛乱序）
         Ok(table)
     }
 
@@ -244,11 +279,11 @@ impl RouteTableManager {
     pub async fn recount(&self) -> Result<RouteTable, String> {
         let _guard = self.update_mutex.lock().await;
         let mut mem = self.mem.write().await;
-        mem.recount();
+        mem.recount(); // 版本 +1（使广播可被 peers 采纳）
         let table = mem.clone();
         drop(mem);
         self.persist(&table)?;
-        self.broadcast(&table).await;
+        self.broadcast(&table).await; // 锁外广播
         Ok(table)
     }
 
@@ -263,9 +298,14 @@ impl RouteTableManager {
     }
 
     /// 构建到 peer 的 Migration 客户端（惰性连接）。
+    ///
+    /// 请求超时 2s：广播/拉取不能因 peer 挂起（接受连接但不响应）而无限
+    /// 等待——广播失败由「下次变更全表重发」自愈。
     fn migration_client(&self, addr: &str) -> Result<MigrationClient<tonic::transport::Channel>, String> {
+        const BROADCAST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
         let endpoint = tonic::transport::Endpoint::from_shared(addr.to_string())
             .map_err(|e| format!("地址非法 {addr}: {e}"))?;
+        let endpoint = endpoint.timeout(BROADCAST_TIMEOUT);
         let endpoint = es_proto::tls::apply_endpoint_tls(endpoint, self.tls.as_ref())
             .map_err(|e| format!("TLS 装配失败（{addr}）: {e}"))?;
         Ok(MigrationClient::new(endpoint.connect_lazy()))

@@ -399,17 +399,22 @@ impl EventStore for EsService {
             .ok_or_else(|| Status::invalid_argument("expected_version is required"))?;
         let expected = proto_to_expected_version(expected_version);
 
-        let events: Vec<es_core::NewEvent> = req
-            .events
-            .into_iter()
-            .map(|e| es_core::NewEvent {
-                event_id: uuid::Uuid::from_slice(&e.event_id)
-                    .unwrap_or_else(|_| uuid::Uuid::new_v4()),
+        // event_id 必须是合法 16 字节 UUID：静默替换为随机值会破坏幂等
+        // 去重（客户端重试同一请求生成新 id，重复追加）——显式报错
+        let mut events = Vec::with_capacity(req.events.len());
+        for e in req.events {
+            let event_id = uuid::Uuid::from_slice(&e.event_id)
+                .map_err(|_| Status::invalid_argument(format!(
+                    "event_id 必须是 16 字节 UUID，实际 {} 字节",
+                    e.event_id.len()
+                )))?;
+            events.push(es_core::NewEvent {
+                event_id,
                 event_type: e.event_type,
                 data: e.data,
                 metadata: e.metadata,
-            })
-            .collect();
+            });
+        }
 
         // 3. 分配 HLC（leader 在提交前分配，保证所有副本一致）
         let hlc = es_core::Hlc::now();

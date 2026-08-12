@@ -364,8 +364,10 @@ pub struct PlacementNode {
 
 impl Default for PlacementConfig {
     fn default() -> Self {
+        // 与 Config::default（单节点 rf=1）一致，避免误导；
+        // 缺 [placement] 段时 nodes 为空，validate 必然失败（fail-fast）
         Self {
-            replication_factor: 2,
+            replication_factor: 1,
             nodes: Vec::new(),
         }
     }

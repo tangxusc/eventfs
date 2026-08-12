@@ -82,13 +82,15 @@ impl RouteTable {
     }
 
     /// 全表重建计数（RecountStreams 用）：把 streams 逐条重新计数。
-    /// 版本不变更（这是校准，不是结构变更）。
+    /// 版本 +1——recount 结果要经整表广播让集群收敛，同版本会被
+    /// 接收方以「版本不高于本地」忽略，校准就只对本节点生效。
     pub fn recount(&mut self) {
         let mut counts: BTreeMap<u64, u64> = BTreeMap::new();
         for &s in self.streams.values() {
             *counts.entry(s).or_insert(0) += 1;
         }
         self.shard_stream_counts = counts;
+        self.version += 1;
     }
 }
 
@@ -189,7 +191,7 @@ mod tests {
         t.shard_stream_counts = BTreeMap::from([(1, 99), (2, 99)]);
         t.recount();
         assert_eq!(t.shard_stream_counts, BTreeMap::from([(1, 2), (2, 1)]));
-        assert_eq!(t.version, 7, "recount 不改版本");
+        assert_eq!(t.version, 8, "recount 应 bump 版本（使广播可被 peers 采纳）");
     }
 
     #[test]

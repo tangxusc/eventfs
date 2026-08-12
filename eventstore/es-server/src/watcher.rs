@@ -58,6 +58,7 @@ pub fn spawn(
     routes_path: PathBuf,
     route_table: Arc<RouteTableManager>,
     shard_manager: Arc<ShardManager>,
+    self_node_id: u64,
 ) -> Result<WatcherHandle, notify::Error> {
     // 事件是否命中目标文件：路径末尾文件名匹配（rename 替换后路径仍是新文件名）
     // 文件名提前提取为 owned 值——闭包要 move 进 notify 回调（'static）
@@ -108,7 +109,8 @@ pub fn spawn(
                     if ev.as_ref().is_ok_and(|e| {
                         e.paths.iter().any(|p| p.file_name() == config_path.file_name())
                     }) {
-                        handle_config_change(&config_path, &route_table, &shard_manager).await;
+                        handle_config_change(&config_path, &route_table, &shard_manager, self_node_id)
+                            .await;
                     } else if ev.as_ref().is_ok_and(|e| {
                         e.paths.iter().any(|p| p.file_name() == routes_path.file_name())
                     }) {
@@ -127,11 +129,12 @@ pub fn spawn(
     })
 }
 
-/// 配置变更处理：重载 → 校验 → 更新分配范围 → 创建新增 shards。
+/// 配置变更处理：重载 → 校验 → 创建新增 shards → 更新分配范围。
 async fn handle_config_change(
     config_path: &PathBuf,
     route_table: &Arc<RouteTableManager>,
     shard_manager: &Arc<ShardManager>,
+    self_node_id: u64,
 ) {
     // 重载配置（fail-soft：损坏/非法保留旧配置，服务不受影响）
     let content = match std::fs::read_to_string(config_path) {
@@ -141,29 +144,24 @@ async fn handle_config_change(
             return;
         }
     };
-    let cfg: Config = match toml::from_str(&content) {
+    let mut cfg: Config = match toml::from_str(&content) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("配置热更新：解析失败，保留旧配置：{e}");
             return;
         }
     };
+    // --node-id 命令行覆盖启动的节点：热更新必须按**实际节点**计算
+    // local_shards/self_id，不能用文件里的 node.id（否则会把别的节点的
+    // 分片创建/自举到本节点，形成幽灵 raft group）
+    cfg.node.id = self_node_id;
     if let Err(e) = cfg.validate() {
         tracing::error!("配置热更新：校验失败，保留旧配置：{e}");
         return;
     }
 
-    // 分配范围随放置表更新（新 shards 加入分配池）
-    let shard_set: std::collections::BTreeSet<u64> = cfg
-        .placement
-        .nodes
-        .iter()
-        .flat_map(|n| n.primary.iter().chain(n.replica.iter()))
-        .copied()
-        .collect();
-    route_table.set_shard_set(shard_set).await;
-
-    // diff：新增的本地 shards → 异步创建
+    // diff：新增的本地 shards → 串行创建（全部就绪后才更新分配池，
+    // 避免扩容窗口内新流被分配到尚未创建的 shard）
     let new_local: std::collections::BTreeSet<u64> = cfg.local_shards().into_iter().collect();
     let current: std::collections::BTreeSet<u64> = shard_manager.shard_ids().await.into_iter().collect();
     let added: Vec<u64> = new_local.difference(&current).copied().collect();
@@ -171,39 +169,68 @@ async fn handle_config_change(
 
     if !removed.is_empty() {
         tracing::warn!(
-            "配置热更新：以下 shards 不再由本节点承载（数据目录保留，可重新加入）：{removed:?}"
+            "配置热更新：以下 shards 不再由本节点承载（数据目录保留，可重新加入）：{removed:?}。\
+             注意：路由表中指向这些 shards 的流在分片不存在后将不可写，\
+             请用 `esctl route check` 检测并用 `esctl migrate` 迁移"
         );
     }
 
+    let has_added = !added.is_empty();
+    let mut created_ok = true;
     for shard_id in added {
         tracing::info!("配置热更新：新增 shard {shard_id}，动态创建...");
-        let cfg = cfg.clone();
-        let sm = shard_manager.clone();
-        tokio::spawn(async move {
-            match factory::create_shard(&cfg, shard_id).await {
-                Ok(shard) => match sm.register_shard(shard).await {
-                    Ok(()) => {
-                        crate::bootstrap::bootstrap_new_shard(&cfg, sm.clone(), shard_id).await;
-                    }
-                    // FSEvents 对 rename 替换可能延迟投递多波事件：第二次事件
-                    // 到达时 shard 可能已被（前一波）注册——视为幂等成功
-                    Err(e) if e.to_string().contains("already registered") => {
-                        tracing::info!(shard_id, "shard 已注册（重复事件），跳过");
-                    }
-                    Err(e) => {
-                        tracing::error!(shard_id, "动态注册分片失败：{e}");
-                    }
-                },
-                // 重复创建时 surrealkv 同目录二次打开报 already locked——
-                // 同样视为幂等（首次创建已持有该目录）
-                Err(e) if e.to_string().contains("already locked") => {
-                    tracing::info!(shard_id, "shard 已创建（重复事件），跳过");
-                }
-                Err(e) => {
-                    tracing::error!(shard_id, "动态创建分片失败：{e}");
-                }
+        match create_shard_blocking(&cfg, shard_manager, shard_id).await {
+            Ok(true) => {} // 已注册（重复事件）视为成功
+            Ok(false) => {}
+            Err(e) => {
+                created_ok = false;
+                tracing::error!(shard_id, "动态创建分片失败：{e}");
             }
-        });
+        }
+    }
+
+    // 分配范围随放置表更新（新 shards 加入分配池；创建失败的部分不加入——
+    // 由 cfg 的 placement 决定整体，失败 shard 无法从池中单独剔除，
+    // 因此仅在全部创建成功时才更新，避免把未就绪 shard 暴露给分配）
+    if created_ok || !has_added {
+        let shard_set: std::collections::BTreeSet<u64> = cfg
+            .placement
+            .nodes
+            .iter()
+            .flat_map(|n| n.primary.iter().chain(n.replica.iter()))
+            .copied()
+            .collect();
+        route_table.set_shard_set(shard_set).await;
+    }
+}
+
+/// 创建并注册单个 shard（含自举），返回是否已注册（幂等）。
+async fn create_shard_blocking(
+    cfg: &Config,
+    shard_manager: &Arc<ShardManager>,
+    shard_id: u64,
+) -> Result<bool, anyhow::Error> {
+    match factory::create_shard(cfg, shard_id).await {
+        Ok(shard) => match shard_manager.register_shard(shard).await {
+            Ok(()) => {
+                crate::bootstrap::bootstrap_new_shard(cfg, shard_manager.clone(), shard_id).await;
+                Ok(true)
+            }
+            // FSEvents 对 rename 替换可能延迟投递多波事件：第二次事件
+            // 到达时 shard 可能已被（前一波）注册——视为幂等成功
+            Err(e) if e.to_string().contains("already registered") => {
+                tracing::info!(shard_id, "shard 已注册（重复事件），跳过");
+                Ok(true)
+            }
+            Err(e) => Err(anyhow::anyhow!("动态注册分片失败：{e}")),
+        },
+        // 重复创建时 surrealkv 同目录二次打开报 already locked——
+        // 同样视为幂等（首次创建已持有该目录）
+        Err(e) if e.to_string().contains("already locked") => {
+            tracing::info!(shard_id, "shard 已创建（重复事件），跳过");
+            Ok(true)
+        }
+        Err(e) => Err(e.into()),
     }
 }
 

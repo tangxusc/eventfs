@@ -82,6 +82,7 @@ async fn main() -> Result<()> {
         es_server::route_table::routes_path(&server.config().storage.data_dir),
         server.route_table().clone(),
         server.shard_manager().clone(),
+        server.config().node.id, // --node-id 覆盖后的实际节点
     ) {
         Ok(w) => Some(w),
         Err(e) => {

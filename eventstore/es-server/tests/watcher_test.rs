@@ -73,6 +73,7 @@ async fn hot_config_adds_shards_dynamically() {
         es_server::route_table::routes_path(&server.config().storage.data_dir),
         server.route_table().clone(),
         server.shard_manager().clone(),
+        server.config().node.id,
     )
     .expect("watcher 启动");
 
@@ -116,6 +117,7 @@ async fn hot_config_invalid_keeps_old_state() {
         es_server::route_table::routes_path(&server.config().storage.data_dir),
         server.route_table().clone(),
         server.shard_manager().clone(),
+        server.config().node.id,
     )
     .expect("watcher 启动");
 
