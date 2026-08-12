@@ -49,16 +49,34 @@ impl WatcherHandle {
 /// 按 inode 跟踪被 watch 的文件，`sed -i`/temp+rename 等原子替换会让
 /// watcher 指向旧 inode 而永久丢失后续事件；watch 目录 + 文件名过滤
 /// 则对 rename 替换天然可靠。
+///
+/// 注意：FSEvents 目录 watch 是**递归**的（shard 子目录的 surrealkv 写活动
+/// 也产生事件）。回调里前置过滤——只放行目标文件（config/routes）的事件，
+/// 否则事件风暴会溢出事件通道，把真正的配置变更事件挤掉。
 pub fn spawn(
     config_path: PathBuf,
     routes_path: PathBuf,
     route_table: Arc<RouteTableManager>,
     shard_manager: Arc<ShardManager>,
 ) -> Result<WatcherHandle, notify::Error> {
-    let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+    // 事件是否命中目标文件：路径末尾文件名匹配（rename 替换后路径仍是新文件名）
+    // 文件名提前提取为 owned 值——闭包要 move 进 notify 回调（'static）
+    let config_name = config_path.file_name().unwrap_or_default().to_os_string();
+    let routes_name = routes_path.file_name().unwrap_or_default().to_os_string();
+    let matches = move |paths: &[std::path::PathBuf]| -> bool {
+        paths.iter().any(|p| {
+            let fname = p.file_name().unwrap_or_default();
+            fname == config_name.as_os_str() || fname == routes_name.as_os_str()
+        })
+    };
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        // 事件发送失败（接收端已关）→ watcher 停摆，静默
-        let _ = tx.blocking_send(res);
+        // 前置过滤：只转发目标文件事件（防 shard 目录事件风暴挤掉配置变更）
+        if res.as_ref().is_ok_and(|e| matches(&e.paths)) {
+            // 事件发送失败（接收端已关）→ watcher 停摆，静默
+            let _ = tx.blocking_send(res);
+        }
     })?;
     // 目录去重后 watch（config 与 routes 可能同目录）
     let mut watched: Vec<std::path::PathBuf> = Vec::new();
@@ -69,15 +87,6 @@ pub fn spawn(
             watcher.watch(dir, RecursiveMode::NonRecursive)?;
         }
     }
-
-    // 事件是否命中目标文件：路径末尾文件名匹配（rename 替换后路径仍是新文件名）
-    let matches = |paths: &[std::path::PathBuf], target: &PathBuf| -> bool {
-        paths.iter().any(|p| {
-            p.file_name()
-                .map(|f| f == target.file_name().unwrap_or_default())
-                .unwrap_or(false)
-        })
-    };
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
@@ -96,9 +105,13 @@ pub fn spawn(
                     if *shutdown_rx.borrow() {
                         break;
                     }
-                    if ev.as_ref().is_ok_and(|e| matches(&e.paths, &config_path)) {
+                    if ev.as_ref().is_ok_and(|e| {
+                        e.paths.iter().any(|p| p.file_name() == config_path.file_name())
+                    }) {
                         handle_config_change(&config_path, &route_table, &shard_manager).await;
-                    } else if ev.as_ref().is_ok_and(|e| matches(&e.paths, &routes_path)) {
+                    } else if ev.as_ref().is_ok_and(|e| {
+                        e.paths.iter().any(|p| p.file_name() == routes_path.file_name())
+                    }) {
                         route_table.reload().await;
                     }
                 }
