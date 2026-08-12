@@ -35,6 +35,8 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+# 配置文件/routes.json 热更新 watch（temp+rename 场景 notify 可靠捕获）
+notify = "7"
 
 [dev-dependencies]
 tempfile = { workspace = true }

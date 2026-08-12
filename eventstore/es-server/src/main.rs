@@ -72,19 +72,40 @@ async fn main() -> Result<()> {
     // 初始化
     server.init().await?;
 
+    // 配置与路由表热更新 watcher（动态 shard 创建 / routes.json 热生效）。
+    // notify 只能 watch 已存在的文件：先确保路由表文件存在（缺失时落盘空表）
+    if let Err(e) = server.route_table().ensure_file().await {
+        tracing::error!("路由表文件初始化失败（动态扩容不可用）：{e}");
+    }
+    let watcher = match es_server::watcher::spawn(
+        std::path::PathBuf::from(&args.config),
+        es_server::route_table::routes_path(&server.config().storage.data_dir),
+        server.route_table().clone(),
+        server.shard_manager().clone(),
+    ) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            tracing::error!("watcher 启动失败（动态扩容不可用，其余功能正常）：{e}");
+            None
+        }
+    };
+
     // 启动服务（监听阻塞）
     let serve_server = server.clone();
     let serve = tokio::spawn(async move {
         serve_server.serve().await
     });
 
-    // 优雅关闭：Ctrl-C / SIGTERM → 逐 shard 停 Raft 并关闭存储
+    // 优雅关闭：Ctrl-C / SIGTERM → 停 watcher → 逐 shard 停 Raft 并关闭存储
     // （flush WAL + 释放 surrealkv LOCK，否则重启报 "already locked"）
     tokio::select! {
         res = serve => return res?,
         _ = shutdown_signal() => {
             tracing::info!("收到退出信号，优雅关闭...");
         }
+    }
+    if let Some(w) = watcher {
+        w.stop().await;
     }
     server.shutdown().await;
 

@@ -118,9 +118,9 @@ async fn register_and_get_basic() {
 }
 
 #[tokio::test]
-async fn register_out_of_range_rejected() {
+async fn register_beyond_initial_range_extends() {
     let manager = ShardManager::new(1, 2);
-    // shard_id >= num_shards 必须拒绝
+    // 动态扩容：shard_id 超过启动范围（num_shards=2）时自动扩展而非拒绝
     let dir = tempfile::tempdir().expect("临时目录");
     let tree = Arc::new(
         surrealkv::TreeBuilder::new()
@@ -135,11 +135,10 @@ async fn register_out_of_range_rejected() {
         .await
         .expect("建 Raft");
     let shard = Arc::new(Shard::new(2, raft, Arc::new(store)));
-    let err = manager
-        .register_shard(shard)
-        .await
-        .expect_err("越界应拒绝");
-    assert!(err.to_string().contains(">= num_shards"), "{err}");
+    manager.register_shard(shard).await.expect("动态 shard 应注册成功");
+    // 范围自动扩展为 max(shard_id)+1
+    assert_eq!(manager.num_shards(), 3);
+    assert_eq!(manager.shard_ids().await, vec![2]);
 }
 
 #[tokio::test]

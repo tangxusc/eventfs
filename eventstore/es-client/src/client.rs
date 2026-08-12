@@ -452,6 +452,60 @@ impl EventStoreClient {
         })
         .await
     }
+
+    /// 显式创建流：服务端分配 shard（大致最少流）并记录归属。
+    ///
+    /// 幂等：流已存在时返回现有归属（`exists=true`）。与 append 同一套
+    /// LeaderRetryPlan 语义——分配在任意节点本地完成并广播收敛。
+    pub async fn create_stream(
+        &mut self,
+        stream_id: String,
+    ) -> Result<CreateStreamResponse, ClientError> {
+        let mut plan = LeaderRetryPlan::new(self.rotated_nodes());
+        let mut last_redirect: Option<String> = None;
+        let mut errors: Vec<String> = Vec::new();
+
+        while let Some(target) = plan.next() {
+            if plan.needs_backoff(&target) {
+                tokio::time::sleep(ELECTION_RETRY_DELAY).await;
+            }
+            let client = match self.get_or_connect(&target).await {
+                Ok(c) => c,
+                Err(e) => {
+                    errors.push(format!("{target}: 连接失败: {e}"));
+                    plan.retry_later(target);
+                    continue;
+                }
+            };
+            let req = CreateStreamRequest {
+                stream_id: stream_id.clone(),
+            };
+            match client.clone().create_stream(req).await {
+                Ok(resp) => return Ok(resp.into_inner()),
+                Err(status) if status.code() == Code::Unavailable => {
+                    match parse_leader_hint(status.message()) {
+                        Some(addr) => {
+                            let norm = normalize_endpoint(&addr);
+                            last_redirect = Some(norm.clone());
+                            plan.redirect_to(norm);
+                        }
+                        None => {
+                            plan.retry_later(target);
+                        }
+                    }
+                }
+                Err(status) => return Err(ClientError::from_status(status)),
+            }
+        }
+        match (last_redirect, errors.is_empty()) {
+            (Some(addr), _) => Err(ClientError::NotLeader(Some(addr))),
+            (None, false) => Err(ClientError::RpcFailed {
+                code: Code::Unavailable,
+                message: errors.join("；"),
+            }),
+            (None, true) => Err(ClientError::NotLeader(None)),
+        }
+    }
 }
 
 /// gRPC 错误码是否为节点级故障（可换节点轮换重试）。

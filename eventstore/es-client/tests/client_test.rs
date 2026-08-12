@@ -146,6 +146,13 @@ impl EventStore for StubServer {
             .unwrap_or_else(default_meta);
         Ok(Response::new(resp))
     }
+
+    async fn create_stream(
+        &self,
+        _request: Request<CreateStreamRequest>,
+    ) -> Result<Response<CreateStreamResponse>, Status> {
+        Err(Status::unimplemented("stub"))
+    }
 }
 
 /// 起一个 stub gRPC 服务，返回 (地址, 共享状态)。

@@ -150,6 +150,13 @@ impl EventStore for MockEventStore {
     ) -> Result<Response<GetStreamMetaResponse>, Status> {
         Err(Status::unimplemented("mock 未实现"))
     }
+
+    async fn create_stream(
+        &self,
+        _r: Request<CreateStreamRequest>,
+    ) -> Result<Response<CreateStreamResponse>, Status> {
+        Err(Status::unimplemented("mock 未实现"))
+    }
 }
 
 /// mock 管理面：get_raft_state 前 N 次返回无 leader（选举中），之后是 leader；

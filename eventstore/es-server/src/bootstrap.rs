@@ -160,15 +160,53 @@ fn shard_members_map(
         .collect()
 }
 
+/// 动态创建的 shard 自举入口（配置热更新触发；与启动流程共用
+/// [`bootstrap_shard`]，只针对单个新 shard）。
+///
+/// 幂等性由 bootstrap_shard 内部保证（is_initialized 跳过 / probe 判定），
+/// 重复触发（配置重复变更）无害。
+pub(crate) async fn bootstrap_new_shard(config: &Config, sm: Arc<ShardManager>, shard_id: u64) {
+    // 全量 peers（normalize 后）→ 该 shard 的成员子集 → 探测客户端
+    let all_members: BTreeMap<u64, BasicNode> = config
+        .node
+        .peers
+        .iter()
+        .map(|p| {
+            let uri = normalize_endpoint(&p.addr);
+            (p.id, BasicNode { addr: uri })
+        })
+        .collect();
+    let members = shard_members_map(&all_members, config, shard_id);
+    if members.is_empty() {
+        tracing::warn!(shard_id, "放置表中该分片无承载节点（或地址缺失），跳过自举");
+        return;
+    }
+    let tls = match config.tls.as_ref().map(|t| t.client_trust()) {
+        Some(Ok(t)) => Some(t),
+        Some(Err(e)) => {
+            tracing::error!("TLS 客户端配置无效，跳过新分片自举：{e}");
+            return;
+        }
+        None => None,
+    };
+    let clients = match build_clients(&members, tls.as_ref()) {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            tracing::error!("构建探测客户端失败，跳过新分片自举：{e}");
+            return;
+        }
+    };
+    bootstrap_shard(shard_id, members, clients, config.node.id, sm).await;
+}
+
 /// 单个分片的探测与自举。
-async fn bootstrap_shard(
+pub(crate) async fn bootstrap_shard(
     shard_id: u64,
     members: BTreeMap<u64, BasicNode>,
     clients: Arc<BTreeMap<u64, RaftAdminClient<Channel>>>,
     self_id: u64,
     sm: Arc<ShardManager>,
-) {
-    let shard = match sm.get_shard(shard_id).await {
+) {    let shard = match sm.get_shard(shard_id).await {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(shard_id, "取分片失败：{e}");

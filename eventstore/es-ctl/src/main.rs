@@ -52,6 +52,8 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Read(a) => commands::read::run(&ctx, &a).await,
         Command::ReadAll(a) => commands::read::run_all(&ctx, &a).await,
         Command::Meta(a) => commands::meta::run(&ctx, &a).await,
+        Command::CreateStream(a) => commands::create_stream::run(&ctx, &a).await,
+        Command::Route(a) => commands::route::run(&ctx, &a).await,
         Command::Watch(a) => commands::watch::run(&ctx, &a).await,
         Command::Init(a) => commands::init::run(&ctx, &a).await,
         Command::Member(a) => commands::member::run(&ctx, &a).await,

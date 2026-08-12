@@ -69,8 +69,14 @@ async fn start_server() -> (String, Server, tempfile::TempDir) {
         .await
         .expect("绑定端口");
     let addr = format!("http://{}", listener.local_addr().expect("取本地地址"));
-    let service = es_server::service::EsService::new(server.shard_manager().clone(), &config)
-        .expect("创建服务");
+    // 共享 server 的路由表实例（EsService::new 会自建独立实例，内存态不同步）
+    let service = es_server::service::EsService::with_limits(
+        server.shard_manager().clone(),
+        config.limits.clone(),
+        server.route_table().clone(),
+        &config,
+    )
+    .expect("创建服务");
     let admin = es_raft::admin_service::RaftAdminService::new(server.shard_manager().clone());
     let raft = es_raft::rpc_service::RaftRpcService::new(server.shard_manager().clone());
     tokio::spawn(async move {
@@ -821,6 +827,13 @@ impl event_store_server::EventStore for FlakyStub {
         &self,
         _request: Request<GetStreamMetaRequest>,
     ) -> Result<Response<GetStreamMetaResponse>, Status> {
+        Err(Status::unimplemented("stub"))
+    }
+
+    async fn create_stream(
+        &self,
+        _request: Request<CreateStreamRequest>,
+    ) -> Result<Response<CreateStreamResponse>, Status> {
         Err(Status::unimplemented("stub"))
     }
 }

@@ -69,10 +69,18 @@ async fn start_server() -> (
     let addr = format!("http://{}", listener.local_addr().expect("取本地地址"));
 
     let sm = server.shard_manager().clone();
+    // 共享 server 的路由表实例（EsService::new 会自建独立实例，内存态不同步）
+    let route_table = server.route_table().clone();
     let handle = tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
             .add_service(EventStoreServer::new(
-                es_server::service::EsService::new(sm.clone(), &config).expect("创建服务"),
+                es_server::service::EsService::with_limits(
+                    sm.clone(),
+                    config.limits.clone(),
+                    route_table,
+                    &config,
+                )
+                .expect("创建服务"),
             ))
             .add_service(RaftAdminServer::new(es_raft::RaftAdminService::new(sm)))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
@@ -126,10 +134,18 @@ async fn start_server_uninitialized(num_shards: u64) -> (
     let addr = format!("http://{}", listener.local_addr().expect("取本地地址"));
 
     let sm = server.shard_manager().clone();
+    // 共享 server 的路由表实例（EsService::new 会自建独立实例，内存态不同步）
+    let route_table = server.route_table().clone();
     let handle = tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
             .add_service(EventStoreServer::new(
-                es_server::service::EsService::new(sm.clone(), &config).expect("创建服务"),
+                es_server::service::EsService::with_limits(
+                    sm.clone(),
+                    config.limits.clone(),
+                    route_table,
+                    &config,
+                )
+                .expect("创建服务"),
             ))
             .add_service(RaftAdminServer::new(es_raft::RaftAdminService::new(sm)))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
@@ -466,12 +482,20 @@ async fn https_self_signed_cert() {
         .expect("绑定端口");
     let addr = format!("https://{}", listener.local_addr().expect("取地址"));
     let sm = server.shard_manager().clone();
+    // 共享 server 的路由表实例（EsService::new 会自建独立实例，内存态不同步）
+    let route_table = server.route_table().clone();
     let handle = tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
             .tls_config(ServerTlsConfig::new().identity(identity))
             .expect("TLS 配置")
             .add_service(EventStoreServer::new(
-                es_server::service::EsService::new(sm.clone(), &config).expect("创建服务"),
+                es_server::service::EsService::with_limits(
+                    sm.clone(),
+                    config.limits.clone(),
+                    route_table,
+                    &config,
+                )
+                .expect("创建服务"),
             ))
             .add_service(RaftAdminServer::new(es_raft::RaftAdminService::new(sm)))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
@@ -621,10 +645,18 @@ async fn start_two_nodes() -> (
             .expect("绑定端口");
         let addr = format!("http://{}", listener.local_addr().expect("取地址"));
         let sm = server.shard_manager().clone();
+        // 共享 server 的路由表实例（EsService::new 会自建独立实例，内存态不同步）
+        let route_table = server.route_table().clone();
         let handle = tokio::spawn(async move {
             let _ = tonic::transport::Server::builder()
                 .add_service(EventStoreServer::new(
-                    es_server::service::EsService::new(sm.clone(), &config).expect("创建服务"),
+                    es_server::service::EsService::with_limits(
+                        sm.clone(),
+                        config.limits.clone(),
+                        route_table,
+                        &config,
+                    )
+                    .expect("创建服务"),
                 ))
                 .add_service(RaftRpcServer::new(es_raft::RaftRpcService::new(sm.clone())))
                 .add_service(RaftAdminServer::new(es_raft::RaftAdminService::new(sm)))
@@ -953,10 +985,11 @@ async fn readall_backward_defaults_to_latest() {
 async fn watch_all_per_shard() {
     let (addr, handle, _server, _dir) = start_server().await;
 
-    let s1 = (0..100u64)
-        .map(|i| format!("watch/shard1/{i}"))
-        .find(|n| es_core::route(n, 2) == 1)
-        .expect("应有路由到分片 1 的流名");
+    // 显式分配（最少流）：先写一个流占 shard 0，目标流必落在 shard 1
+    let filler = "watch/filler";
+    let out = esctl(&addr, &["append", filler, "--event-type", "T", "--data", "x"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let s1 = "watch/shard1/target";
     let out = esctl(&addr, &["append", &s1, "--event-type", "T", "--data", "x"]);
     assert!(out.status.success(), "{}", stderr(&out));
 

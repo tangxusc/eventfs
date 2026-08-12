@@ -63,10 +63,13 @@ async fn start_server(
         .expect("绑定端口");
     let addr = format!("http://{}", listener.local_addr().expect("取地址"));
     let sm = server.shard_manager().clone();
+    // 共享 server 的路由表实例（EsService::new 会自建独立实例，内存态不同步）
+    let route_table = server.route_table().clone();
     let handle = tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
             .add_service(EventStoreServer::new(
-                es_server::service::EsService::new(sm, &config).expect("创建服务"),
+                es_server::service::EsService::with_limits(sm, Default::default(), route_table, &config)
+                    .expect("创建服务"),
             ))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await;
@@ -147,7 +150,8 @@ async fn snapshot_list_shows_metadata() {
 
     // 写数据并造快照（s1 路由到的分片）
     append_n(&addr, "s1", 3).await;
-    let sid = es_core::route("s1", 2);
+    // 显式分配下 s1 的归属由路由表决定（hash 路由已废弃）
+    let sid = server.route_table().lookup("s1").await.expect("s1 应已分配");
     // 通过 raft 真实路径触发建快照（build 需要 &mut self，经 openraft 触发）
     let shard = server.shard_manager().get_shard(sid).await.expect("取分片");
     shard.raft.trigger().snapshot().await.expect("触发建快照");
@@ -195,7 +199,8 @@ async fn snapshot_list_marks_corrupted_and_empty() {
 
     // 造一个合法快照 + 一个损坏文件
     append_n(&addr, "s1", 1).await;
-    let sid = es_core::route("s1", 2);
+    // 显式分配下 s1 的归属由路由表决定（hash 路由已废弃）
+    let sid = server.route_table().lookup("s1").await.expect("s1 应已分配");
     let shard = server.shard_manager().get_shard(sid).await.expect("取分片");
     shard.raft.trigger().snapshot().await.expect("建快照");
     let snap_dir = dir.path().join("snapshots");
@@ -239,7 +244,8 @@ async fn snapshot_restore_point_in_time_and_resume() {
 
     // 写 5 条 → 造快照（快照点）→ 再写 3 条（快照点之后的数据）
     append_n(&addr, "s1", 5).await;
-    let sid = es_core::route("s1", 2);
+    // 显式分配下 s1 的归属由路由表决定（hash 路由已废弃）
+    let sid = server.route_table().lookup("s1").await.expect("s1 应已分配");
     let shard = server.shard_manager().get_shard(sid).await.expect("取分片");
     shard.raft.trigger().snapshot().await.expect("触发建快照");
     let snap_path = wait_snapshot(shard.storage.snapshot_store()).await;
@@ -304,7 +310,8 @@ async fn snapshot_restore_rejects_locked_and_invalid() {
 
     // 造快照
     append_n(&addr, "s1", 1).await;
-    let sid = es_core::route("s1", 2);
+    // 显式分配下 s1 的归属由路由表决定（hash 路由已废弃）
+    let sid = server.route_table().lookup("s1").await.expect("s1 应已分配");
     let shard = server.shard_manager().get_shard(sid).await.expect("取分片");
     shard.raft.trigger().snapshot().await.expect("触发建快照");
     let snap_path = wait_snapshot(shard.storage.snapshot_store()).await;

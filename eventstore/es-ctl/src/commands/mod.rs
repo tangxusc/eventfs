@@ -9,11 +9,13 @@ use crate::output;
 use crate::shards::{ShardScope, resolve_shard_scope};
 
 pub mod append;
+pub mod create_stream;
 pub mod init;
 pub mod member;
 pub mod meta;
 pub mod read;
 pub mod reshard;
+pub mod route;
 pub mod snapshot;
 pub mod status;
 pub mod watch;

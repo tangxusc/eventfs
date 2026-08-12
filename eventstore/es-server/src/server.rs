@@ -6,12 +6,16 @@ use anyhow::Result;
 use es_raft::{ShardManager, Shard};
 use crate::config::Config;
 use crate::factory;
+use crate::migration_service::MigrationService;
+use crate::route_table::{RouteTableManager, routes_path};
 use crate::service::EsService;
 
 /// EventStore 服务器
 pub struct Server {
     config: Config,
     shard_manager: Arc<ShardManager>,
+    /// 流路由表（stream → shard 归属；启动加载 + 热更新）
+    route_table: Arc<RouteTableManager>,
 }
 
 impl Server {
@@ -30,9 +34,16 @@ impl Server {
             shard_count,
         ));
 
+        // 路由表：{data_dir}/routes.json（专门文件 + 热更新）
+        let route_table = Arc::new(
+            RouteTableManager::new(&config, routes_path(&config.storage.data_dir))
+                .map_err(anyhow::Error::msg)?,
+        );
+
         Ok(Self {
             config,
             shard_manager,
+            route_table,
         })
     }
 
@@ -41,9 +52,22 @@ impl Server {
         &self.shard_manager
     }
 
+    /// 获取当前配置（watcher/测试用）
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// 获取路由表管理器（测试与 watcher 用）
+    pub fn route_table(&self) -> &Arc<RouteTableManager> {
+        &self.route_table
+    }
+
     /// 初始化存储与 Raft 节点（本节点承载的 shards，每个 shard 独立 LSM tree）。
     pub async fn init(&self) -> Result<()> {
         tracing::info!("Initializing storage and Raft nodes...");
+
+        // 加载路由表（本地文件优先，缺失时向 peers 拉取）
+        self.route_table.load().await.map_err(anyhow::Error::msg)?;
 
         // 创建数据目录
         std::fs::create_dir_all(&self.config.storage.data_dir)?;
@@ -112,11 +136,13 @@ impl Server {
         let es_service = EsService::with_limits(
             self.shard_manager.clone(),
             self.config.limits.clone(),
+            self.route_table.clone(),
             &self.config,
         )
         .map_err(anyhow::Error::msg)?;
         let raft_service = es_raft::RaftRpcService::new(self.shard_manager.clone());
         let admin_service = es_raft::RaftAdminService::new(self.shard_manager.clone());
+        let migration_service = MigrationService::new(self.route_table.clone());
 
         let mut server = tonic::transport::Server::builder();
         // tls_config 必须在 add_service 之前
@@ -155,11 +181,17 @@ impl Server {
         )
         .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
         .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE);
+        let migration = es_proto::eventstore::migration_server::MigrationServer::new(
+            migration_service,
+        )
+        .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
+        .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE);
 
         server
             .add_service(event_store)
             .add_service(raft_rpc)
             .add_service(raft_admin)
+            .add_service(migration)
             .serve(addr)
             .await?;
 

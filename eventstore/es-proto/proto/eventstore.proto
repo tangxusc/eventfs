@@ -14,6 +14,24 @@ service EventStore {
   rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
   // 查询流元数据（当前版本等）
   rpc GetStreamMeta(GetStreamMetaRequest) returns (GetStreamMetaResponse);
+  // 显式创建流：服务端分配 shard（大致最少流），返回流归属
+  rpc CreateStream(CreateStreamRequest) returns (CreateStreamResponse);
+}
+
+// 创建流请求
+message CreateStreamRequest {
+  string stream_id = 1;
+}
+
+// 创建流响应
+message CreateStreamResponse {
+  // 分配的 shard；exists=true 时表示已有归属（幂等）
+  uint64 shard_id = 1;
+  // 该 shard 的 leader 地址（http(s)://host:port，可用于直连），
+  // 未知时为空字符串（调用方可经常规重定向路径定位）
+  string leader_addr = 2;
+  // true 表示流已存在（本次调用未新建）
+  bool exists = 3;
 }
 
 // 混合逻辑时钟：由 leader 在写入前分配并随事件落盘
@@ -225,6 +243,59 @@ message ListShardsResponse {
   uint64 node_id = 1;
   // 本节点承载的分片 ID（已注册，可被 GetRaftState/读写访问）
   repeated uint64 shard_ids = 2;
+}
+
+// ============================================================================
+// Migration 服务：路由表同步与在线迁移原语（节点间，不暴露给客户端）
+// ============================================================================
+
+// 流路由表同步与迁移辅助服务。
+// 路由表（stream → shard）是「专门文件 + 热更新」的分布式实现：
+// 变更节点落盘本地 routes.json 后整表广播，接收方按版本号仲裁采纳。
+service Migration {
+  // 拉取路由表（重启恢复 / 探测用）
+  rpc GetRouteTable(GetRouteTableRequest) returns (GetRouteTableResponse);
+  // 推送路由表（整表广播；version 不大于本地的会被忽略）
+  rpc PushRouteTable(PushRouteTableRequest) returns (PushRouteTableResponse);
+  // 原子切换流归属（迁移切换点），返回切换后的路由表
+  rpc SetStreamShard(SetStreamShardRequest) returns (SetStreamShardResponse);
+  // 校准 per-shard 流计数（recount）
+  rpc RecountStreams(RecountStreamsRequest) returns (RecountStreamsResponse);
+}
+
+// 路由表快照（与 es-core::route::RouteTable 字段一一对应）
+message RouteTable {
+  uint64 version = 1;
+  map<string, uint64> streams = 2;
+  map<uint64, uint64> shard_stream_counts = 3;
+}
+
+message GetRouteTableRequest {}
+
+message GetRouteTableResponse {
+  RouteTable table = 1;
+}
+
+message PushRouteTableRequest {
+  RouteTable table = 1;
+}
+
+message PushRouteTableResponse {}
+
+message SetStreamShardRequest {
+  string stream_id = 1;
+  uint64 shard_id = 2;
+}
+
+message SetStreamShardResponse {
+  RouteTable table = 1;
+}
+
+message RecountStreamsRequest {}
+
+message RecountStreamsResponse {
+  // 校准后的路由表
+  RouteTable table = 1;
 }
 
 // 集群成员：node_id 与其 Raft RPC 地址

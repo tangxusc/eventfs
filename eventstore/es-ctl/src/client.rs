@@ -12,11 +12,14 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Status};
 
 use es_core::{LeaderRetryPlan, parse_leader_hint};
+use es_core::route::RouteTable;
 use es_proto::endpoint::normalize_endpoint;
 use es_proto::eventstore::event_store_client::EventStoreClient;
+use es_proto::eventstore::migration_client::MigrationClient;
 use es_proto::eventstore::raft_admin_client::RaftAdminClient;
 use es_proto::eventstore::{
-    GetRaftStateRequest, GetRaftStateResponse, ListShardsRequest, ListShardsResponse,
+    CreateStreamRequest, CreateStreamResponse, GetRaftStateRequest, GetRaftStateResponse,
+    GetRouteTableRequest, ListShardsRequest, ListShardsResponse, RecountStreamsRequest,
 };
 use es_proto::tls::{TlsClientConfig, apply_endpoint_tls};
 
@@ -143,6 +146,86 @@ impl ClusterClient {
             .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE))
     }
 
+    /// Migration 服务客户端（路由表同步，与其它服务同端口）
+    pub async fn migration_client(
+        &self,
+        endpoint: &str,
+    ) -> Result<MigrationClient<Channel>, anyhow::Error> {
+        Ok(MigrationClient::new(self.channel_for(endpoint).await?)
+            .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
+            .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE))
+    }
+
+    /// Migration 操作：在任一可达端点执行（语义同 with_any_endpoint）。
+    pub async fn with_any_migration_endpoint<T, F, Fut>(
+        &self,
+        f: F,
+    ) -> Result<T, anyhow::Error>
+    where
+        F: Fn(MigrationClient<Channel>) -> Fut,
+        Fut: Future<Output = Result<T, Status>>,
+    {
+        let mut errors: Vec<String> = Vec::new();
+        for ep in self.rotated_endpoints() {
+            let client = match self.migration_client(&ep).await {
+                Ok(c) => c,
+                Err(e) => {
+                    errors.push(format!("{ep}: 连接失败: {e:#}"));
+                    continue;
+                }
+            };
+            match f(client).await {
+                Ok(v) => return Ok(v),
+                Err(status) => errors.push(format!("{ep}: {}", status.message())),
+            }
+        }
+        Err(anyhow!(
+            "所有端点均不可用（{}）：{}",
+            self.endpoints.join(", "),
+            errors.join("；")
+        ))
+    }
+
+    /// 显式创建流：服务端分配 shard（大致最少流）。任一端点即可——
+    /// 分配在本节点路由表上完成并广播收敛，幂等。
+    pub async fn create_stream(
+        &self,
+        stream_id: &str,
+    ) -> Result<CreateStreamResponse, anyhow::Error> {
+        self.with_any_endpoint(|mut c| async move {
+            c.create_stream(CreateStreamRequest {
+                stream_id: stream_id.to_string(),
+            })
+            .await
+            .map(|r| r.into_inner())
+        })
+        .await
+    }
+
+    /// 拉取路由表（任一端点；节点重启后从 peer 拉取的同一来源）。
+    pub async fn get_route_table(&self) -> Result<RouteTable, anyhow::Error> {
+        self.with_any_migration_endpoint(|mut c| async move {
+            let resp = c
+                .get_route_table(GetRouteTableRequest {})
+                .await
+                .map(|r| r.into_inner())?;
+            Ok(proto_table_to_core(resp.table))
+        })
+        .await
+    }
+
+    /// 校准 per-shard 流计数，返回校准后的路由表。
+    pub async fn recount_streams(&self) -> Result<RouteTable, anyhow::Error> {
+        self.with_any_migration_endpoint(|mut c| async move {
+            let resp = c
+                .recount_streams(RecountStreamsRequest {})
+                .await
+                .map(|r| r.into_inner())?;
+            Ok(proto_table_to_core(resp.table))
+        })
+        .await
+    }
+
     /// 调单个端点的 GetRaftState（NotFound 等状态原样返回）。
     ///
     /// pub(crate)：命令层（member list / status / 分片探测）直接复用。
@@ -176,7 +259,6 @@ impl ClusterClient {
         let resp = client.list_shards(ListShardsRequest {}).await?.into_inner();
         Ok(resp)
     }
-
     /// 读操作：在任一可达端点执行。
     ///
     /// 依序尝试全部端点（轮询起点后移），第一个成功的返回；全部失败时
@@ -379,6 +461,18 @@ enum LeaderLookupError {
     NotInitialized,
     /// 选举中或全部端点不可达：瞬态，可重试
     NoLeader { detail: String },
+}
+
+/// proto RouteTable → 领域模型（table 缺失视为空表）
+fn proto_table_to_core(t: Option<es_proto::eventstore::RouteTable>) -> RouteTable {
+    match t {
+        Some(t) => RouteTable {
+            version: t.version,
+            streams: t.streams.into_iter().collect(),
+            shard_stream_counts: t.shard_stream_counts.into_iter().collect(),
+        },
+        None => RouteTable::new(),
+    }
 }
 
 #[cfg(test)]

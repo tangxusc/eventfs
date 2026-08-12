@@ -211,6 +211,11 @@ pub enum Command {
     ReadAll(ReadAllArgs),
     /// 查询流元数据（当前版本、所在分片）
     Meta(MetaArgs),
+    /// 显式创建流：服务端分配 shard（大致最少流），返回流归属
+    #[command(name = "create-stream")]
+    CreateStream(CreateStreamArgs),
+    /// 查看/校准流路由表（stream → shard 归属）
+    Route(RouteArgs),
     /// 订阅流事件：先追平历史（catch-up），追平后实时推送
     Watch(WatchArgs),
     /// 初始化分片集群（把给定成员写入首条 membership 日志，只需在一个节点调用一次）
@@ -352,6 +357,25 @@ pub struct ReadAllArgs {
 pub struct MetaArgs {
     /// 流 ID
     pub stream: String,
+}
+
+/// `esctl create-stream`
+#[derive(Args, Debug)]
+pub struct CreateStreamArgs {
+    /// 流 ID
+    pub stream: String,
+}
+
+/// `esctl route`
+#[derive(Args, Debug)]
+pub struct RouteArgs {
+    /// 只显示路由表（默认动作）
+    #[arg(long)]
+    pub show: bool,
+
+    /// 校准 per-shard 流计数（从路由表重建）
+    #[arg(long)]
+    pub recount: bool,
 }
 
 #[derive(Args, Debug)]

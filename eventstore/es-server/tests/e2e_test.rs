@@ -67,8 +67,14 @@ async fn start_test_server() -> (
         .expect("绑定端口");
     let addr = format!("http://{}", listener.local_addr().expect("取本地地址"));
 
-    let service = es_server::service::EsService::new(server.shard_manager().clone(), &config)
-        .expect("创建服务");
+    // 共享 server 的路由表实例（EsService::new 会自建独立实例，内存态不同步）
+    let service = es_server::service::EsService::with_limits(
+        server.shard_manager().clone(),
+        config.limits.clone(),
+        server.route_table().clone(),
+        &config,
+    )
+    .expect("创建服务");
     let handle = tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
             .add_service(EventStoreServer::new(service))
@@ -215,12 +221,19 @@ async fn write_and_read_back() {
     assert_eq!(events[0].data, b"hello");
     assert_eq!(events[1].data, b"world");
 
-    // 直查存储层，确认落盘内容与 gRPC 返回一致
+    // 直查存储层，确认落盘内容与 gRPC 返回一致。
+    // 路由表是流归属权威（append 隐式建流已记录）；ShardManager::route_shard
+    // 是纯哈希推导，与写路径的「大致最少流」分配可能不一致，不能用于定位数据。
+    let shard_id = server
+        .route_table()
+        .lookup("test-stream")
+        .await
+        .expect("append 应已记录路由");
     let shard = server
         .shard_manager()
-        .route_shard("test-stream")
+        .get_shard(shard_id)
         .await
-        .expect("路由");
+        .expect("取分片");
     let stored = shard
         .storage
         .read_stream_events("test-stream", 0, 0)
@@ -386,13 +399,23 @@ async fn read_stream_from_version_with_limit() {
     handle.abort();
 }
 
+/// 路由表架构下，读未知流（未创建/路由表缺失）→ NotFound
+/// （旧哈希路由时代返回空列表）。
 #[tokio::test]
-async fn read_stream_missing_stream_empty() {
+async fn read_stream_missing_stream_not_found() {
     let (addr, handle, _server, _dir) = start_test_server().await;
     let mut client = EventStoreClient::connect(addr).await.expect("连接");
 
-    let events = read_stream_all(&mut client, "nonexistent").await;
-    assert!(events.is_empty(), "不存在的流应返回空，而非报错");
+    let err = client
+        .read_stream(ReadStreamRequest {
+            stream_id: "nonexistent".to_string(),
+            from_version: 0,
+            max_count: 0,
+            direction: Direction::Forward as i32,
+        })
+        .await
+        .expect_err("未知流应 NotFound");
+    assert_eq!(err.code(), tonic::Code::NotFound, "{err}");
 
     handle.abort();
 }

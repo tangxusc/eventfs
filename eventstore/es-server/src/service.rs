@@ -11,6 +11,7 @@ use es_proto::tls::TlsClientConfig;
 use es_raft::ShardManager;
 
 use crate::config::Config;
+use crate::route_table::{RouteTableManager, routes_path};
 
 /// 远程 shard 的 leader 探测器。
 ///
@@ -269,36 +270,57 @@ pub struct EsService {
     shard_manager: Arc<ShardManager>,
     /// 请求大小限制（append 权威校验）
     limits: crate::config::LimitsSection,
+    /// 流路由表（stream → shard 归属；写路径权威）
+    route_table: Arc<RouteTableManager>,
     /// 远程 shard 定位（本节点不承载的目标分片）
     remote: RemoteShards,
 }
 
 impl EsService {
-    /// 创建服务实例（默认大小限制）
+    /// 创建服务实例（默认大小限制；自建路由表管理器——测试/独立使用便捷路径）。
     pub fn new(shard_manager: Arc<ShardManager>, config: &Config) -> Result<Self, String> {
-        Ok(Self {
-            shard_manager,
-            limits: config.limits.clone(),
-            remote: RemoteShards::new(config)?,
-        })
+        let route_table = Arc::new(RouteTableManager::new(
+            config,
+            routes_path(&config.storage.data_dir),
+        )?);
+        Self::with_limits(shard_manager, config.limits.clone(), route_table, config)
     }
 
-    /// 创建服务实例（自定义大小限制）
+    /// 创建服务实例（自定义大小限制 + 共享路由表管理器）。
     pub fn with_limits(
         shard_manager: Arc<ShardManager>,
         limits: crate::config::LimitsSection,
+        route_table: Arc<RouteTableManager>,
         config: &Config,
     ) -> Result<Self, String> {
         Ok(Self {
             shard_manager,
             limits,
+            route_table,
             remote: RemoteShards::new(config)?,
         })
     }
 
-    /// stream 路由到 shard id（Phase 1 保持哈希；Phase 2 换路由表）。
-    fn route_shard_id(&self, stream_id: &str) -> u64 {
-        es_core::routing::route(stream_id, self.shard_manager.num_shards())
+    /// 写路径解析 stream 归属 shard：路由表命中直接返回；未命中（隐式建流）
+    /// 分配并记录（锁内双检查，同节点并发不重复分配）。
+    async fn resolve_write_shard_id(&self, stream_id: &str) -> Result<u64, Status> {
+        if let Some(s) = self.route_table.lookup(stream_id).await {
+            return Ok(s);
+        }
+        self.route_table
+            .allocate(stream_id)
+            .await
+            .map(|(s, _)| s)
+            .map_err(|e| Status::internal(format!("分配流失败: {e}")))
+    }
+
+    /// 读路径解析 stream 归属：只查不分配（读无副作用）。
+    /// 未知流（从未创建或路由表缺失）→ NotFound，客户端可直接判定。
+    async fn resolve_read_stream_shard(&self, stream_id: &str) -> Result<u64, Status> {
+        self.route_table
+            .lookup(stream_id)
+            .await
+            .ok_or_else(|| Status::not_found(format!("stream '{stream_id}' not found")))
     }
 
     /// 取目标 shard；本节点不承载时给出标准重定向提示（写路径用）。
@@ -364,8 +386,9 @@ impl EventStore for EsService {
             }
         }
 
-        // 1. 根据 stream_id 路由到对应分片；本节点不承载时给出 leader 重定向提示
-        let shard_id = self.route_shard_id(stream_id);
+        // 1. 解析 stream 归属 shard（未知流 = 隐式建流：分配并记录路由表）；
+        //    本节点不承载时给出 leader 重定向提示
+        let shard_id = self.resolve_write_shard_id(stream_id).await?;
         let shard = self.resolve_write_shard(shard_id).await?;
 
         // 2. 转换 proto 请求为领域模型
@@ -433,8 +456,8 @@ impl EventStore for EsService {
         let req = request.into_inner();
         tracing::debug!("ReadStream request for stream: {}", req.stream_id);
 
-        // 路由到分片；本节点不承载 → Unavailable，客户端轮换其它节点
-        let shard_id = self.route_shard_id(&req.stream_id);
+        // 路由到分片（只查不分配——读无副作用）；本节点不承载 → Unavailable 轮换
+        let shard_id = self.resolve_read_stream_shard(&req.stream_id).await?;
         let shard = self.resolve_read_shard(shard_id).await?;
 
         // 读取事件（直接从存储层读，无需走 Raft —— 读本地副本即可）
@@ -623,8 +646,8 @@ impl EventStore for EsService {
         use subscribe_request::Target;
         let (stream_id, shard_id, from_position) = match target {
             Target::StreamId(sid) => {
-                // 订阅单个流：路由到分片；本节点不承载 → Unavailable，客户端轮换
-                let shard_id = self.route_shard_id(&sid);
+                // 订阅单个流：解析归属 shard（只查不分配）；本节点不承载 → Unavailable 轮换
+                let shard_id = self.resolve_read_stream_shard(&sid).await?;
                 let shard = self.resolve_read_shard(shard_id).await?;
                 let _ = shard; // shard 仅用于承载校验，后续按 id 取回
 
@@ -792,8 +815,18 @@ impl EventStore for EsService {
         let req = request.into_inner();
         tracing::debug!("GetStreamMeta request for stream: {}", req.stream_id);
 
-        // 路由到分片；本节点不承载 → Unavailable，客户端轮换其它节点
-        let shard_id = self.route_shard_id(&req.stream_id);
+        // 路由表只查不分配：未知流（未创建/路由表缺失）直接返回 exists=false
+        let shard_id = match self.route_table.lookup(&req.stream_id).await {
+            Some(s) => s,
+            None => {
+                return Ok(Response::new(GetStreamMetaResponse {
+                    shard_id: 0,
+                    exists: false,
+                    current_version: 0,
+                }))
+            }
+        };
+        // 本节点不承载 → Unavailable，客户端轮换其它节点
         let shard = self.resolve_read_shard(shard_id).await?;
 
         let meta = shard
@@ -813,6 +846,40 @@ impl EventStore for EsService {
                 current_version: 0,
             })),
         }
+    }
+
+    /// 显式创建流：服务端分配 shard（大致最少流）并记录路由表。
+    ///
+    /// 幂等：流已存在时返回现有归属（exists=true），不重复分配。
+    /// 返回目标 shard 的 leader 地址（探测尽力而为，未知返回空串，
+    /// 调用方经常规重定向路径定位亦可）。
+    async fn create_stream(
+        &self,
+        request: Request<CreateStreamRequest>,
+    ) -> Result<Response<CreateStreamResponse>, Status> {
+        let req = request.into_inner();
+        if req.stream_id.is_empty() {
+            return Err(Status::invalid_argument("stream_id 不能为空"));
+        }
+        let (shard_id, inserted) = self
+            .route_table
+            .allocate(&req.stream_id)
+            .await
+            .map_err(|e| Status::internal(format!("分配流失败: {e}")))?;
+
+        // 尽力探测 leader（仅提示用；失败不阻塞创建）
+        let leader_addr = self
+            .remote
+            .find_leader(shard_id)
+            .await
+            .map(|(_, addr)| addr)
+            .unwrap_or_default();
+
+        Ok(Response::new(CreateStreamResponse {
+            shard_id,
+            leader_addr,
+            exists: !inserted,
+        }))
     }
 }
 

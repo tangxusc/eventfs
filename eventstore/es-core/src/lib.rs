@@ -5,6 +5,7 @@ pub mod hlc;
 pub mod limits;
 pub mod model;
 pub mod redirect;
+pub mod route;
 pub mod routing;
 
 pub use error::{Error, Result};

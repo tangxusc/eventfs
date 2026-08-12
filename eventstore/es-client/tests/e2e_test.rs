@@ -10,6 +10,7 @@ use es_client::{
     subscribe_response,
 };
 use es_client::{ExpectedVersionBuilder, EventBuilder};
+use tonic::Code;
 use es_server::config::{Config, NodeConfig, PlacementConfig, PlacementNode, StorageConfig};
 use es_server::Server;
 
@@ -85,6 +86,7 @@ async fn start_test_server_with_limits(limits: es_server::config::LimitsSection)
     let service = es_server::service::EsService::with_limits(
         server.shard_manager().clone(),
         limits,
+        server.route_table().clone(),
         &config,
     )
     .expect("创建服务");
@@ -297,11 +299,12 @@ async fn subscribe_all_target_receives_shard_events() {
         history.iter().map(|e| &e.stream_id).collect::<Vec<_>>()
     );
 
-    // live 阶段：写同分片新流，应被推送
-    append_one(&mut client, "s0-live", 2).await;
+    // live 阶段：写已有流 s0（显式分配下流的归属固定，事件必进本分片
+    // broadcast；不能写新流——最少流分配可能把它放到别的分片，订阅收不到）
+    append_one(&mut client, "s0", 2).await;
     let live = stream.next().await.expect("收到推送").expect("无错误");
     match live.payload {
-        Some(subscribe_response::Payload::Event(e)) => assert_eq!(e.stream_id, "s0-live"),
+        Some(subscribe_response::Payload::Event(e)) => assert_eq!(e.stream_id, "s0"),
         other => panic!("应收到 live 事件: {other:?}"),
     }
 }
@@ -479,12 +482,15 @@ async fn append_oversized_event_rejected_by_server_limits() {
         other => panic!("应原样上抛 RpcFailed(FailedPrecondition),实际 {other:?}"),
     }
 
-    // 流里没有任何事件被写入
-    let events = client
+    // 流里没有任何事件被写入（服务端校验先于分配，流未创建 → 读 NotFound）
+    let err = client
         .read_stream("s".into(), 0, 10, Direction::Forward)
         .await
-        .expect("读流");
-    assert!(events.is_empty(), "被拒的 append 不应写入任何事件");
+        .expect_err("未创建流应读不到");
+    assert!(
+        matches!(err, ClientError::RpcFailed { code: Code::NotFound, .. }),
+        "应为 NotFound,实际 {err:?}"
+    );
 }
 
 /// 服务端 batch 级校验:单事件各不过限、但 proto 编码后总字节超限被拒。
@@ -542,10 +548,14 @@ async fn append_client_side_limit_rejects_without_rpc() {
         "应为 PayloadTooLarge,实际 {err:?}"
     );
 
-    // 未发出 RPC:流为空
-    let events = client
+    // 未发出 RPC:流未创建（路由表无记录）→ 读返回 NotFound（显式分配语义：
+    // 未创建过的流不存在于路由表，读不到）
+    let err = client
         .read_stream("s".into(), 0, 10, Direction::Forward)
         .await
-        .expect("读流");
-    assert!(events.is_empty(), "本地拒绝不应写入任何事件");
+        .expect_err("未创建流应读不到");
+    assert!(
+        matches!(err, ClientError::RpcFailed { code: Code::NotFound, .. }),
+        "应为 NotFound,实际 {err:?}"
+    );
 }

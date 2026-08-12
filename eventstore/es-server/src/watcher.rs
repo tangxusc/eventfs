@@ -1,0 +1,232 @@
+//! 配置文件与路由表热更新 watcher + 运行期动态 shard 创建。
+//!
+//! 节点只承载放置表分配的部分分片；扩容 = 更新所有节点配置（新增节点/
+//! 新增 shards 行）→ 各节点 watch 到变更后运行期创建新增的 shards，无需重启。
+//!
+//! 两条 watch：
+//! - config.toml：重载 + validate（失败仅告警，服务不受影响）→ diff 新增
+//!   shards → 逐个创建（factory::create_shard → register_shard → bootstrap）
+//! - routes.json：热更新路由表（运维手工修改文件同样生效）
+//!
+//! 配置中移除 shard：仅告警，数据目录保留；重新加入时幂等打开恢复。
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use notify::{RecursiveMode, Watcher};
+use tokio::sync::watch;
+
+use es_raft::ShardManager;
+
+use crate::config::Config;
+use crate::factory;
+use crate::route_table::RouteTableManager;
+
+/// 事件合并窗口：配置文件常见 temp+rename 写入，会触发多事件；
+/// 收到事件后等待窗口结束再重读文件（读到的即最终状态）。
+const DEBOUNCE: Duration = Duration::from_millis(200);
+
+/// watcher 生命周期句柄：持有 notify watcher（防 drop）与后台任务。
+pub struct WatcherHandle {
+    _watcher: notify::RecommendedWatcher,
+    task: tokio::task::JoinHandle<()>,
+    /// 置 true 停止后台循环
+    shutdown: watch::Sender<bool>,
+}
+
+impl WatcherHandle {
+    /// 停止 watcher 后台任务（shutdown 流程调用）。
+    pub async fn stop(self) {
+        let _ = self.shutdown.send(true);
+        let _ = self.task.await;
+    }
+}
+
+/// 启动配置与路由表 watcher。
+///
+/// watch 目标：**文件所在目录**而非文件本身——notify 在 macOS（FSEvents）
+/// 按 inode 跟踪被 watch 的文件，`sed -i`/temp+rename 等原子替换会让
+/// watcher 指向旧 inode 而永久丢失后续事件；watch 目录 + 文件名过滤
+/// 则对 rename 替换天然可靠。
+pub fn spawn(
+    config_path: PathBuf,
+    routes_path: PathBuf,
+    route_table: Arc<RouteTableManager>,
+    shard_manager: Arc<ShardManager>,
+) -> Result<WatcherHandle, notify::Error> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        // 事件发送失败（接收端已关）→ watcher 停摆，静默
+        let _ = tx.blocking_send(res);
+    })?;
+    // 目录去重后 watch（config 与 routes 可能同目录）
+    let mut watched: Vec<std::path::PathBuf> = Vec::new();
+    for p in [&config_path, &routes_path] {
+        let dir = p.parent().unwrap_or_else(|| std::path::Path::new("."));
+        if !watched.iter().any(|w| w == dir) {
+            watched.push(dir.to_path_buf());
+            watcher.watch(dir, RecursiveMode::NonRecursive)?;
+        }
+    }
+
+    // 事件是否命中目标文件：路径末尾文件名匹配（rename 替换后路径仍是新文件名）
+    let matches = |paths: &[std::path::PathBuf], target: &PathBuf| -> bool {
+        paths.iter().any(|p| {
+            p.file_name()
+                .map(|f| f == target.file_name().unwrap_or_default())
+                .unwrap_or(false)
+        })
+    };
+
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+    let task = tokio::spawn(async move {
+        // 事件到达 → debounce → 按路径分发
+        while !*shutdown_rx.borrow() {
+            tokio::select! {
+                _ = shutdown_rx.changed() => break,
+                maybe = rx.recv() => {
+                    let Some(ev) = maybe else { break };
+                    if ev.is_err() {
+                        continue;
+                    }
+                    // debounce：等待窗口内的事件合并
+                    tokio::time::sleep(DEBOUNCE).await;
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                    if ev.as_ref().is_ok_and(|e| matches(&e.paths, &config_path)) {
+                        handle_config_change(&config_path, &route_table, &shard_manager).await;
+                    } else if ev.as_ref().is_ok_and(|e| matches(&e.paths, &routes_path)) {
+                        route_table.reload().await;
+                    }
+                }
+            }
+        }
+        tracing::info!("watcher 已停止");
+    });
+
+    Ok(WatcherHandle {
+        _watcher: watcher,
+        task,
+        shutdown: shutdown_tx,
+    })
+}
+
+/// 配置变更处理：重载 → 校验 → 更新分配范围 → 创建新增 shards。
+async fn handle_config_change(
+    config_path: &PathBuf,
+    route_table: &Arc<RouteTableManager>,
+    shard_manager: &Arc<ShardManager>,
+) {
+    // 重载配置（fail-soft：损坏/非法保留旧配置，服务不受影响）
+    let content = match std::fs::read_to_string(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("配置热更新：读取失败（{config_path:?}）：{e}");
+            return;
+        }
+    };
+    let cfg: Config = match toml::from_str(&content) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("配置热更新：解析失败，保留旧配置：{e}");
+            return;
+        }
+    };
+    if let Err(e) = cfg.validate() {
+        tracing::error!("配置热更新：校验失败，保留旧配置：{e}");
+        return;
+    }
+
+    // 分配范围随放置表更新（新 shards 加入分配池）
+    let shard_set: std::collections::BTreeSet<u64> = cfg
+        .placement
+        .nodes
+        .iter()
+        .flat_map(|n| n.primary.iter().chain(n.replica.iter()))
+        .copied()
+        .collect();
+    route_table.set_shard_set(shard_set).await;
+
+    // diff：新增的本地 shards → 异步创建
+    let new_local: std::collections::BTreeSet<u64> = cfg.local_shards().into_iter().collect();
+    let current: std::collections::BTreeSet<u64> = shard_manager.shard_ids().await.into_iter().collect();
+    let added: Vec<u64> = new_local.difference(&current).copied().collect();
+    let removed: Vec<u64> = current.difference(&new_local).copied().collect();
+
+    if !removed.is_empty() {
+        tracing::warn!(
+            "配置热更新：以下 shards 不再由本节点承载（数据目录保留，可重新加入）：{removed:?}"
+        );
+    }
+
+    for shard_id in added {
+        tracing::info!("配置热更新：新增 shard {shard_id}，动态创建...");
+        let cfg = cfg.clone();
+        let sm = shard_manager.clone();
+        tokio::spawn(async move {
+            match factory::create_shard(&cfg, shard_id).await {
+                Ok(shard) => match sm.register_shard(shard).await {
+                    Ok(()) => {
+                        crate::bootstrap::bootstrap_new_shard(&cfg, sm.clone(), shard_id).await;
+                    }
+                    // FSEvents 对 rename 替换可能延迟投递多波事件：第二次事件
+                    // 到达时 shard 可能已被（前一波）注册——视为幂等成功
+                    Err(e) if e.to_string().contains("already registered") => {
+                        tracing::info!(shard_id, "shard 已注册（重复事件），跳过");
+                    }
+                    Err(e) => {
+                        tracing::error!(shard_id, "动态注册分片失败：{e}");
+                    }
+                },
+                // 重复创建时 surrealkv 同目录二次打开报 already locked——
+                // 同样视为幂等（首次创建已持有该目录）
+                Err(e) if e.to_string().contains("already locked") => {
+                    tracing::info!(shard_id, "shard 已创建（重复事件），跳过");
+                }
+                Err(e) => {
+                    tracing::error!(shard_id, "动态创建分片失败：{e}");
+                }
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 配置差异计算（纯逻辑，供 handle 内部用）——这里直接验证 diff 语义
+    #[test]
+    fn diff_added_and_removed() {
+        let new_local: std::collections::BTreeSet<u64> = vec![0, 1, 2, 4].into_iter().collect();
+        let current: std::collections::BTreeSet<u64> = vec![0, 1, 3].into_iter().collect();
+        let added: Vec<u64> = new_local.difference(&current).copied().collect();
+        let removed: Vec<u64> = current.difference(&new_local).copied().collect();
+        assert_eq!(added, vec![2, 4]);
+        assert_eq!(removed, vec![3]);
+    }
+
+    /// 配置热更新：解析+校验失败不影响当前状态（fail-soft 语义由
+    /// handle_config_change 内部保证，此处验证纯解析路径）。
+    #[test]
+    fn hot_config_parse_failure_is_recoverable() {
+        // 非法 toml → 解析失败；合法但校验失败 → validate 拒绝
+        assert!(toml::from_str::<Config>("not [valid").is_err());
+        let cfg: Config = toml::from_str(
+            r#"
+[node]
+id = 1
+listen_addr = "127.0.0.1:50051"
+peers = []
+
+[storage]
+data_dir = "./data"
+"#,
+        )
+        .expect("缺 placement 段可解析（serde default 空表）");
+        assert!(cfg.validate().is_err(), "空放置表校验失败（fail-soft 前置）");
+    }
+}
