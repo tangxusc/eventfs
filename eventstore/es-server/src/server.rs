@@ -142,7 +142,7 @@ impl Server {
         .map_err(anyhow::Error::msg)?;
         let raft_service = es_raft::RaftRpcService::new(self.shard_manager.clone());
         let admin_service = es_raft::RaftAdminService::new(self.shard_manager.clone());
-        let migration_service = MigrationService::new(self.route_table.clone());
+        let migration_service = MigrationService::new(self.route_table.clone(), self.shard_manager.clone());
 
         let mut server = tonic::transport::Server::builder();
         // tls_config 必须在 add_service 之前

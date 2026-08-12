@@ -322,11 +322,32 @@ impl EsStorage {
 /// 不直接写 txn 而先攒在这里的原因：同一批 entry 里可能有多条针对同一个 stream
 /// 的 Append，后一条必须看到前一条的版本号。surrealkv 事务内的读不保证能看到
 /// 同事务未提交的写，因此版本号与 next_position 用内存态串接。
+/// 批内操作（有序）：put 与 delete 必须按 apply 顺序交错执行——
+/// 同一 key 在同批先写后删（Append 后 DeleteStream）应删掉，先删后写应保留。
+#[derive(Debug)]
+enum ApplyOp {
+    Put(Vec<u8>, Vec<u8>),
+    Delete(Vec<u8>),
+}
+
+impl ApplyBatch {
+    /// 压入 Delete：先移除批内同 key 的既有 Put（键级后操作覆盖——
+    /// Delete 在后 ⇒ 前面的 Put 作废），保证「同批先写后删」语义，
+    /// 且批内 Append 的写入（事件/指针/幂等索引）无需显式收集删除。
+    fn push_delete(&mut self, key: Vec<u8>) {
+        self.ops.retain(|op| !matches!(op, ApplyOp::Put(k, _) if *k == key));
+        self.ops.push(ApplyOp::Delete(key));
+    }
+}
+
 struct ApplyBatch {
-    /// 待写入的 kv
-    puts: Vec<(Vec<u8>, Vec<u8>)>,
+    /// 待执行的有序操作
+    ops: Vec<ApplyOp>,
     /// stream_id -> 该批次内的最新版本号（None 表示流仍不存在）
     stream_versions: std::collections::HashMap<String, Option<u64>>,
+    /// 本批已删除的流（Delete 排队未提交时，存储里的旧 meta 会误导
+    /// batch_stream_version——deleted 优先判定流不存在）
+    deleted: std::collections::HashSet<String>,
     /// 分片内下一个可用 position
     next_position: u64,
     /// 本批次新产生的事件（用于 commit 后广播）
@@ -340,6 +361,11 @@ impl EsStorage {
         batch: &ApplyBatch,
         stream_id: &str,
     ) -> es_core::Result<Option<u64>> {
+        // 本批已删除的流：即使存储里还有旧 meta（Delete 排队未提交），
+        // 也判定为不存在（先删后写同批语义）
+        if batch.deleted.contains(stream_id) {
+            return Ok(None);
+        }
         if let Some(v) = batch.stream_versions.get(stream_id) {
             return Ok(*v);
         }
@@ -376,6 +402,99 @@ impl EsStorage {
                 _ => Err(actual),
             },
         }
+    }
+
+    /// 处理 DeleteStream：同事务删除该流全部数据（事件、StreamMeta、
+    /// 幂等索引、position 指针）。删除不存在的流 = no-op（幂等，迁移清尾可重跑）。
+    ///
+    /// position 指针在 apply 内同步扫描删除（DeleteStream 是低频操作，
+    /// 全 ptr 区扫描可接受），保证与事件删除同一事务、崩溃一致；
+    /// 不残留孤儿指针（即使残留，resolve_position_ptrs 对缺失事件静默跳过）。
+    fn apply_delete(&self, batch: &mut ApplyBatch, stream_id: &str) -> es_core::Result<EsResponse> {
+        let shard = self.shard_id();
+
+        // 判据：本批已 Append 过（批内写入尚未提交，存储扫描不到）
+        // 或存储中已有该流数据。批内 Append 的 Put 由后续 Delete op 覆盖
+        // （同 key 后操作生效），无需显式收集其事件 key。
+        let in_batch = batch.stream_versions.contains_key(stream_id);
+
+        // 1. 扫描该流全部事件：收集事件 key 与 event_id（幂等索引删除用）。
+        //    多删无害：幂等索引是加速索引，不存在的事件 id 删除是 no-op。
+        let prefix = key::sm_event_prefix(shard, stream_id);
+        let end = match key::successor(&prefix) {
+            Some(e) => e,
+            None => return Ok(EsResponse::DeleteOk),
+        };
+        let mut deleted_any = false;
+        let mut idem_keys: Vec<Vec<u8>> = Vec::new();
+        let mut event_keys: Vec<Vec<u8>> = Vec::new();
+        for (k, v) in self.scan_kv(prefix, end)? {
+            deleted_any = true;
+            event_keys.push(k);
+            if let Ok(ev) = decode_event(&v) {
+                idem_keys.push(key::sm_idempotency(shard, &ev.event_id));
+            }
+        }
+        // 批内 Append 的幂等索引 key（事件在 batch.new_events，存储还没有）
+        for ev in &batch.new_events {
+            if ev.stream_id == stream_id {
+                idem_keys.push(key::sm_idempotency(shard, &ev.event_id));
+            }
+        }
+
+        if !in_batch && !deleted_any {
+            // 2a. 流不存在（批内外都没有）：no-op（幂等）
+            batch.stream_versions.remove(stream_id);
+            return Ok(EsResponse::DeleteOk);
+        }
+
+        // 2b. 扫描 position 指针区：删除指向该流的全部指针
+        let pstart = key::sm_position_prefix(shard);
+        let pend = match key::successor(&pstart) {
+            Some(e) => e,
+            None => return Ok(EsResponse::DeleteOk),
+        };
+        let mut ptr_keys: Vec<Vec<u8>> = Vec::new();
+        for (k, v) in self.scan_kv(pstart, pend)? {
+            if let Ok((s, _v)) = crate::encode::decode::<(String, u64)>(&v) {
+                if s == stream_id {
+                    ptr_keys.push(k);
+                }
+            }
+        }
+        // 批内 Put 的事件/指针 key（本批 Append 写入、存储中还没有）：
+        // 事件值可解码为 Event，指针值为 (String, u64)
+        for op in &batch.ops {
+            if let ApplyOp::Put(k, v) = op {
+                if let Ok(ev) = decode_event(v) {
+                    if ev.stream_id == stream_id {
+                        event_keys.push(k.clone());
+                    }
+                } else if let Ok((s, _)) = crate::encode::decode::<(String, u64)>(v) {
+                    if s == stream_id {
+                        ptr_keys.push(k.clone());
+                    }
+                }
+            }
+        }
+
+        // 3. 删除全部（push_delete 键级覆盖：批内同 key 的 Put 一并作废）
+        for k in event_keys {
+            batch.push_delete(k);
+        }
+        for k in idem_keys {
+            batch.push_delete(k);
+        }
+        for k in ptr_keys {
+            batch.push_delete(k);
+        }
+        batch.push_delete(key::sm_stream_meta(shard, stream_id));
+        // 批内版本缓存清掉：后续同批 Append 重新从存储读；
+        // deleted 标记使 batch_stream_version 判定流不存在
+        batch.stream_versions.remove(stream_id);
+        batch.deleted.insert(stream_id.to_string());
+
+        Ok(EsResponse::DeleteOk)
     }
 
     /// 处理一条 Append 请求，把写入累积到 batch。
@@ -446,16 +565,18 @@ impl EsStorage {
             };
             let ev_bytes = crate::encode::encode(&stored)
                 .map_err(|e| es_core::Error::Serde(format!("Event 序列化失败: {e}")))?;
-            batch
-                .puts
-                .push((key::sm_event(shard, stream_id, version), ev_bytes));
+            batch.ops.push(ApplyOp::Put(
+                key::sm_event(shard, stream_id, version),
+                ev_bytes,
+            ));
 
             // position 指针，供分片内 $all 流按提交序读取
             let ptr = crate::encode::encode(&(stream_id, version))
                 .map_err(|e| es_core::Error::Serde(format!("position 指针序列化失败: {e}")))?;
-            batch
-                .puts
-                .push((key::sm_position_ptr(shard, position), ptr));
+            batch.ops.push(ApplyOp::Put(
+                key::sm_position_ptr(shard, position),
+                ptr,
+            ));
 
             // 记录新事件（用于 commit 后广播）
             batch.new_events.push(stored);
@@ -476,7 +597,7 @@ impl EsStorage {
             first_position,
         ))
         .map_err(|e| es_core::Error::Serde(format!("幂等索引序列化失败: {e}")))?;
-        batch.puts.push((
+        batch.ops.push(ApplyOp::Put(
             key::sm_idempotency(shard, &events[0].event_id),
             idem_v,
         ));
@@ -487,14 +608,15 @@ impl EsStorage {
         };
         let meta_bytes = crate::encode::encode(&meta)
             .map_err(|e| es_core::Error::Serde(format!("StreamMeta 序列化失败: {e}")))?;
-        batch
-            .puts
-            .push((key::sm_stream_meta(shard, stream_id), meta_bytes));
+        batch.ops.push(ApplyOp::Put(
+            key::sm_stream_meta(shard, stream_id),
+            meta_bytes,
+        ));
 
-        // 批内累积版本号，供同批后续 Append 看到
-        batch
-            .stream_versions
-            .insert(stream_id.to_string(), Some(last_version));
+        // 批内累积版本号，供同批后续 Append 看到；
+        // 重建流（先删后写）清除 deleted 标记
+        batch.stream_versions.insert(stream_id.to_string(), Some(last_version));
+        batch.deleted.remove(stream_id);
 
         Ok(EsResponse::AppendOk {
             next_expected_version: last_version,
@@ -576,8 +698,9 @@ impl RaftStateMachine<TypeConfig> for EsStorage {
     {
         let shard = self.shard_id();
         let mut batch = ApplyBatch {
-            puts: Vec::new(),
+            ops: Vec::new(),
             stream_versions: std::collections::HashMap::new(),
+            deleted: std::collections::HashSet::new(),
             next_position: self.read_next_position().map_err(sm_read_err)?,
             new_events: Vec::new(),
         };
@@ -610,6 +733,10 @@ impl RaftStateMachine<TypeConfig> for EsStorage {
                             .map_err(sm_write_err)?;
                         responses.push(resp);
                     }
+                    EsRequest::DeleteStream { stream_id } => {
+                        let resp = self.apply_delete(&mut batch, stream_id).map_err(sm_write_err)?;
+                        responses.push(resp);
+                    }
                 },
                 EntryPayload::Membership(ref mem) => {
                     membership = Some(StoredMembership::new(Some(entry.log_id), mem.clone()));
@@ -624,7 +751,9 @@ impl RaftStateMachine<TypeConfig> for EsStorage {
 
         // next_position 计数器
         let np = crate::encode::encode(&batch.next_position).map_err(sm_write_err)?;
-        batch.puts.push((key::sm_next_position(shard), np));
+        batch
+            .ops
+            .push(ApplyOp::Put(key::sm_next_position(shard), np));
 
         // 已应用状态：与业务数据同事务提交，保证重启后 last_applied 与数据一致
         let mut cache = self.sm_cache().write().await;
@@ -636,13 +765,16 @@ impl RaftStateMachine<TypeConfig> for EsStorage {
         };
         let applied_bytes = crate::encode::encode(&applied).map_err(sm_write_err)?;
         batch
-            .puts
-            .push((key::sm_applied_state(shard), applied_bytes));
+            .ops
+            .push(ApplyOp::Put(key::sm_applied_state(shard), applied_bytes));
 
-        // 单事务提交全部写入
+        // 单事务按序提交全部操作（put/delete 交错，保批内语义）
         let mut txn = self.tree().begin().map_err(sm_write_err)?;
-        for (k, v) in &batch.puts {
-            txn.set(k.clone(), v.clone()).map_err(sm_write_err)?;
+        for op in &batch.ops {
+            match op {
+                ApplyOp::Put(k, v) => txn.set(k.clone(), v.clone()).map_err(sm_write_err)?,
+                ApplyOp::Delete(k) => txn.delete(k.clone()).map_err(sm_write_err)?,
+            }
         }
         txn.commit().await.map_err(sm_write_err)?;
 

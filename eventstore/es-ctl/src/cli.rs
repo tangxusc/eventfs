@@ -216,6 +216,8 @@ pub enum Command {
     CreateStream(CreateStreamArgs),
     /// 查看/校准流路由表（stream → shard 归属）
     Route(RouteArgs),
+    /// 在线迁移流到目标分片（流的数据处理不暂停；取代旧 reshard）
+    Migrate(MigrateArgs),
     /// 订阅流事件：先追平历史（catch-up），追平后实时推送
     Watch(WatchArgs),
     /// 初始化分片集群（把给定成员写入首条 membership 日志，只需在一个节点调用一次）
@@ -224,8 +226,6 @@ pub enum Command {
     Member(MemberArgs),
     /// 各端点健康与分片归属视图
     Status(StatusArgs),
-    /// 离线重分布：变更分片数（需集群停机，直接操作数据目录）
-    Reshard(ReshardArgs),
     /// 快照管理（离线操作数据目录）
     Snapshot(SnapshotArgs),
 }
@@ -376,6 +376,34 @@ pub struct RouteArgs {
     /// 校准 per-shard 流计数（从路由表重建）
     #[arg(long)]
     pub recount: bool,
+}
+
+/// `esctl migrate`
+#[derive(Args, Debug)]
+pub struct MigrateArgs {
+    /// 迁移单个流
+    #[arg(long, conflicts_with = "shard")]
+    pub stream: Option<String>,
+
+    /// 迁移整个分片的全部流（逐流独立状态机，失败隔离）
+    #[arg(long, conflicts_with = "stream")]
+    pub shard: Option<u64>,
+
+    /// 目标分片
+    #[arg(long)]
+    pub to: u64,
+
+    /// 只报告迁移计划与版本差，不执行
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// 排水收敛判定：源分片连续 N 次（间隔 2s）无新增即认为收敛
+    #[arg(long, default_value_t = 2)]
+    pub drain_quiet_rounds: u32,
+
+    /// 排水超时（秒），超时退出（数据无害，可重跑）
+    #[arg(long, default_value_t = 300)]
+    pub drain_timeout_secs: u64,
 }
 
 #[derive(Args, Debug)]

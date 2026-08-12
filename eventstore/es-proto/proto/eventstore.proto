@@ -252,6 +252,7 @@ message ListShardsResponse {
 // 流路由表同步与迁移辅助服务。
 // 路由表（stream → shard）是「专门文件 + 热更新」的分布式实现：
 // 变更节点落盘本地 routes.json 后整表广播，接收方按版本号仲裁采纳。
+// 迁移原语按显式 shard 寻址（不走路由表），供在线迁移工具（esctl migrate）使用。
 service Migration {
   // 拉取路由表（重启恢复 / 探测用）
   rpc GetRouteTable(GetRouteTableRequest) returns (GetRouteTableResponse);
@@ -261,6 +262,16 @@ service Migration {
   rpc SetStreamShard(SetStreamShardRequest) returns (SetStreamShardResponse);
   // 校准 per-shard 流计数（recount）
   rpc RecountStreams(RecountStreamsRequest) returns (RecountStreamsResponse);
+  // 迁移复制写入：显式 shard + 保留源 HLC（不走路由表、不做隐式建流）
+  rpc AppendMigrated(AppendMigratedRequest) returns (AppendMigratedResponse);
+  // 迁移清尾：删除源 shard 上的流（幂等 no-op）
+  rpc DeleteStreamFromShard(DeleteStreamFromShardRequest) returns (DeleteStreamFromShardResponse);
+  // 显式 shard 读流（迁移排水/校验用；不走路由表，路由表已切换时仍可读源）
+  rpc ReadStreamFromShard(ReadStreamFromShardRequest) returns (stream ReadEventsResponse);
+  // 显式 shard 读流元数据
+  rpc GetStreamMetaFromShard(GetStreamMetaFromShardRequest) returns (GetStreamMetaResponse);
+  // 列出 shard 上的全部流（迁移枚举 / route check 孤儿检测）
+  rpc ListStreams(ListStreamsRequest) returns (ListStreamsResponse);
 }
 
 // 路由表快照（与 es-core::route::RouteTable 字段一一对应）
@@ -296,6 +307,61 @@ message RecountStreamsRequest {}
 message RecountStreamsResponse {
   // 校准后的路由表
   RouteTable table = 1;
+}
+
+// 迁移复制写入：单事件一条 raft 日志（hlc 由请求携带保留源时间戳），
+// 按显式 shard 寻址（不查路由表、不隐式建流）。逐条写入使幂等索引
+// 逐事件记录，重放安全；迁移工具按期望版本链驱动。
+message AppendMigratedRequest {
+  uint64 shard_id = 1;
+  string stream_id = 2;
+  ExpectedVersion expected_version = 3;
+  MigratedEvent event = 4;
+}
+
+// 迁移事件：NewEvent + hlc
+message MigratedEvent {
+  bytes event_id = 1;
+  string event_type = 2;
+  bytes data = 3;
+  bytes metadata = 4;
+  Hlc hlc = 5;
+}
+
+message AppendMigratedResponse {
+  // 追加后的当前版本
+  uint64 next_expected_version = 1;
+  // 与 AppendResponse 同语义（迁移工具用于版本链续写）
+  uint64 first_position = 2;
+  uint64 last_position = 3;
+  uint64 shard_id = 4;
+}
+
+message DeleteStreamFromShardRequest {
+  uint64 shard_id = 1;
+  string stream_id = 2;
+}
+
+message DeleteStreamFromShardResponse {}
+
+message ReadStreamFromShardRequest {
+  uint64 shard_id = 1;
+  string stream_id = 2;
+  uint64 from_version = 3;
+  uint64 max_count = 4;
+}
+
+message GetStreamMetaFromShardRequest {
+  uint64 shard_id = 1;
+  string stream_id = 2;
+}
+
+message ListStreamsRequest {
+  uint64 shard_id = 1;
+}
+
+message ListStreamsResponse {
+  repeated string stream_ids = 1;
 }
 
 // 集群成员：node_id 与其 Raft RPC 地址

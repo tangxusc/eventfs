@@ -45,6 +45,11 @@ async fn start_server() -> (
         limits: Default::default(),
     };
 
+    // 测试服务器日志（try_init 幂等，多个测试共用进程不重复初始化）
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new("es_server=debug,es_storage=debug"))
+        .try_init();
+
     let server = Server::new(config.clone()).expect("创建服务器");
     server.init().await.expect("初始化");
 
@@ -77,12 +82,15 @@ async fn start_server() -> (
                 es_server::service::EsService::with_limits(
                     sm.clone(),
                     config.limits.clone(),
-                    route_table,
+                    route_table.clone(),
                     &config,
                 )
                 .expect("创建服务"),
             ))
-            .add_service(RaftAdminServer::new(es_raft::RaftAdminService::new(sm)))
+            .add_service(RaftAdminServer::new(es_raft::RaftAdminService::new(sm.clone())))
+            .add_service(es_proto::eventstore::migration_server::MigrationServer::new(
+                es_server::migration_service::MigrationService::new(route_table, sm),
+            ))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await;
     });
@@ -142,12 +150,15 @@ async fn start_server_uninitialized(num_shards: u64) -> (
                 es_server::service::EsService::with_limits(
                     sm.clone(),
                     config.limits.clone(),
-                    route_table,
+                    route_table.clone(),
                     &config,
                 )
                 .expect("创建服务"),
             ))
-            .add_service(RaftAdminServer::new(es_raft::RaftAdminService::new(sm)))
+            .add_service(RaftAdminServer::new(es_raft::RaftAdminService::new(sm.clone())))
+            .add_service(es_proto::eventstore::migration_server::MigrationServer::new(
+                es_server::migration_service::MigrationService::new(route_table, sm),
+            ))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await;
     });
@@ -1132,5 +1143,121 @@ async fn member_cas_stale_snapshot_rejected() {
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(err.message().contains("成员集合已变更"), "{}", err.message());
 
+    handle.abort();
+}
+
+/// migrate：单流在线迁移（写入 → 迁移 → 目标可读、源清空、路由切换）
+#[tokio::test(flavor = "multi_thread")]
+async fn migrate_single_stream_roundtrip() {
+    let (addr, handle, _server, _dir) = start_server().await;
+
+    // 写 3 条（分配到 shard 0，最少流）
+    for i in 0..3 {
+        let out = esctl(
+            &addr,
+            &["append", "mig/s1", "--event-type", "T", "--data", &i.to_string()],
+        );
+        assert!(out.status.success(), "{}", stderr(&out));
+    }
+
+    // 迁移到 shard 1
+    let out = esctl(&addr, &["migrate", "--stream", "mig/s1", "--to", "1"]);
+    assert!(out.status.success(), "migrate 失败: {}", stderr(&out));
+
+    // 路由表指向 shard 1；读 3 条（经路由表）；meta 版本 2
+    let out = esctl(&addr, &["route"]);
+    let text = stdout(&out);
+    assert!(text.contains("mig/s1 -> shard 1"), "路由应指向新分片: {text}");
+
+    let out = esctl(&addr, &["read", "mig/s1"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out).matches("[T]").count(), 3, "应读到 3 条: {}", stdout(&out));
+
+    let out = esctl(&addr, &["meta", "mig/s1"]);
+    assert!(stdout(&out).contains("current_version: 2"), "{}", stdout(&out));
+
+    // 迁移后仍可追加（目标分片继续写入）
+    let out = esctl(&addr, &["append", "mig/s1", "--event-type", "T", "--data", "x"]);
+    assert!(out.status.success(), "迁移后追加失败: {}", stderr(&out));
+    handle.abort();
+}
+
+/// migrate：迁移期间持续生产（后台不断写源），全部事件最终在目标
+#[tokio::test(flavor = "multi_thread")]
+async fn migrate_with_live_producer() {
+    let (addr, handle, _server, _dir) = start_server().await;
+
+    // 预写 2 条建立流
+    for i in 0..2 {
+        let out = esctl(&addr, &["append", "mig/live", "--event-type", "T", "--data", &i.to_string()]);
+        assert!(out.status.success(), "{}", stderr(&out));
+    }
+
+    // 后台持续追加（模拟生产）。esctl 是阻塞子进程调用，必须在
+    // spawn_blocking 线程池跑——直接放在 async 任务里会阻塞 worker
+    // 线程，服务器 task 若在同一 worker 上会被冻结（请求超时）
+    let producer_addr = addr.clone();
+    let producer = tokio::spawn(async move {
+        for i in 2..30 {
+            let out = tokio::task::spawn_blocking({
+                let addr = producer_addr.clone();
+                move || esctl(&addr, &["append", "mig/live", "--event-type", "T", "--data", &i.to_string()])
+            })
+            .await
+            .expect("阻塞任务 join");
+            assert!(out.status.success(), "后台追加失败: {}", stderr(&out));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+
+    // 迁移（排水窗口内源仍在写）
+    let out = esctl(&addr, &["migrate", "--stream", "mig/live", "--to", "1"]);
+    assert!(out.status.success(), "migrate 失败: {}", stderr(&out));
+    producer.await.expect("生产者完成");
+
+    // 全部 30 条在目标（路由已切，读即目标）
+    let out = esctl(&addr, &["read", "mig/live"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out).matches("[T]").count(), 30, "全部事件应在目标: {}", stdout(&out));
+    handle.abort();
+}
+
+/// migrate：dry-run 不产生任何变更
+#[tokio::test(flavor = "multi_thread")]
+async fn migrate_dry_run_noop() {
+    let (addr, handle, _server, _dir) = start_server().await;
+    let out = esctl(&addr, &["append", "mig/dry", "--event-type", "T", "--data", "x"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let out = esctl(&addr, &["migrate", "--stream", "mig/dry", "--to", "1", "--dry-run"]);
+    assert!(out.status.success(), "dry-run 失败: {}", stderr(&out));
+    assert!(stdout(&out).contains("dry-run"), "应报告 dry-run: {}", stdout(&out));
+
+    // 路由未变
+    let out = esctl(&addr, &["route"]);
+    assert!(stdout(&out).contains("mig/dry -> shard 0"), "路由不应变化: {}", stdout(&out));
+    handle.abort();
+}
+
+/// migrate：批量 --shard（多个流全部迁移，失败隔离）
+#[tokio::test(flavor = "multi_thread")]
+async fn migrate_shard_batch() {
+    let (addr, handle, _server, _dir) = start_server().await;
+
+    // 写 3 个流（filler 占 shard 0 首位，其余 2 个流落到 shard 1 与 shard 0）
+    for s in ["mig/b1", "mig/b2", "mig/b3"] {
+        let out = esctl(&addr, &["append", s, "--event-type", "T", "--data", "x"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+    }
+
+    // 把整个 shard 0 迁到 shard 1（最少流分配：第一个流在 shard 0，其余在 shard 1）
+    let out = esctl(&addr, &["migrate", "--shard", "0", "--to", "1"]);
+    assert!(out.status.success(), "批量迁移失败: {}", stderr(&out));
+
+    // 所有流路由到 shard 1（3 个流全在 shard 0/1 中，批量迁移后应全部指向 1）
+    let out = esctl(&addr, &["route"]);
+    let text = stdout(&out);
+    assert!(!text.contains("-> shard 0"), "不应再有流指向 shard 0: {text}");
+    assert!(text.contains("mig/b1 -> shard 1"), "b1 应迁到 1: {text}");
     handle.abort();
 }

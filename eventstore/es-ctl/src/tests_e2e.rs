@@ -19,7 +19,7 @@ use tonic::{Request, Response, Status};
 
 use crate::cli::*;
 use crate::client::ClusterClient;
-use crate::commands::{Ctx, append, init, member, meta, read, reshard, status, watch};
+use crate::commands::{Ctx, append, init, member, meta, read, status, watch};
 
 /// 启动单节点测试集群（2 分片，raft 已初始化，gRPC 已监听）。
 /// 返回 (gRPC 地址, Server, TempDir)。
@@ -576,124 +576,6 @@ async fn shards_probe_and_cache() {
     assert_eq!(scope1.count(), 2, "应探测到 2 分片");
     let scope2 = ctx.shards().await.expect("缓存命中");
     assert_eq!(scope1, scope2, "缓存应返回同一结果");
-}
-
-// ---------- reshard（离线，本地目录） ----------
-
-/// 在临时目录建 src 分片布局并写入事件（2 分片，分片 0 两条、分片 1 一条）。
-async fn make_reshard_src(dir: &Path) -> (Vec<es_storage::EsStorage>, tempfile::TempDir) {
-    let tmp = tempfile::tempdir().expect("临时目录");
-    let tree = Arc::new(
-        surrealkv::TreeBuilder::new()
-            .with_path(dir.to_path_buf())
-            .build()
-            .expect("建 src tree"),
-    );
-    let mut sts = (0..2u64)
-        .map(|id| {
-            es_storage::EsStorage::new(
-                id,
-                tree.clone(),
-                es_storage::snapshot::SnapshotConfig {
-                    dir: dir.join("snapshots"),
-                    ..Default::default()
-                },
-            )
-            .expect("建存储")
-        })
-        .collect::<Vec<_>>();
-
-    let entry = |term: u64, index: u64, stream: &str, data: &[u8]| Entry {
-        log_id: LogId::new(CommittedLeaderId::new(term, 0), index),
-        payload: EntryPayload::Normal(es_storage::EsRequest::Append {
-            stream_id: stream.to_string(),
-            expected_version: es_core::ExpectedVersion::NoStream,
-            events: vec![es_core::NewEvent {
-                event_id: uuid::Uuid::new_v4(),
-                event_type: "E".into(),
-                data: data.to_vec(),
-                metadata: vec![],
-            }],
-            hlc: es_core::Hlc { wall: 1, logical: 0 },
-        }),
-    };
-
-    sts[0]
-        .apply(vec![entry(1, 1, "s0", b"a1"), entry(1, 2, "s0", b"a2")])
-        .await
-        .expect("写分片 0");
-    sts[1]
-        .apply(vec![entry(1, 1, "s1", b"b1")])
-        .await
-        .expect("写分片 1");
-    // 释放 LOCK：reshard::run 需要重新打开同一目录（Tree 关闭后不可再用）
-    for st in &sts {
-        st.close().await.expect("关闭 tree");
-    }
-    (sts, tmp)
-}
-
-fn reshard_args(src: &Path, dst: &Path) -> ReshardArgs {
-    ReshardArgs {
-        src_dir: src.to_path_buf(),
-        src_shards: 2,
-        dst_dir: dst.to_path_buf(),
-        dst_shards: 4,
-        yes: true,
-    }
-}
-
-#[tokio::test]
-async fn reshard_full_flow_three_formats() {
-    let dir = tempfile::tempdir().expect("临时目录");
-    let src = dir.path().join("src");
-    let (_sts, _keep) = make_reshard_src(&src).await;
-
-    for fmt in [Format::Simple, Format::Table, Format::Json] {
-        let dst = dir.path().join(format!("dst-{fmt:?}"));
-        reshard::run(fmt, &reshard_args(&src, &dst)).await.expect("reshard 成功");
-    }
-
-    // 目标目录已存在且非空且未 --yes → 拒绝（--yes 时允许覆盖，是另一条路径）
-    let dst = dir.path().join("dst-dup");
-    let args = reshard_args(&src, &dst);
-    reshard::run(Format::Simple, &args).await.expect("首次成功");
-    let no_yes = ReshardArgs {
-        yes: false,
-        ..args
-    };
-    let err = reshard::run(Format::Simple, &no_yes)
-        .await
-        .expect_err("目录非空且未 --yes 应拒绝");
-    assert!(err.to_string().contains("非空"), "{err}");
-}
-
-#[tokio::test]
-async fn reshard_validation_failures() {
-    // 源目录不存在
-    let a = ReshardArgs {
-        src_dir: PathBuf::from("/nonexistent-xyz"),
-        src_shards: 2,
-        dst_dir: PathBuf::from("/tmp/x"),
-        dst_shards: 4,
-        yes: true,
-    };
-    assert!(reshard::run(Format::Simple, &a).await.is_err());
-
-    // --src-shards 与目录实际分片数不符
-    let dir = tempfile::tempdir().expect("临时目录");
-    let src = dir.path().join("src2");
-    let (_sts, _keep) = make_reshard_src(&src).await;
-    let dst = dir.path().join("dst2");
-    let a = ReshardArgs {
-        src_dir: src,
-        src_shards: 7, // 实际 2
-        dst_dir: dst,
-        dst_shards: 4,
-        yes: true,
-    };
-    let err = reshard::run(Format::Simple, &a).await.expect_err("分片数不符应报错");
-    assert!(err.to_string().contains("不一致"), "{err}");
 }
 
 // ---------- 行为可配置 stub（client.rs 网络错误分支） ----------

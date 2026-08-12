@@ -245,6 +245,21 @@ impl ClusterClient {
         Ok(resp)
     }
 
+    /// 定位 shard 的 leader 端点（GetRaftState 探测全部端点，is_leader 命中即返回）。
+    ///
+    /// 迁移工具用：写/读统一走 shard leader（leader 必承载该 shard）。
+    /// 返回已 normalize 的端点地址；无 leader（选举中/集群未组建）返回 None。
+    pub async fn find_shard_leader(&self, shard_id: u64) -> Option<String> {
+        for ep in self.endpoints() {
+            if let Ok(r) = self.get_raft_state_via(ep, shard_id).await {
+                if r.is_leader {
+                    return Some(ep.clone());
+                }
+            }
+        }
+        None
+    }
+
     /// 调单个端点的 ListShards（返回该节点承载的分片；NotFound 等状态原样返回）。
     ///
     /// 分片探测用：各节点只承载放置表分配的子集，集群全部分片 = 全部端点并集。

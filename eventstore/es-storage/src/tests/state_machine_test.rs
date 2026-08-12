@@ -1054,3 +1054,108 @@ async fn snapshot_restore_replaces_snapshot_dir() {
         names[0]
     );
 }
+
+// ---- DeleteStream：在线迁移清尾语义 ----
+
+/// 构造 DeleteStream entry
+fn delete_entry(index: u64, stream: &str) -> openraft::Entry<crate::TypeConfig> {
+    let mut e = entry_with(1, index, stream, ExpectedVersion::Any, vec![]);
+    e.payload = EntryPayload::Normal(crate::EsRequest::DeleteStream {
+        stream_id: stream.to_string(),
+    });
+    e
+}
+
+#[tokio::test]
+async fn delete_removes_all_stream_data() {
+    let (mut st, _d) = new_storage(0);
+
+    // 写 2 条 → 删除
+    st.apply(vec![append_entry(
+        0,
+        "s1",
+        ExpectedVersion::NoStream,
+        vec![new_event("E", b"a"), new_event("E", b"b")],
+    )])
+    .await
+    .expect("append");
+    st.apply(vec![delete_entry(1, "s1")]).await.expect("delete");
+
+    // 读流空、meta 不存在、$all 空
+    assert!(st.read_stream_events("s1", 0, 0).expect("读流").is_empty());
+    assert!(st.read_stream_meta("s1").expect("读 meta").is_none());
+    assert!(
+        st.read_all_events(0, 0).expect("读 all").is_empty(),
+        "$all 不应再看到被删流的事件（position 指针已清理）"
+    );
+
+    // 删除后 NoStream 可重新创建（版本从 0 重新开始）
+    let resp = st
+        .apply(vec![append_entry(
+            2,
+            "s1",
+            ExpectedVersion::NoStream,
+            vec![new_event("E", b"c")],
+        )])
+        .await
+        .expect("重建");
+    match &resp[0] {
+        EsResponse::AppendOk { next_expected_version, .. } => {
+            assert_eq!(*next_expected_version, 0, "重建后版本重新从 0 起");
+        }
+        other => panic!("应成功，实际: {other:?}"),
+    }
+    let evs = st.read_stream_events("s1", 0, 0).expect("读流");
+    assert_eq!(evs.len(), 1);
+    assert_eq!(evs[0].data, b"c");
+}
+
+#[tokio::test]
+async fn delete_nonexistent_is_noop() {
+    let (mut st, _d) = new_storage(0);
+    let resp = st
+        .apply(vec![delete_entry(0, "ghost")])
+        .await
+        .expect("delete 不存在流");
+    assert!(matches!(resp[0], EsResponse::DeleteOk), "应返回 DeleteOk: {:?}", resp[0]);
+    // 无副作用：$all 仍空、next_position 不推进
+    assert!(st.read_all_events(0, 0).expect("读 all").is_empty());
+}
+
+#[tokio::test]
+async fn delete_then_append_same_batch_recreates() {
+    let (mut st, _d) = new_storage(0);
+    // 同批：先删后写 → 流应存在（后操作覆盖）
+    st.apply(vec![append_entry(0, "s1", ExpectedVersion::NoStream, vec![new_event("E", b"a")])])
+        .await
+        .expect("写");
+    let resp = st
+        .apply(vec![
+            delete_entry(1, "s1"),
+            append_entry(2, "s1", ExpectedVersion::NoStream, vec![new_event("E", b"b")]),
+        ])
+        .await
+        .expect("同批先删后写");
+    assert!(matches!(resp[0], EsResponse::DeleteOk));
+    assert!(matches!(resp[1], EsResponse::AppendOk { .. }));
+    let evs = st.read_stream_events("s1", 0, 0).expect("读流");
+    assert_eq!(evs.len(), 1, "后写应保留");
+    assert_eq!(evs[0].data, b"b");
+}
+
+#[tokio::test]
+async fn append_then_delete_same_batch_removes() {
+    let (mut st, _d) = new_storage(0);
+    // 同批：先写后删 → 流不存在（后操作覆盖）
+    let resp = st
+        .apply(vec![
+            append_entry(0, "s1", ExpectedVersion::NoStream, vec![new_event("E", b"a")]),
+            delete_entry(1, "s1"),
+        ])
+        .await
+        .expect("同批先写后删");
+    assert!(matches!(resp[0], EsResponse::AppendOk { .. }));
+    assert!(matches!(resp[1], EsResponse::DeleteOk));
+    assert!(st.read_stream_meta("s1").expect("读 meta").is_none());
+    assert!(st.read_all_events(0, 0).expect("读 all").is_empty());
+}

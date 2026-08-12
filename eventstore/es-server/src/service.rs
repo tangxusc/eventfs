@@ -227,7 +227,8 @@ fn merge_by_hlc(
 /// leader 的 node_id 与地址。必须把地址透出给客户端，否则客户端只能盲目重试
 /// 其它节点。错误码用 `Unavailable`——它是 gRPC 的可重试语义，
 /// 客户端拿到后应重定向到 message 中的地址。
-fn client_write_to_status(
+/// pub(crate)：migration_service（AppendMigrated/DeleteStreamFromShard）复用。
+pub(crate) fn client_write_to_status(
     e: openraft::error::RaftError<u64, openraft::error::ClientWriteError<u64, openraft::BasicNode>>,
 ) -> Status {
     use openraft::error::{ClientWriteError, RaftError};
@@ -255,7 +256,8 @@ fn client_write_to_status(
 }
 
 /// proto ExpectedVersion 转领域模型
-fn proto_to_expected_version(ev: ExpectedVersion) -> es_core::ExpectedVersion {
+/// pub(crate)：migration_service（AppendMigrated）复用。
+pub(crate) fn proto_to_expected_version(ev: ExpectedVersion) -> es_core::ExpectedVersion {
     match ev.kind {
         Some(expected_version::Kind::Any(_)) => es_core::ExpectedVersion::Any,
         Some(expected_version::Kind::NoStream(_)) => es_core::ExpectedVersion::NoStream,
@@ -443,6 +445,9 @@ impl EventStore for EsService {
                     "optimistic conflict: actual_version={}",
                     actual_version
                 )))
+            }
+            es_storage::EsResponse::DeleteOk => {
+                Err(Status::internal("append 返回 DeleteOk（不应发生）"))
             }
         }
     }

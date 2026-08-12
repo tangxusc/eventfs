@@ -18,6 +18,9 @@ pub enum EsRequest {
         /// 后者会让同一条事件在不同副本上带不同时间戳，状态机不再确定性。
         hlc: Hlc,
     },
+    /// 删除流（在线迁移清尾用）：同事务删除该流全部事件、StreamMeta、
+    /// 幂等索引与 position 指针。删除不存在的流 = no-op（幂等）。
+    DeleteStream { stream_id: String },
 }
 
 /// Raft 应用层响应
@@ -31,6 +34,8 @@ pub enum EsResponse {
     },
     /// 乐观并发冲突
     OptimisticConflict { actual_version: u64 },
+    /// 删除流成功（含删除不存在流的幂等 no-op）
+    DeleteOk,
 }
 
 // Raft 类型配置：绑定应用请求/响应、节点 ID、日志条目与快照数据类型

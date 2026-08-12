@@ -54,11 +54,11 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Meta(a) => commands::meta::run(&ctx, &a).await,
         Command::CreateStream(a) => commands::create_stream::run(&ctx, &a).await,
         Command::Route(a) => commands::route::run(&ctx, &a).await,
+        Command::Migrate(a) => commands::migrate::run(&ctx, &a).await,
         Command::Watch(a) => commands::watch::run(&ctx, &a).await,
         Command::Init(a) => commands::init::run(&ctx, &a).await,
         Command::Member(a) => commands::member::run(&ctx, &a).await,
         Command::Status(a) => commands::status::run(&ctx, &a).await,
-        Command::Reshard(a) => commands::reshard::run(ctx.format, &a).await,
         Command::Snapshot(a) => match a.action {
             crate::cli::SnapshotAction::List(args) => {
                 commands::snapshot::list(ctx.format, &args).await
