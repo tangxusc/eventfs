@@ -376,6 +376,11 @@ pub struct RouteArgs {
     /// 校准 per-shard 流计数（从路由表重建）
     #[arg(long)]
     pub recount: bool,
+
+    /// 孤儿流检测：对比各分片实际存储的流与路由表，报告
+    /// 「存储有但路由表无」（孤儿）与「路由表指向与存储不一致」（虚挂）
+    #[arg(long, conflicts_with = "recount")]
+    pub check: bool,
 }
 
 /// `esctl migrate`

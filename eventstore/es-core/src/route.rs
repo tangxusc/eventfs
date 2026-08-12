@@ -200,3 +200,54 @@ mod tests {
         assert_eq!(back, t);
     }
 }
+
+#[cfg(test)]
+mod fuzz {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// 分配不变量：分配的 shard 必在集合内；计数单调不变量在 insert 后成立
+    proptest! {
+        #[test]
+        fn allocate_always_in_set(
+            stream in "[a-z]{0,20}",
+            shards in prop::collection::vec(0u64..8, 1..4),
+            counts in prop::collection::vec(0u64..100, 0..8),
+        ) {
+            let set: BTreeSet<u64> = shards.into_iter().collect();
+            let mut t = RouteTable::new();
+            // 随机初始计数（含不在集合内的 shard 计数，验证跳过逻辑）
+            for (i, c) in counts.into_iter().enumerate() {
+                t.shard_stream_counts.insert(i as u64, c);
+            }
+            let chosen = t.allocate(&stream, &set);
+            prop_assert!(chosen.is_some(), "非空集合必有分配");
+            prop_assert!(set.contains(&chosen.unwrap()), "分配结果必在集合内");
+        }
+    }
+
+    /// 插入-分配交替：分配出的 shard 计数在 insert 后必为所选 shard 的最小值之一
+    proptest! {
+        #[test]
+        fn insert_then_allocate_consistent(
+            streams in prop::collection::vec("[a-z]{1,10}", 1..10),
+        ) {
+            let set: BTreeSet<u64> = (0u64..3).collect();
+            let mut t = RouteTable::new();
+            for s in &streams {
+                let chosen = t.allocate(s, &set).unwrap();
+                t.insert(s, chosen);
+            }
+            // 全部流已插入（重复流名 insert 幂等）：总计数 = 唯一流数
+            let total: u64 = t.shard_stream_counts.values().sum();
+            let unique: std::collections::BTreeSet<&String> = streams.iter().collect();
+            prop_assert_eq!(total, unique.len() as u64);
+            // 计数与 streams 映射一致（recount 幂等）
+            let mut expect: BTreeMap<u64, u64> = BTreeMap::new();
+            for &shard in t.streams.values() {
+                *expect.entry(shard).or_insert(0) += 1;
+            }
+            prop_assert_eq!(t.shard_stream_counts, expect);
+        }
+    }
+}

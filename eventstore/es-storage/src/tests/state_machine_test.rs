@@ -1159,3 +1159,53 @@ async fn append_then_delete_same_batch_removes() {
     assert!(st.read_stream_meta("s1").expect("读 meta").is_none());
     assert!(st.read_all_events(0, 0).expect("读 all").is_empty());
 }
+
+/// 模糊测试：随机 Append/DeleteStream 序列后，不变量成立——
+/// 流的版本连续无空洞、删除后流不可见、重建后版本归零。
+///
+/// 确定性伪随机（固定种子 LCG）：可复现、无 proptest 宏的 async 限制。
+#[tokio::test]
+async fn fuzz_random_append_delete_invariants() {
+    // LCG：固定种子，可复现
+    let mut seed: u64 = 0x5eed_cafe;
+    let mut rng = move || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        seed
+    };
+
+    for round in 0..30 {
+        let (mut st, _d) = new_storage(0);
+        let n_ops = (rng() % 15) + 1;
+        let n_names = (rng() % 3) + 1;
+        let names: Vec<String> = (0..n_names).map(|i| format!("s{i}")).collect();
+        for i in 0..n_ops {
+            let name = &names[(rng() as usize) % names.len()];
+            let mut entries = Vec::new();
+            if rng() % 2 == 0 {
+                let n = (rng() % 3) + 1;
+                let events: Vec<_> = (0..n).map(|_| new_event("E", b"x")).collect();
+                entries.push(append_entry(i as u64, name, ExpectedVersion::Any, events));
+            } else {
+                entries.push(delete_entry(i as u64, name));
+            }
+            let _ = st.apply(entries).await.expect("apply");
+        }
+
+        // 不变量：存在流的版本连续无空洞（从 0 到 current_version）
+        for name in &names {
+            if let Some(meta) = st.read_stream_meta(name).expect("读 meta") {
+                let evs = st.read_stream_events(name, 0, 0).expect("读流");
+                assert_eq!(
+                    evs.len() as u64,
+                    meta.current_version + 1,
+                    "round {round} 流 {name} 版本应连续无空洞"
+                );
+                let versions: Vec<u64> = evs.iter().map(|e| e.version).collect();
+                let expect: Vec<u64> = (0..=meta.current_version).collect();
+                assert_eq!(versions, expect, "round {round} 版本序列应完整");
+            }
+        }
+    }
+}

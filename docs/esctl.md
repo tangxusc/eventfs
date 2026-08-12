@@ -2,7 +2,7 @@
 
 `esctl` 是参照 [etcdctl](https://etcd.io/docs/latest/etcdctl/) 的 EventStore 管理工具，
 独立二进制（workspace 成员 `es-ctl`），覆盖数据面读写、订阅、集群组建与管理、
-端点健康、离线 reshard。
+端点健康、在线迁移。
 
 ## 构建
 
@@ -21,7 +21,7 @@ cargo build --bin esctl
 | `--cacert <FILE>` | 无 | 严格校验服务端证书的 CA 文件（PEM）；与 `--insecure-skip-tls-verify` 互斥；仅 https 端点生效 |
 | `--insecure-skip-tls-verify` | false | 跳过 https 端点证书校验（自签友好，默认行为）；仅 https 端点生效 |
 | `-w, --write-out <FMT>` | simple | 输出格式：`simple`（逐行文本）/ `table`（对齐表格）/ `json`（结构化） |
-| `--shards <N>` | 自动探测 | 分片总数（≥ 1，`0` 是参数错误）；缺省时对 shard 0,1,2,… 逐次 `GetRaftState` 探测（首个 `not_found` 即边界），探测失败回退默认 8 并告警 |
+| `--shards <N>` | 自动探测 | 分片范围：显式指定时 = `0..N`（不触网）；缺省时逐端点 `ListShards` 取**并集**（节点只承载放置表分配的部分分片，旧「GetRaftState 连续扫描」在部分承载布局下会误探到 0）；探测失败回退默认 8 并告警 |
 
 退出码：**0** 成功 / **1** 运行时失败（连接失败、无 leader、乐观并发冲突等）/ **2** 参数错误（clap）。
 
@@ -40,6 +40,16 @@ esctl append <STREAM> --event-type <TYPE> (--data <STR> | --data-file <PATH>)
 期望版本冲突时报错并退出码 1。
 
 ```
+esctl create-stream <STREAM>
+```
+
+显式创建流：服务端分配 shard（大致最少流）并记录路由表，返回 `shard_id` 与
+目标分片 leader 地址（尽力探测，未知为空串）。幂等：流已存在时返回现有归属
+（`exists=true`），不重复分配。**append 未知名流会隐式建流**（服务端分配并
+记录归属），但读（`read`/`meta`）未创建流返回 NotFound（显式分配语义）。
+预显示的「路由分片」仅为提示，以服务端落盘归属为准。
+
+```
 esctl read <STREAM> [--from-version <N=0>] [--max-count <N=0>] [--backward]
 esctl readall [--from-position <N=0>] [--from-positions <"shard:pos,...">]
        [--max-count <N=0>] [--backward] [--shard-ids <"0,1,3">]
@@ -47,6 +57,7 @@ esctl meta <STREAM>
 ```
 
 - `read` 与 `readall` 走本地副本，follower 也可读（任一可达端点即可）
+- `read`/`meta` 读未创建（路由表无记录）的流 → NotFound（退出码 1）
 - `--max-count 0` 表示不限量；`--backward` 反向读，未指定 `--from-version` 时从最新开始
 - `readall` 的 `--from-positions` 非空时覆盖 `--from-position` 与 `--shard-ids`；
   `--max-count` 取满时输出下一页续读游标（json 为 `next_from_positions` 字段，
@@ -126,21 +137,43 @@ esctl snapshot restore <data_dir> <snapshot_file> [--snapshot-dir <DIR>] [--yes]
   继续参与集群（单节点直接恢复领导；多节点由 leader 复制快照点之后的日志或新快照）。
   与 etcd `snapshot restore` 等价但作用于单分片。
 
-### 离线 reshard
+### 流路由表
 
 ```
-esctl reshard --src-dir <DIR> --src-shards <N> --dst-dir <DIR> --dst-shards <M> [--yes]
+esctl route [--recount] [--check]
 ```
 
-变更分片数并重分布数据。**离线操作**：要求集群完全停机、已备份数据目录；
-集群未停时目标目录被 LOCK 占用，命令直接拒绝（退出码 1）。核心逻辑复用
-`es_storage::reshard::reshard()`（K 路归并 + position 重分配，保留
-stream_id/version/event_id/HLC）。非 `--yes` 时交互确认（非交互 stdin 视为拒绝）。
-目标目录已存在且非空时需 `--yes` 确认覆盖；**目标目录不存在时自动创建**（无需预建）。
-`--src-shards` 必须与数据目录实际布局一致（按数据中出现的最大分片推断），
-少报分片数会导致枚举范围之外的分片数据被跳过——不一致直接拒绝（退出码 1）。
-任何失败路径都会 flush 并关闭已打开的 tree（释放 LOCK，不留未落盘脏数据）。
-参数与输出示例见 [docs/reshard.md](reshard.md)。
+查看/校准流路由表（stream → shard 归属）。
+
+- 默认展示路由表：逐条 `stream -> shard N` + 表版本（`version=N`）；
+  json 格式含 `streams` 与 `shard_stream_counts`
+- `--recount`：校准 per-shard 流计数（从路由表重建，版本不变），并输出校准后的表
+- `--check`（与 `--recount` 互斥）：**孤儿流检测**——枚举各分片实际存储的流
+  （`ListStreams`，打各 shard leader）与路由表对比：
+  - **孤儿**：存储中有但路由表无记录（隐式建流跨节点竞态等残留），
+    可用 `migrate --stream <s> --to <shard>` 合并修复
+  - **虚挂**：路由表指向的分片与存储实际所在不一致（迁移切换后未收敛或
+    路由表手工编辑出错），指向的写入会 NotFound
+
+### 在线迁移（取代旧 reshard）
+
+```
+esctl migrate (--stream <STREAM> | --shard <N>) --to <M>
+       [--dry-run] [--drain-quiet-rounds <N=2>] [--drain-timeout-secs <S=300>]
+```
+
+在线迁移流到目标分片，**流的数据处理不暂停**。`--stream` 迁移单个流；
+`--shard` 批量迁移整个分片的全部流（逐流独立状态机，失败隔离——失败的流
+可单独重跑，其余不受影响）。`--to` 目标分片；源与目标相同报错。
+`--dry-run` 只报告迁移计划与版本差，不执行。排水收敛判据 = 目标版本 ≥ 源版本
+且源连续 `--drain-quiet-rounds` 次（间隔 2s）无新增；超过
+`--drain-timeout-secs`（默认 300s）退出（数据无害，可重跑完成排水）。
+
+状态机 `Preparing → FullCopying → Tailing → Switching → Draining → Verifying → Finalizing`；
+切换点（SetStreamShard）后客户端新写直达目标，收敛后校验失败自动回切路由。
+复制按「目标当前版本」读源补差（Exact 版本链写目标，幂等索引防重放），
+**断点续传天然成立，重复执行无害**。完成后建议 `esctl route recount` 校准流计数。
+完整设计见 [docs/migrate.md](migrate.md)。
 
 ## 输出格式
 
@@ -186,7 +219,7 @@ SHARD  NODE  STATE     TERM  LEADER  LAST_APPLIED  VOTER
 ## 测试
 
 ```bash
-# 默认套件（单测 + 进程内 e2e + 离线 reshard）
+# 默认套件（单测 + 进程内 e2e + 在线迁移 e2e）
 cargo test -p es-ctl
 
 # 三节点真实进程组建（需先 cargo build --bin eventstored；串行）

@@ -97,8 +97,24 @@ ca_file = "$CERT_DIR/all.crt"
 [storage]
 data_dir = "$WORK/data/node$i"
 
-[shards]
-num_shards = 8
+# 三节点 rf=1：每节点主承载自己的分片（8 分片，环形）
+[placement]
+replication_factor = 1
+
+[[placement.nodes]]
+id = 1
+primary = [0, 1, 2, 3, 4]
+replica = []
+
+[[placement.nodes]]
+id = 2
+primary = [5, 6, 7]
+replica = []
+
+[[placement.nodes]]
+id = 3
+primary = []
+replica = []
 EOF
 done
 

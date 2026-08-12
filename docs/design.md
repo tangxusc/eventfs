@@ -3,7 +3,7 @@
 分布式事件存储中间件。独立进程启动，多节点集群，基于 openraft 共识与 surrealkv 嵌入式存储，
 客户端与节点间通信统一使用 gRPC。
 
-- 文档版本：1.2（2026-08-11 es-client 完整 API + 内置 leader 重定向）
+- 文档版本：1.3（2026-08-12 显式放置表 + 流路由表 + 在线迁移）
 - 建立日期：2026-08-10
 - 状态：已实现，本文与代码现状一致；标注「已实现」的章节以代码为准
 
@@ -13,12 +13,12 @@
 |---|---|---|
 | 事件语义 | EventStore 风格事件溯源 | Stream 为聚合根单位，append-only，版本号递增，乐观并发 |
 | openraft 版本 | 0.9.25 稳定版 | 已实测编译通过；0.10 仍为 alpha，破坏性变更会反复打断开发与测试 |
-| 分片存储布局 | 共享单个 `Tree` + key 前缀隔离 | 单 LSM，内存缓存/压缩线程/文件句柄数恒定，分片数可放大到上百 |
+| 分片存储布局 | 每 shard 一个独立 surrealkv LSM tree（`{data_dir}/shard-{id}/`），key 内保留 shard 前缀 | 分片独立落盘、独立 LOCK、崩溃域隔离；memtable arena 调小（默认 4MiB）避免 N×100MB 内存；shard 前缀保留供迁移工具按显式 shard 寻址 |
 | 全局顺序语义 | 仅分片内有序 + 记录 HLC | 无写入瓶颈，可水平扩展；HLC 已落盘，日后可平滑加近似全序 |
 | crate 结构 | 多 crate 拆分 | 边界清晰、可并行编译、可独立测试，客户端 SDK 可单独发布 |
 | 节点发现 | 静态配置 | 开发期 3 节点，节点数可配置 |
-| 数据分片 | multi-raft，按 `hash(stream_id)` 路由 | 单 stream 完整落在一个 Raft group，无需跨分片事务 |
-| 管理 API | 已实现（`RaftAdmin`：Initialize / AddLearner / ChangeMembership / GetRaftState） | 组建双路径（自动按 peers 配置 / 手动 RaftAdmin），见 7.3 |
+| 数据分片 | multi-raft + 流路由表显式分配（stream → shard） | 单 stream 完整落在一个 Raft group，无需跨分片事务；归属由服务端分配并记录（`routes.json`），支持在线迁移 |
+| 管理 API | 已实现（`RaftAdmin`：Initialize / AddLearner / ChangeMembership / GetRaftState / ListShards；`Migration`：路由表同步 + 迁移原语） | 组建双路径（自动按 peers 配置 / 手动 RaftAdmin），见 7.3；迁移见 7.5 |
 
 ## 2. 依赖验证证据
 
@@ -29,7 +29,7 @@
 | 版本共存 | openraft 0.9.25 + surrealkv 0.21.3 + tonic 0.14.6 + prost 0.14.4 编译通过（28.89s） |
 | `Sealed` bound | 不阻止外部实现，`RaftLogStorage`/`RaftStateMachine` 可在本项目内实现 |
 | surrealkv 入口 | 0.21.3 已无 `Store`，改为 `TreeBuilder::new().with_path(PathBuf).build()` → `Tree` |
-| `Tree` 线程安全 | `Send + Sync + 'static` 成立，多分片可共享同一个 `Arc<Tree>` |
+| `Tree` 线程安全 | `Send + Sync + 'static` 成立，每分片一个独立 `Arc<Tree>`（不再共享） |
 | `range()` 形态 | 游标式：`seek_first()`/`next()` 返回 `Result`，`valid() -> bool`，`value()`；区间 `[start, end)` |
 | 工具链 | rustc 1.94.1 满足 surrealkv（1.86+）与 tonic 0.14.6（1.88+，edition 2024） |
 
@@ -91,38 +91,63 @@ rustls 0.23）；rustls 直接依赖仅 es-proto 一处（`NoCertVerify` 内部�
 ## 3. 整体架构
 
 ```
-                    ┌──────────────────────────────┐
-   客户端 ──gRPC──> │  es-server（独立进程）        │
-                    │  ┌────────────────────────┐  │
-                    │  │ EventStoreService      │  │  客户端 API
-                    │  │ RaftService            │  │  节点间 API
-                    │  └───────────┬────────────┘  │
-                    │              ▼               │
-                    │  ┌────────────────────────┐  │
-                    │  │ es-raft ShardManager   │  │  管理 N 个 Raft 实例
-                    │  │  Raft[0] Raft[1] ...   │  │
-                    │  └───────────┬────────────┘  │
-                    │              ▼               │
-                    │  ┌────────────────────────┐  │
-                    │  │ es-storage             │  │  LogStorage + StateMachine
-                    │  └───────────┬────────────┘  │
-                    └──────────────┼───────────────┘
-                                   ▼
-                          Arc<surrealkv::Tree>       单 LSM，key 前缀隔离分片
+                    ┌────────────────────────────────────────┐
+                    │                                        │
+                       ┌──────────────────────────┐           
+                       │EventStore / RaftRpc      │           
+                       │RaftAdmin / Migration     │           
+                       │四服务共用单端口            │           
+                       └────────────┬─────────────┘           
+                                                     ┌──────┐ 
+                                                     │Route │ 
+                                                     │Table │ 
+                                                     │Mgr   │ 
+                                                     └──┬───┘ 
+                    │               ▼                   ▼    │
+                    │               │                   │    │
+                       ┌──────────────────────────┐           
+                       │es-raft ShardManager      │           
+                       │  Raft[0] Raft[1] ...     │           
+                       └────────────┬─────────────┘           
+                    │               ▼                   │    │
+                    │               │                   │    │
+                       ┌──────────────────────────┐           
+                       │es-storage                │           
+                       │LogStorage + StateMachine │           
+                       └────────────┬─────────────┘           
+                    └───────────────┼───────────────────┼────┘
+                                    ▼                   ▼
+                      {data_dir}/shard-{id}/      {data_dir}/routes.json
+                      每 shard 一个独立           stream → shard 归属
+                      surrealkv LSM tree            （watcher 热更新 + 广播同步）
 ```
 
+四个 gRPC 服务（客户端 API / Raft 节点间 RPC / RaftAdmin / Migration）共用 `listen_addr` 单端口。
 节点间通过 gRPC 交换 Raft 消息（Vote / AppendEntries / InstallSnapshot），
 每条消息携带 `shard_id` 用于路由到对应的 Raft 实例。
+
+**流路由表**（RouteTable Manager）与 ShardManager 并列：写路径先查/分配
+stream → shard 归属（`{data_dir}/routes.json`，watcher 热更新 + 整表广播 + 版本仲裁，
+见 §6），再按归属寻址分片；Migration 服务承载路由表同步与在线迁移原语（见 §7.5）。
+
+**存储布局**：每 shard 一个独立 surrealkv LSM tree（`{data_dir}/shard-{id}/`，
+独立 LOCK），取代旧「全分片共享单 tree + key 前缀隔离」。memtable arena 调小
+（`[storage] memtable_arena_bytes`，默认 4MiB，surrealkv 默认 100MB 打开即预分配）。
+
+**优雅退出**：Ctrl-C / SIGTERM → 停 watcher → 逐 shard 先 `raft.shutdown()`
+再 `storage.close()`（flush WAL + 释放 surrealkv LOCK，顺序不可颠倒——先停
+Raft 避免关闭期间后台任务还在写；仅靠 drop 不保证释放锁，不显式关闭则重启
+同目录会报 "already locked"）。
 
 ### 3.1 crate 划分
 
 | crate | 职责 | 依赖 |
 |---|---|---|
 | `es-proto` | protobuf 定义与 tonic-build 生成代码 | tonic, prost |
-| `es-core` | 领域模型、HLC、分片路由、错误类型 | serde |
-| `es-storage` | surrealkv 封装、key 编码、两个 openraft 存储 trait 实现 | es-core, openraft, surrealkv |
+| `es-core` | 领域模型、HLC、流路由表（RouteTable）、错误类型 | serde |
+| `es-storage` | surrealkv 封装、key 编码、两个 openraft 存储 trait 实现（每 shard 一个 `EsStorage`） | es-core, openraft, surrealkv |
 | `es-raft` | TypeConfig、ShardManager、gRPC RaftNetwork | es-core, es-storage, es-proto |
-| `es-server` | gRPC 服务实现、配置、进程入口 | 全部 |
+| `es-server` | gRPC 服务实现、配置（含放置表校验）、路由表管理 + watcher 热更新、进程入口 | 全部 |
 | `es-client` | 客户端 SDK、leader 重定向重试 | es-core, es-proto |
 
 分层依赖单向向下，`es-client` 不依赖 `es-raft`/`es-storage`，因此可独立发布而不拖入共识与存储依赖。
@@ -150,6 +175,13 @@ Raft 日志区（每分片独立）
 快照区（已废弃：快照改为独立文件，见 docs/snapshot.md）
   [0x03][shard:BE8][0x01]                   -> 旧版快照 key，启动时检测即删（仅升级清理用）
 ```
+
+**key 编码在 per-shard tree 布局下不变**：存储布局已改为每 shard 一个独立 LSM
+tree（§3），tree 内部其实只剩一个 shard 的数据，但 key 中的 `shard:BE8` 前缀
+**仍然保留**——迁移工具（esctl migrate）按显式 shard 读写（`AppendMigrated` /
+`ReadStreamFromShard` / `DeleteStreamFromShard` 等原语把 shard 写进 key），
+带前缀保证同一套编码同时适用于任意布局（迁移期间源/目标分片并存），
+也保留未来合并回共享 tree 的兼容性。
 
 ### 4.1 为什么 stream_id 前面要加长度前缀
 
@@ -223,7 +255,9 @@ pub struct Event {
 ```
 客户端 Append(stream_id, expected_version, events)
   │
-  ├─ es-client：shard = hash(stream_id) % shard_count，找该分片 leader
+  ├─ es-client：连接任一节点（客户端不做分片路由）；服务端按路由表解析归属
+  │             （未知名流 = 隐式建流并分配，见 §6），非 leader/非承载节点
+  │             返回 Unavailable + leader_addr 由客户端重定向
   │
   ├─ leader 节点：分配 HLC，构造 EsRequest::Append
   │
@@ -274,19 +308,71 @@ pub struct Hlc {
 消费者（含 `eventfs-fuse`）需接受跨分片存在有界乱序。
 per-stream 顺序始终严格，因为单 stream 恒在单一分片内。
 
-## 6. 分片路由
+## 6. 流路由表（显式分配）
+
+流 → 分片的归属**不再由 `hash(stream_id) % shard_count` 推导**，而是服务端显式
+分配并记录在**流路由表**中。路由表是「专门文件 + 热更新」的分布式实现：
 
 ```rust
-pub fn route(stream_id: &str, shard_count: u64) -> u64 {
-    xxhash_rust::xxh3::xxh3_64(stream_id.as_bytes()) % shard_count
+pub struct RouteTable {
+    pub version: u64,                            // 集群级单调版本号，每次变更 +1
+    pub streams: BTreeMap<String, u64>,          // stream → shard 映射（写路径权威）
+    pub shard_stream_counts: BTreeMap<u64, u64>, // per-shard 流计数（分配用，允许漂移）
 }
 ```
 
-- `shard_count` 启动时确定，**运行期不可变**。变更需数据重分布，本期不实现。
-- 选 xxh3 而非 `DefaultHasher`：`DefaultHasher` 的 hash 值不保证跨版本稳定，
-  用它做持久化路由会在 Rust 版本升级后导致数据错位。xxh3 算法固定且高速。
-- 开发期默认 `shard_count = 8`（`config.example.toml`），3 节点均为全部 8 个分片的成员（全复制），
-  不引入独立的分片放置调度器。
+持久化形态为 `{data_dir}/routes.json`（es-server 与 es-ctl 共用 `es_core::route::RouteTable`）。
+
+### 6.1 分配策略
+
+- 创建流（`EventStore.CreateStream`）与隐式建流（写未知名流，见 6.3）都由
+  `RouteTableManager::allocate` 分配：从放置表全部分片（`shard_set`）中选
+  **计数最少的 shard**，并列取最小 shard_id（「大致最少流」即可，需求确认流持续
+  生产、不要求精确均衡）。
+- 已存在的流返回现有归属（写锁内双检查），不重复分配、不 bump 版本。
+- 计数允许漂移（删除/迁移不精确扣减），由 `Migration.RecountStreams` 校准
+  （`esctl route recount`）。
+- 分配成功后版本 +1、落盘（temp + rename 原子写）、整表广播到全部 peers。
+
+### 6.2 跨节点收敛
+
+- **整表广播 + 版本仲裁**：变更节点 `PushRouteTable` 全表广播，接收方
+  **只采纳版本更高的表**（幂等，重复广播无害）；广播失败仅告警，下次变更
+  全表重发自愈。
+- **启动加载**：本地 `routes.json` 优先；缺失（新节点）时向 peers 拉取
+  （`GetRouteTable`，首个成功者）。
+- **本地文件热更新**：watcher 监听 routes.json，运维手工修改文件（版本更高）
+  同样生效；损坏文件保留内存旧表并告警。
+- 单节点内更新串行化（update_mutex + 写锁），版本号是收敛的原子点。
+
+### 6.3 读写路径语义
+
+- **写**（Append）：路由表命中直接返回归属；未命中 = **隐式建流**，分配并记录
+  （锁内双检查，同节点并发不重复分配）。写请求打到未承载该 shard 的节点时，
+  返回与本地 ForwardToLeader 同格式的 leader 重定向提示。
+- **读**（ReadStream / GetStreamMeta）：**只查不分配**（读无副作用）；未知流
+  （从未创建或路由表缺失）→ **NotFound**——显式分配语义：流必须先创建
+  （CreateStream 或首次写入）才能读。
+- 服务端是路由的**唯一权威**。es-core 仍保留 `hash(stream_id) % count` 的
+  `route()` 函数，但仅作 esctl 的**客户端预选提示**（选起始探测端点、
+  预显示分片，以服务端落盘为准），不参与数据寻址。
+
+### 6.4 孤儿流检测（esctl route check）
+
+对比各分片实际存储的流（`Migration.ListStreams`，按显式 shard 枚举）与路由表：
+
+- **孤儿**：存储中有但路由表无记录——隐式建流跨节点竞态等残留，
+  可用 `esctl migrate --stream <s> --to <shard>` 合并修复。
+- **虚挂**：路由表指向的分片与存储实际所在不一致——迁移切换后未收敛或
+  路由表手工编辑出错，指向的写入会 NotFound。
+
+### 6.5 扩容（运行期动态加 shards）
+
+加节点 = 更新**所有节点**配置（新增节点 + 新增 shards 行）→ 各节点 watcher
+热加载配置（fail-soft：解析/校验失败保留旧配置、服务不受影响）→ diff 出新增的
+本地 shards → 逐个 `factory::create_shard`（与启动共用单一代码路径）→ 注册 →
+单分片自举（`bootstrap_new_shard`，幂等）。配置中移除的 shard 仅告警，
+数据目录保留，重新加入时幂等打开恢复。**全程无需重启**。
 
 ## 7. gRPC 接口
 
@@ -299,8 +385,14 @@ service EventStore {
   rpc ReadAll(ReadAllRequest) returns (stream ReadEventsResponse);
   rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
   rpc GetStreamMeta(GetStreamMetaRequest) returns (GetStreamMetaResponse);
+  rpc CreateStream(CreateStreamRequest) returns (CreateStreamResponse);  // 显式创建流
 }
 ```
+
+`CreateStream`：服务端分配 shard（大致最少流，§6.1）并记录路由表；
+幂等——流已存在时返回现有归属（`exists=true`，不重复分配）；
+响应携带目标 shard 与 leader 地址（尽力探测，未知返回空串，调用方经常规
+重定向路径定位亦可）。
 
 写请求打到非 leader 时，返回 `Unavailable`（gRPC 可重试语义），message 中携带
 `leader_addr=...`，由客户端重定向重试。服务端不做透明转发，避免持有到其它节点的
@@ -340,10 +432,20 @@ service RaftAdmin {
   rpc AddLearner(AddLearnerRequest) returns (AddLearnerResponse);          // 学习者追平数据
   rpc ChangeMembership(ChangeMembershipRequest) returns (ChangeMembershipResponse);
   rpc GetRaftState(GetRaftStateRequest) returns (GetRaftStateResponse);
+  rpc ListShards(ListShardsRequest) returns (ListShardsResponse);          // 本节点承载的分片
 }
 ```
 
-组建集群有两条路径，**每个分片各组建一次**（分片间不共享 membership 与 leader）：
+`ListShards`：返回本节点已注册（承载）的分片 ID 集合。esctl 的分片探测用它：
+逐端点 `ListShards` 取**并集**即集群全部分片集（节点只承载放置表分配的部分
+分片，旧「按 0,1,2,… 连续扫描 GetRaftState、首个 NotFound 即边界」的方案在
+部分承载布局下会错误地探测到 0 个分片）。
+
+组建集群有两条路径，**每个分片各组建一次**（分片间不共享 membership 与 leader）。
+**每个 shard 的 membership = 放置表中承载它的节点子集，而非全量 peers**
+（`Config::shard_members` 计算；未承载该 shard 的节点不注册它，向它复制日志
+会得到 NotFound）——所有节点对同一 shard 的计算结果一致，是 bootstrap
+membership 与双集群防护的基础：
 
 **自动组建（推荐，etcd 静态引导语义）**：`node.peers` 非空即触发（见 `es-server/src/bootstrap.rs`）。
 日志为空的节点按分片：随机延迟 0~2s（formation delay）→ 探测所有 peer 的
@@ -373,12 +475,32 @@ catch-up 与 live 两阶段：
 切换点需处理边界：先订阅 broadcast 再做最后一段扫描，避免两阶段之间漏事件。
 broadcast 落后（`RecvError::Lagged`）时退回扫描存储补齐，不直接断开订阅。
 
+### 7.5 路由表同步与在线迁移 API（Migration 服务，节点间）
+
+承载路由表同步与在线迁移原语，不暴露给客户端：
+
+| RPC | 作用 |
+|---|---|
+| `GetRouteTable` / `PushRouteTable` | 拉取/推送路由表（整表广播；接收方按版本仲裁采纳，见 §6.2） |
+| `SetStreamShard` | 原子切换流归属（迁移切换点），路由表版本 +1 并广播 |
+| `RecountStreams` | 校准 per-shard 流计数（版本不变） |
+| `AppendMigrated` | 迁移复制写入：单事件一条 raft 日志、**保留源 HLC**、按显式 shard 寻址（不走路由表、不隐式建流） |
+| `DeleteStreamFromShard` | 迁移清尾：删除源 shard 上的流（幂等 no-op） |
+| `ReadStreamFromShard` | 显式 shard 读流（迁移排水/校验用；路由表已切换时仍可读源） |
+| `GetStreamMetaFromShard` | 显式 shard 读流元数据（排水收敛判据） |
+| `ListStreams` | 列出 shard 上的全部流（迁移枚举 / route check 孤儿检测） |
+
+**迁移原语按显式 shard 寻址，不走路由表**——迁移切换后路由表已指向目标，
+排水阶段必须仍能读源。写入原语在目标 shard leader 上执行（非 leader 返回
+标准重定向提示），读取原语走本地存储（无需 leader）。在线迁移状态机与
+用法见 [docs/migrate.md](migrate.md)。
+
 ## 8. 配置
 
 ```toml
 [node]
 id = 1
-listen_addr = "127.0.0.1:50051"   # 三个 gRPC 服务共用一个端口
+listen_addr = "127.0.0.1:50051"   # 四个 gRPC 服务共用一个端口
 
 # 集群节点列表（3 节点示例；非空即触发启动时自动组建，见 7.3）
 # 必须包含本节点，且所有节点配置完全一致；addr 可省略 http:// 前缀
@@ -391,15 +513,30 @@ addr = "127.0.0.1:50052"
 
 [storage]
 data_dir = "./data/node1"         # 每节点独立
+memtable_arena_bytes = 4194304    # 每 shard 的 LSM memtable arena（默认 4MiB，
+                                  # 范围 [1MiB, 16MiB]；surrealkv 默认 100MB 打开即预分配）
 
-[shards]
-num_shards = 8                    # 运行期不可变；变更需离线 reshard
+# 分片放置表（替代旧 [shards] num_shards；完整示例见 config.example.toml）
+# - 每个 shard 一个 raft group，成员 = 放置表中承载它的全部节点
+# - replication_factor：每 shard 投票成员数（primary + replica 合计），默认 2
+# - primary 是管理偏好标签（leader 仍由 raft 选举产生）
+# - 不变式（启动校验强制）：primary 分区互斥、每 shard 承载数 == rf
+# - 配置变更（加节点/加 shards）由 watcher 热加载后运行期生效，无需重启（见 6.5）
+[placement]
+replication_factor = 2
+
+[[placement.nodes]]
+id = 1
+primary = [0, 1]
+replica = [2, 3]
 ```
 
-客户端、节点间、管理三类 gRPC 服务共用 `listen_addr` 单端口（`server.rs` 同一
-`Server` 注册三个 service）。`node.peers` 在启动时由 `bootstrap` 消费：地址
-normalize（补 `http://`）后随 `initialize` 写入 membership 的 `BasicNode.addr`，
-与网络层回连规则同源（`es_raft::normalize_endpoint`）。
+客户端、节点间、管理、迁移四类 gRPC 服务共用 `listen_addr` 单端口（`server.rs`
+同一 `Server` 注册四个 service）。`node.peers` 在启动时由 `bootstrap` 消费：
+地址 normalize（补 `http://`）后随 `initialize` 写入 membership 的 `BasicNode.addr`，
+与网络层回连规则同源（`es_raft::normalize_endpoint`）。流路由表持久化为
+`{data_dir}/routes.json`（§6），由 watcher 热更新；配置文件本身同样被 watcher
+监听（§6.5 动态扩容）。
 
 ## 9. 测试策略
 
@@ -407,9 +544,9 @@ normalize（补 `http://`）后随 `initialize` 写入 membership 的 `BasicNode
 
 | 层次 | 内容 |
 |---|---|
-| 单元测试 | key 编码往返与**排序性质**（随机 index 排序后字节序须一致）、分片路由分布、HLC 单调性、`ExpectedVersion` 校验矩阵 |
+| 单元测试 | key 编码往返与**排序性质**（随机 index 排序后字节序须一致）、路由表分配与版本仲裁（最少流、双检查、recount、跨节点仲裁）、HLC 单调性、`ExpectedVersion` 校验矩阵 |
 | 存储层测试 | RaftLogStorage 语义（append/truncate/purge/无空洞不变量）、apply 幂等性、快照往返 |
-| 端到端测试 | 3 节点真实集群：启动选主、写读一致性、乐观并发冲突、leader 故障转移、重启恢复、订阅 catch-up 到 live 切换 |
+| 端到端测试 | 3 节点真实集群：启动选主、写读一致性、乐观并发冲突、leader 故障转移、重启恢复、订阅 catch-up 到 live 切换、显式建流/隐式建流/读未建流 NotFound、在线迁移（esctl migrate） |
 | 模糊测试 | 随机 stream 名（含 Unicode、前缀包含、空串）、随机并发 Append、随机 `expected_version`，断言不变量：版本连续无空洞、无重复、per-stream 严格有序 |
 
 key 编码的排序性质测试是重点：第 2.1 节的大端约束若被破坏，
@@ -419,6 +556,6 @@ key 编码的排序性质测试是重点：第 2.1 节的大端约束若被破�
 
 | 项 | 原因 |
 |---|---|
-| 在线分片重分布 | 离线 reshard 已实现（`docs/reshard.md`）；在线分裂/合并需架构级改动，见该文方案 B/C |
+| 在线分裂/合并 | 单流在线迁移已实现（`esctl migrate`，见 `docs/migrate.md`）；离线 reshard 已下线，region 式分片拆分/合并未实现，需架构级改动 |
 | 跨分片严格全序 | 已确认取分片内有序 + HLC |
 | 多数据中心 | 未列入需求 |

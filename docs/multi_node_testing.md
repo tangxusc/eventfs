@@ -176,7 +176,7 @@ CI 中应作为独立阶段执行。
 | **网络分区** | 进程内可控网络层 | 3 项(默认套件) | 同上 |
 | **慢节点/非对称延迟** | 进程内按链路设延迟 | 1 项(默认套件) | 同上 |
 | **反向读取** | `read_*_backward` 倒扫 | 2 项 e2e | 实现细节在 `key.rs` / `state_machine.rs` 注释 |
-| **分片数变更数据重分布** | 离线 reshard 库函数 | 1 项单元测试 + bench | 见 `reshard.md` 完整设计 |
+| **在线迁移** | esctl migrate（状态机 + Migration 原语） | e2e（`es-ctl/tests/e2e_test.rs`） | 见 `migrate.md` 完整设计 |
 
 **测试总数:默认套件 85 项 + 多节点 6 项(`--ignored`),全部通过。**
 

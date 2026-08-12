@@ -354,7 +354,7 @@ async fn verify(ctx: &Ctx, stream: &str, src_shard: u64, dst_shard: u64) -> Resu
 }
 
 /// 定位 shard leader 并构建 Migration 客户端（写/读统一走 leader）
-async fn migration_client_to_leader(
+pub(crate) async fn migration_client_to_leader(
     ctx: &Ctx,
     shard: u64,
 ) -> Result<MigrationClient<Channel>> {

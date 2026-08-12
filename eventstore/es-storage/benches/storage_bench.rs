@@ -3,7 +3,7 @@
 //! 运行: `cargo bench -p es-storage`
 //! 查看报告: `open target/criterion/report/index.html`
 //!
-//! 注:写入需要完整 Raft 环境,此处只测读取和 reshard。
+//! 注:写入需要完整 Raft 环境,此处只测读取与快照恢复。
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use es_storage::storage::EsStorage;
@@ -47,62 +47,9 @@ fn bench_read_empty_stream(c: &mut Criterion) {
     });
 }
 
-/// Reshard 基准:测不同流数下的重分布速度
-fn bench_reshard(c: &mut Criterion) {
-    let mut group = c.benchmark_group("reshard");
-    group.sample_size(10); // Reshard 较慢,减少采样
 
-    for n_streams in [10, 100] {
-        group.bench_with_input(
-            BenchmarkId::from_parameter(n_streams),
-            &n_streams,
-            |b, &n| {
-                b.iter(|| {
-                    RT.block_on(async {
-                        // 每次迭代重建数据(包含在测量中,反映真实使用)
-                        let src_dir = tempfile::tempdir().expect("src dir");
-                        let src_tree = Arc::new(
-                            surrealkv::TreeBuilder::new()
-                                .with_path(src_dir.path().to_path_buf())
-                                .build()
-                                .expect("src tree"),
-                        );
-
-                        // 手工写入最小数据集:StreamMeta
-                        use es_storage::key;
-                        for shard in 0..2u64 {
-                            let mut txn = src_tree.begin().expect("begin");
-                            for i in 0..(n / 2) {
-                                let stream = format!("s{shard}-{i}");
-                                let meta = es_core::StreamMeta {
-                                    current_version: 0,
-                                };
-                                let k = key::sm_stream_meta(shard, &stream);
-                                let v = serde_json::to_vec(&meta).expect("序列化");
-                                txn.set(&k, &v).expect("set");
-                            }
-                            txn.commit().await.expect("commit");
-                        }
-
-                        let dst_dir = tempfile::tempdir().expect("dst dir");
-                        let dst_tree = Arc::new(
-                            surrealkv::TreeBuilder::new()
-                                .with_path(dst_dir.path().to_path_buf())
-                                .build()
-                                .expect("dst tree"),
-                        );
-
-                        let report = es_storage::reshard::reshard(src_tree, 2, dst_tree, 4)
-                            .await
-                            .expect("reshard");
-                        black_box(report);
-                    });
-                });
-            },
-        );
-    }
-    group.finish();
-}
-
-criterion_group!(benches, bench_read_empty_stream, bench_reshard);
+criterion_group!(
+    benches,
+    bench_read_empty_stream,
+);
 criterion_main!(benches);
