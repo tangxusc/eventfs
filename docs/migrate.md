@@ -11,7 +11,7 @@
 - **容量调整**：新 shard 加入（运行期动态扩容，见 design.md §6.5）后，把流迁入
   以利用新增承载
 - **孤儿流修复**：`esctl route check` 发现「存储有但路由表无记录」的流，
-  用迁移把它合并回路由表管辖
+  `esctl migrate` 会自动枚举分片定位孤儿流所在 shard 并迁移（无需指定源）
 
 迁移按 **Migration 服务原语**（显式 shard 寻址，不走路由表）驱动：读走源
 leader、写走目标 leader（leader 由 `GetRaftState` 探测定位），任意节点执行
@@ -26,12 +26,12 @@ Preparing → FullCopying → Tailing → Switching → Draining → Verifying �
 
 | 阶段 | 动作 | 失败语义 |
 |---|---|---|
-| **Preparing** | 路由表查源归属；源 == 目标报错；目标分片存在性检查（放置表/ListShards 并集）；读源/目标元数据得版本差（dry-run 只报告此差） | 未产生任何写入，重跑安全 |
+| **Preparing** | 路由表查源归属（无记录 = 孤儿流 → 枚举分片自动定位）；**源 == 目标不报错**——检查其它分片是否有残留数据，有则直接进入排水收尾（上次切换后中断的自愈），无则提示完成；目标分片存在性检查；读源/目标元数据得版本差（dry-run 只报告此差） | 未产生任何写入，重跑安全 |
 | **FullCopying** | 从「目标当前版本 +1」读源 `[from, to]` 补差（每批 500 条，打源 leader 本地存储读），逐条写目标（Exact 版本链）；循环直到追平源当前版本 | 已写事件被幂等索引挡住，重跑从目标当前版本续 |
 | **Tailing** | 与 FullCopying 同一循环——FullCopying 追平时窗口内新写可能已落源，循环直到版本再次收敛 | 同上 |
 | **Switching** | `SetStreamShard` 原子切换路由表（版本 +1 + 落盘 + 整表广播），**切换点** | 失败则未切换，重跑从 Preparing 开始 |
-| **Draining** | 切换后客户端新写直达目标（路由已切）；复制从目标当前版本续，天然兼容并发写入；收敛判据 = **目标版本 ≥ 源版本且源连续 N 轮安静**（`--drain-quiet-rounds`，间隔 2s） | 排水超时（`--drain-timeout-secs`，默认 300s）退出：数据无害（源未动、目标只多不少），可重跑完成排水 |
-| **Verifying** | 双向全量对比：源的全部事件必须存在于目标（event_id / version / hlc 一致） | **失败自动回切路由到源**——源数据从未被动过，回切安全；已复制到目标的数据留着（重跑时幂等续写） |
+| **Draining** | 切换后客户端新写直达目标（路由已切）；复制从目标当前版本续，天然兼容并发写入；**客户端写入占用版本槽（Exact 冲突）时自动改用 Any 兜底**——目标分配新版本，事件载荷/event_id/hlc 保真，version 允许重排（数据保真优先）；收敛判据 = **目标版本 ≥ 源版本且源连续 N 轮安静**（`--drain-quiet-rounds`，间隔 2s） | 排水超时（`--drain-timeout-secs`，默认 300s）退出：数据无害（源未动、目标只多不少），可重跑完成排水 |
+| **Verifying** | 源 ⊆ 目标：按 event_id 匹配，**内容保真**（hlc / event_type / data / metadata 全比对——复制中载荷截断或篡改必须在此拦截）；version 允许不同（排水 Any 兜底可能重排）；分页读取（整条流可能超 8MB 单消息，服务端已分块流式发送） | **失败自动回切路由到源**——源数据从未被动过，回切安全；已复制到目标的数据留着（重跑时幂等续写） |
 | **Finalizing** | `DeleteStreamFromShard` 删除源分片数据（幂等 no-op） | 残留源数据无碍读写，重跑清尾即可 |
 
 **为何 Verifying 不做数量相等断言**：切换后客户端新写直达目标，目标可能比源
@@ -42,7 +42,7 @@ Preparing → FullCopying → Tailing → Switching → Draining → Verifying �
 
 | 原语 | 幂等性保证 |
 |---|---|
-| `AppendMigrated` | 单事件一条 raft 日志，**hlc 保留源值**（迁移保真要求），期望版本链由工具驱动（version 0 用 `NoStream`，其余 `Exact(v-1)`）；幂等索引逐事件记录 → 重放返回原结果，**断点续传不重复** |
+| `AppendMigrated` | 单事件一条 raft 日志，**hlc 保留源值**（迁移保真要求），期望版本链由工具驱动（version 0 用 `NoStream`，其余 `Exact(v-1)`）；**排水阶段冲突时工具自动改用 Any 兜底**；幂等索引逐事件记录 → 重放返回原结果，**断点续传不重复** |
 | `SetStreamShard` | 切换是路由表版本号原子点；同值切换不重复 bump；接收方按版本仲裁，重复广播无害 |
 | `DeleteStreamFromShard` | 不存在的流 no-op |
 
@@ -53,7 +53,8 @@ Preparing → FullCopying → Tailing → Switching → Draining → Verifying �
   源侧增量（旧客户端缓存的路由、广播未收敛窗口）在 Draining 阶段被补完
 - 收敛判据：目标版本 ≥ 源版本 **且** 源连续 `drain-quiet-rounds` 轮（间隔 2s）
   无新增——两条件都满足才认为窗口彻底关闭
-- 收敛前中断：重跑命令即可，Draining 从目标当前版本继续（数据无害）
+- 收敛前中断：重跑命令即可，Draining 从目标当前版本继续（数据无害）；
+  若路由已切换（中断发生在切换后），重跑会检测到残留源数据并自动进入排水收尾
 
 ## 断点续传
 
