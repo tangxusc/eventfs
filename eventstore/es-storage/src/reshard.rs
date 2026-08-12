@@ -180,7 +180,7 @@ async fn write_shard(
     // 1. 事件本体
     for ev in events {
         let k = key::sm_event(shard, &ev.stream_id, ev.version);
-        let v = serde_json::to_vec(ev)
+        let v = crate::encode::encode(ev)
             .map_err(|e| es_core::Error::Serde(format!("Event 序列化失败: {e}")))?;
         txn.set(&k, &v)
             .map_err(|e| es_core::Error::Storage(format!("写 event 失败: {e}")))?;
@@ -189,7 +189,7 @@ async fn write_shard(
     // 2. position 指针
     for ev in events {
         let k = key::sm_position_ptr(shard, ev.position);
-        let v = serde_json::to_vec(&(ev.stream_id.clone(), ev.version))
+        let v = crate::encode::encode(&(ev.stream_id.clone(), ev.version))
             .map_err(|e| es_core::Error::Serde(format!("position 指针序列化失败: {e}")))?;
         txn.set(&k, &v)
             .map_err(|e| es_core::Error::Storage(format!("写 position 指针失败: {e}")))?;
@@ -198,7 +198,7 @@ async fn write_shard(
     // 3. StreamMeta
     for (stream_id, meta) in streams {
         let k = key::sm_stream_meta(shard, stream_id);
-        let v = serde_json::to_vec(meta)
+        let v = crate::encode::encode(meta)
             .map_err(|e| es_core::Error::Serde(format!("StreamMeta 序列化失败: {e}")))?;
         txn.set(&k, &v)
             .map_err(|e| es_core::Error::Storage(format!("写 StreamMeta 失败: {e}")))?;
@@ -214,7 +214,7 @@ async fn write_shard(
     }
     for (event_id, (v, p)) in batches {
         let k = key::sm_idempotency(shard, &event_id);
-        let val = serde_json::to_vec(&(v, p))
+        let val = crate::encode::encode(&(v, p))
             .map_err(|e| es_core::Error::Serde(format!("幂等索引序列化失败: {e}")))?;
         txn.set(&k, &val)
             .map_err(|e| es_core::Error::Storage(format!("写幂等索引失败: {e}")))?;
@@ -223,7 +223,7 @@ async fn write_shard(
     // 5. next_position
     let next_pos = events.len() as u64;
     let k = key::sm_next_position(shard);
-    let v = serde_json::to_vec(&next_pos)
+    let v = crate::encode::encode(&next_pos)
         .map_err(|e| es_core::Error::Serde(format!("next_position 序列化失败: {e}")))?;
     txn.set(&k, &v)
         .map_err(|e| es_core::Error::Storage(format!("写 next_position 失败: {e}")))?;

@@ -142,9 +142,9 @@ async fn verify_dst(
         it.seek_first().expect("seek_first");
         while it.valid() {
             let value = it.value().expect("value");
-            // 事件值 = es_core::Event（JSON 序列化，无 shard_id 字段）
+            // 事件值 = es_core::Event（bincode 序列化，与 es-storage 存储格式一致）
             let event: es_core::Event =
-                serde_json::from_slice(&value).expect("事件值应为合法 JSON（es_core::Event）");
+                es_storage::encode::decode(&value).expect("事件值应为合法 bincode（es_core::Event）");
             let entry = streams
                 .entry(event.stream_id)
                 .or_insert_with(|| (vec![], vec![]));

@@ -8,15 +8,17 @@ use super::EsStorage;
 use crate::key;
 use crate::raft_type::TypeConfig;
 
-/// 序列化辅助，错误统一转为 io 错误描述
-fn to_json<T: serde::Serialize>(v: &T) -> std::result::Result<Vec<u8>, std::io::Error> {
-    serde_json::to_vec(v).map_err(std::io::Error::other)
+/// 序列化辅助，错误统一转为 io 错误描述。
+/// 存储值统一 bincode 编码（见 crate::encode：JSON 的 base64 膨胀曾限制
+/// 写入吞吐，2026-08 迁移）
+fn to_bytes<T: serde::Serialize>(v: &T) -> std::result::Result<Vec<u8>, std::io::Error> {
+    crate::encode::encode(v).map_err(std::io::Error::other)
 }
 
-fn from_json<T: serde::de::DeserializeOwned>(
+fn from_bytes<T: serde::de::DeserializeOwned>(
     b: &[u8],
 ) -> std::result::Result<T, std::io::Error> {
-    serde_json::from_slice(b).map_err(std::io::Error::other)
+    crate::encode::decode(b).map_err(std::io::Error::other)
 }
 
 impl RaftLogStorage<TypeConfig> for EsStorage {
@@ -45,7 +47,7 @@ impl RaftLogStorage<TypeConfig> for EsStorage {
         committed: Option<LogId<u64>>,
     ) -> std::result::Result<(), StorageError<u64>> {
         let k = key::raft_committed(self.shard_id());
-        let v = to_json(&committed).map_err(|e| StorageIOError::write(&e))?;
+        let v = to_bytes(&committed).map_err(|e| StorageIOError::write(&e))?;
         self.set(&k, &v)
             .await
             .map_err(|e| StorageIOError::write(&std::io::Error::other(e.to_string())))?;
@@ -60,7 +62,7 @@ impl RaftLogStorage<TypeConfig> for EsStorage {
             None => Ok(None),
             Some(bytes) => {
                 let committed: Option<LogId<u64>> =
-                    from_json(&bytes).map_err(|e| StorageIOError::read(&e))?;
+                    from_bytes(&bytes).map_err(|e| StorageIOError::read(&e))?;
                 Ok(committed)
             }
         }
@@ -68,7 +70,7 @@ impl RaftLogStorage<TypeConfig> for EsStorage {
 
     async fn save_vote(&mut self, vote: &Vote<u64>) -> std::result::Result<(), StorageError<u64>> {
         let k = key::raft_vote(self.shard_id());
-        let v = to_json(vote).map_err(|e| StorageIOError::write_vote(&e))?;
+        let v = to_bytes(vote).map_err(|e| StorageIOError::write_vote(&e))?;
         // openraft 要求 save_vote 返回前 vote 必须已落盘，commit 已保证
         self.set(&k, &v).await.map_err(|e| {
             StorageIOError::write_vote(&std::io::Error::other(e.to_string()))
@@ -84,7 +86,7 @@ impl RaftLogStorage<TypeConfig> for EsStorage {
             None => Ok(None),
             Some(bytes) => {
                 let vote: Vote<u64> =
-                    from_json(&bytes).map_err(|e| StorageIOError::read_vote(&e))?;
+                    from_bytes(&bytes).map_err(|e| StorageIOError::read_vote(&e))?;
                 Ok(Some(vote))
             }
         }
@@ -106,7 +108,7 @@ impl RaftLogStorage<TypeConfig> for EsStorage {
         for entry in entries {
             let log_id = entry.log_id;
             let k = key::raft_log_entry(self.shard_id(), log_id.index);
-            let v = to_json(&entry).map_err(|e| StorageIOError::write_log_entry(log_id, &e))?;
+            let v = to_bytes(&entry).map_err(|e| StorageIOError::write_log_entry(log_id, &e))?;
             txn.set(k, v).map_err(|e| {
                 StorageIOError::write_log_entry(log_id, &std::io::Error::other(e.to_string()))
             })?;
@@ -138,8 +140,10 @@ impl RaftLogStorage<TypeConfig> for EsStorage {
         // 先记录 last_purged，再删日志。
         // 顺序很重要：若先删日志后写 meta 时崩溃，重启后 get_log_state
         // 会同时读不到日志也读不到 purged 标记，openraft 会误认为日志从未存在。
+        // 注意编码为 Option<LogId>：与 restore 写回的格式一致（JSON 时代
+        // Option 无序列化标记碰巧兼容，bincode 严格后必须统一）
         let k = key::raft_last_purged(self.shard_id());
-        let v = to_json(&log_id).map_err(|e| StorageIOError::write(&e))?;
+        let v = to_bytes(&Some(log_id)).map_err(|e| StorageIOError::write(&e))?;
         self.set(&k, &v)
             .await
             .map_err(|e| StorageIOError::write(&std::io::Error::other(e.to_string())))?;
@@ -165,15 +169,25 @@ impl RaftLogStorage<TypeConfig> for EsStorage {
 
 impl EsStorage {
     /// 读取 last_purged_log_id
+    ///
+    /// 损坏检测：写入方（purge/restore）只写 `Some`，key 存在但值解码
+    /// 为 `None`（bincode 单字节 0x00，只可能是存储清零/截断）必须响亮
+    /// 报错——静默当作「从未 purge」会让 openraft 认为日志从 0 开始，
+    /// 重放已删除的日志。
     pub(crate) fn read_last_purged(&self) -> es_core::Result<Option<LogId<u64>>> {
         let k = key::raft_last_purged(self.shard_id());
         match self.get(&k)? {
             None => Ok(None),
             Some(bytes) => {
-                let log_id: LogId<u64> = serde_json::from_slice(&bytes).map_err(|e| {
+                let log_id: Option<LogId<u64>> = from_bytes(&bytes).map_err(|e| {
                     es_core::Error::Serde(format!("last_purged 反序列化失败: {e}"))
                 })?;
-                Ok(Some(log_id))
+                match log_id {
+                    Some(id) => Ok(Some(id)),
+                    None => Err(es_core::Error::Serde(format!(
+                        "last_purged 损坏：key 存在但值编码为 None（写入方只写 Some）"
+                    ))),
+                }
             }
         }
     }

@@ -251,7 +251,7 @@ impl EsStorage {
             let v = it
                 .value()
                 .map_err(|e| Error::Storage(format!("value 失败: {e}")))?;
-            let entry: openraft::Entry<TypeConfig> = serde_json::from_slice(&v)
+            let entry: openraft::Entry<TypeConfig> = crate::encode::decode(&v)
                 .map_err(|e| Error::Serde(format!("日志条目反序列化失败: {e}")))?;
             entries.push(entry);
             it.next()
@@ -283,7 +283,7 @@ impl EsStorage {
         let v = it
             .value()
             .map_err(|e| Error::Storage(format!("value 失败: {e}")))?;
-        let entry: openraft::Entry<TypeConfig> = serde_json::from_slice(&v)
+        let entry: openraft::Entry<TypeConfig> = crate::encode::decode(&v)
             .map_err(|e| Error::Serde(format!("日志条目反序列化失败: {e}")))?;
         Ok(Some(entry.log_id))
     }

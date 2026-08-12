@@ -33,7 +33,7 @@ fn sm_write_err(e: impl std::fmt::Display) -> StorageError<u64> {
 
 /// 反序列化事件
 fn decode_event(bytes: &[u8]) -> es_core::Result<Event> {
-    serde_json::from_slice(bytes)
+    crate::encode::decode(bytes)
         .map_err(|e| es_core::Error::Serde(format!("Event 反序列化失败: {e}")))
 }
 
@@ -151,7 +151,7 @@ impl EsStorage {
     pub async fn restore_applied_state(&self) -> es_core::Result<()> {
         let k = key::sm_applied_state(self.shard_id());
         if let Some(bytes) = self.get(&k)? {
-            let st: AppliedState = serde_json::from_slice(&bytes)
+            let st: AppliedState = crate::encode::decode(&bytes)
                 .map_err(|e| es_core::Error::Serde(format!("已应用状态反序列化失败: {e}")))?;
             let mut cache = self.sm_cache().write().await;
             cache.last_applied = st.last_applied;
@@ -187,7 +187,7 @@ impl EsStorage {
         match self.get(&k)? {
             None => Ok(None),
             Some(bytes) => {
-                let meta: StreamMeta = serde_json::from_slice(&bytes)
+                let meta: StreamMeta = crate::encode::decode(&bytes)
                     .map_err(|e| es_core::Error::Serde(format!("StreamMeta 反序列化失败: {e}")))?;
                 Ok(Some(meta))
             }
@@ -200,7 +200,7 @@ impl EsStorage {
         match self.get(&k)? {
             None => Ok(None),
             Some(bytes) => {
-                let ev: Event = serde_json::from_slice(&bytes)
+                let ev: Event = crate::encode::decode(&bytes)
                     .map_err(|e| es_core::Error::Serde(format!("Event 反序列化失败: {e}")))?;
                 Ok(Some(ev))
             }
@@ -286,7 +286,7 @@ impl EsStorage {
         let shard = self.shard_id();
         let mut out = Vec::with_capacity(ptrs.len());
         for raw in ptrs {
-            let (stream_id, version): (String, u64) = serde_json::from_slice(raw)
+            let (stream_id, version): (String, u64) = crate::encode::decode(raw)
                 .map_err(|e| es_core::Error::Serde(format!("position 指针反序列化失败: {e}")))?;
             if let Some(bytes) = self.get(&key::sm_event(shard, &stream_id, version))? {
                 out.push(decode_event(&bytes)?);
@@ -309,7 +309,7 @@ impl EsStorage {
             let name = key::decode_stream_meta_key(&k).ok_or_else(|| {
                 es_core::Error::Serde(format!("StreamMeta key 解码失败: {k:?}"))
             })?;
-            let meta: StreamMeta = serde_json::from_slice(&v)
+            let meta: StreamMeta = crate::encode::decode(&v)
                 .map_err(|e| es_core::Error::Serde(format!("StreamMeta 反序列化失败: {e}")))?;
             out.push((name, meta));
         }
@@ -394,7 +394,7 @@ impl EsStorage {
         if let Some(first) = events.first() {
             let idem_k = key::sm_idempotency(shard, &first.event_id);
             if let Some(bytes) = self.get(&idem_k)? {
-                let (v0, p0): (u64, u64) = serde_json::from_slice(&bytes).map_err(|e| {
+                let (v0, p0): (u64, u64) = crate::encode::decode(&bytes).map_err(|e| {
                     es_core::Error::Serde(format!("幂等索引反序列化失败: {e}"))
                 })?;
                 let n = events.len() as u64;
@@ -444,14 +444,14 @@ impl EsStorage {
                 hlc,
                 position,
             };
-            let ev_bytes = serde_json::to_vec(&stored)
+            let ev_bytes = crate::encode::encode(&stored)
                 .map_err(|e| es_core::Error::Serde(format!("Event 序列化失败: {e}")))?;
             batch
                 .puts
                 .push((key::sm_event(shard, stream_id, version), ev_bytes));
 
             // position 指针，供分片内 $all 流按提交序读取
-            let ptr = serde_json::to_vec(&(stream_id, version))
+            let ptr = crate::encode::encode(&(stream_id, version))
                 .map_err(|e| es_core::Error::Serde(format!("position 指针序列化失败: {e}")))?;
             batch
                 .puts
@@ -468,7 +468,7 @@ impl EsStorage {
         let last_position = batch.next_position - 1;
 
         // 幂等索引：以首条 event_id 记录 (起始版本, 起始位置)
-        let idem_v = serde_json::to_vec(&(
+        let idem_v = crate::encode::encode(&(
             match current {
                 None => 0u64,
                 Some(cur) => cur + 1,
@@ -485,7 +485,7 @@ impl EsStorage {
         let meta = StreamMeta {
             current_version: last_version,
         };
-        let meta_bytes = serde_json::to_vec(&meta)
+        let meta_bytes = crate::encode::encode(&meta)
             .map_err(|e| es_core::Error::Serde(format!("StreamMeta 序列化失败: {e}")))?;
         batch
             .puts
@@ -547,7 +547,7 @@ impl EsStorage {
         let k = key::sm_next_position(self.shard_id());
         match self.get(&k)? {
             None => Ok(0),
-            Some(bytes) => serde_json::from_slice(&bytes)
+            Some(bytes) => crate::encode::decode(&bytes)
                 .map_err(|e| es_core::Error::Serde(format!("next_position 反序列化失败: {e}"))),
         }
     }
@@ -623,7 +623,7 @@ impl RaftStateMachine<TypeConfig> for EsStorage {
         }
 
         // next_position 计数器
-        let np = serde_json::to_vec(&batch.next_position).map_err(sm_write_err)?;
+        let np = crate::encode::encode(&batch.next_position).map_err(sm_write_err)?;
         batch.puts.push((key::sm_next_position(shard), np));
 
         // 已应用状态：与业务数据同事务提交，保证重启后 last_applied 与数据一致
@@ -634,7 +634,7 @@ impl RaftStateMachine<TypeConfig> for EsStorage {
             last_applied: new_last_applied,
             membership: new_membership.clone(),
         };
-        let applied_bytes = serde_json::to_vec(&applied).map_err(sm_write_err)?;
+        let applied_bytes = crate::encode::encode(&applied).map_err(sm_write_err)?;
         batch
             .puts
             .push((key::sm_applied_state(shard), applied_bytes));
@@ -754,7 +754,7 @@ impl RaftStateMachine<TypeConfig> for EsStorage {
         };
         txn.set(
             key::sm_applied_state(shard),
-            serde_json::to_vec(&applied).map_err(sm_write_err)?,
+            crate::encode::encode(&applied).map_err(sm_write_err)?,
         )
         .map_err(sm_write_err)?;
         txn.commit().await.map_err(sm_write_err)?;
@@ -846,7 +846,8 @@ impl RaftSnapshotBuilder<TypeConfig> for EsStorage {
             version: snapshot::SNAP_VERSION,
             compression: store.compression(),
             shard_id: shard,
-            meta_len: serde_json::to_vec(&meta).map_err(sm_write_err)?.len() as u64,
+            // meta_len 必须与实际写 header 的编码一致（write_header 保留 serde_json）
+        meta_len: serde_json::to_vec(&meta).map_err(sm_write_err)?.len() as u64,
             payload_len: snapshot::payload_len_for(&entries),
         };
         // 写段失败时清理 tmp（不调 finish 的 zstd Encoder Drop 不补帧尾，

@@ -1379,7 +1379,7 @@ pub async fn restore(
     };
     txn.set(
         key::sm_applied_state(shard_id),
-        serde_json::to_vec(&applied).map_err(|e| {
+        crate::encode::encode(&applied).map_err(|e| {
             es_core::Error::Serde(format!("applied 状态序列化失败: {e}"))
         })?,
     )
@@ -1388,7 +1388,7 @@ pub async fn restore(
     // 5. 日志基线写回快照点（非空快照）：get_log_state 在日志为空时回落
     //    last_purged，committed 与 last_applied 三者一致，openraft 不重放
     if let Some(last_log_id) = meta.last_log_id {
-        let val = serde_json::to_vec(&Some(last_log_id))
+        let val = crate::encode::encode(&Some(last_log_id))
             .map_err(|e| es_core::Error::Serde(format!("last_purged 序列化失败: {e}")))?;
         txn.set(key::raft_last_purged(shard_id), val.clone())
             .map_err(|e| es_core::Error::Storage(format!("写 last_purged 失败: {e}")))?;

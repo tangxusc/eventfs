@@ -5,6 +5,8 @@ pub mod raft_type;
 pub mod reshard;
 pub mod snapshot;
 pub mod storage;
+/// 存储值编解码。pub 供 esctl 离线工具（reshard/snapshot 验证）复用同一格式
+pub mod encode;
 mod log_storage;
 mod state_machine;
 
