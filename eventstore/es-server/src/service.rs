@@ -1,12 +1,97 @@
 //! gRPC 服务实现。
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tokio_stream::wrappers::ReceiverStream;
 
 use es_proto::eventstore::event_store_server::EventStore;
 use es_proto::eventstore::*;
+use es_proto::tls::TlsClientConfig;
 use es_raft::ShardManager;
+
+use crate::config::Config;
+
+/// 远程 shard 的 leader 探测器。
+///
+/// 本节点只承载放置表分配的子集；客户端请求路由到本节点不承载的 shard 时，
+/// 无法在本地处理，需要向 peers 探测该 shard 的 leader 并把客户端引过去。
+/// 探测结果与本地 openraft `ForwardToLeader` 的错误格式对齐，
+/// 客户端 `LeaderRetryPlan` 无需感知差别。
+pub struct RemoteShards {
+    /// 本节点 ID（探测时跳过自己）
+    self_id: u64,
+    /// peers 的 RaftAdmin 客户端（惰性连接）
+    clients: BTreeMap<u64, es_proto::eventstore::raft_admin_client::RaftAdminClient<tonic::transport::Channel>>,
+    /// node_id -> 已 normalize 的地址（重定向提示用）
+    addrs: BTreeMap<u64, String>,
+}
+
+impl RemoteShards {
+    /// 从配置构建（地址 normalize 与 bootstrap 同源）。
+    pub fn new(config: &Config) -> Result<Self, String> {
+        let members: BTreeMap<u64, openraft::BasicNode> = config
+            .node
+            .peers
+            .iter()
+            .map(|p| {
+                let uri = es_raft::normalize_endpoint(&p.addr);
+                (p.id, openraft::BasicNode { addr: uri.clone() })
+            })
+            .collect();
+        let tls: Option<TlsClientConfig> = match &config.tls {
+            Some(t) => Some(t.client_trust().map_err(|e| e)?),
+            None => None,
+        };
+        let clients = crate::bootstrap::build_clients(&members, tls.as_ref())?;
+        let addrs = members.into_iter().map(|(id, n)| (id, n.addr)).collect();
+        Ok(Self {
+            self_id: config.node.id,
+            clients,
+            addrs,
+        })
+    }
+
+    /// 探测目标 shard 的 leader，返回 `(leader_node_id, addr)`。
+    ///
+    /// 轮询所有 peers（跳过自己）调 GetRaftState；未承载该 shard 的节点
+    /// 返回 NotFound，直接跳过。全部不可达或尚无 leader → None。
+    async fn find_leader(&self, shard_id: u64) -> Option<(u64, String)> {
+        for (&id, client) in &self.clients {
+            if id == self.self_id {
+                continue;
+            }
+            let mut c = client.clone();
+            match c
+                .get_raft_state(GetRaftStateRequest { shard_id })
+                .await
+            {
+                Ok(resp) => {
+                    let r = resp.into_inner();
+                    if r.is_leader {
+                        return self
+                            .addrs
+                            .get(&id)
+                            .map(|addr| (id, addr.clone()))
+                            .or_else(|| Some((id, String::new())));
+                    }
+                }
+                Err(_) => continue, // 节点未就绪或未承载该 shard
+            }
+        }
+        None
+    }
+
+    /// 目标 shard 不在本节点时的标准重定向提示（与本地 ForwardToLeader 同格式）。
+    async fn leader_hint_status(&self, shard_id: u64) -> Status {
+        match self.find_leader(shard_id).await {
+            Some((id, addr)) => Status::unavailable(format!(
+                "not leader; leader_id={id} leader_addr={addr}"
+            )),
+            None => Status::unavailable("not leader; leader unknown, retry later"),
+        }
+    }
+}
 
 /// 归并用的堆元素：按 (hlc, shard_id, position) 定序
 #[derive(PartialEq, Eq)]
@@ -184,20 +269,60 @@ pub struct EsService {
     shard_manager: Arc<ShardManager>,
     /// 请求大小限制（append 权威校验）
     limits: crate::config::LimitsSection,
+    /// 远程 shard 定位（本节点不承载的目标分片）
+    remote: RemoteShards,
 }
 
 impl EsService {
     /// 创建服务实例（默认大小限制）
-    pub fn new(shard_manager: Arc<ShardManager>) -> Self {
-        Self::with_limits(shard_manager, Default::default())
+    pub fn new(shard_manager: Arc<ShardManager>, config: &Config) -> Result<Self, String> {
+        Ok(Self {
+            shard_manager,
+            limits: config.limits.clone(),
+            remote: RemoteShards::new(config)?,
+        })
     }
 
     /// 创建服务实例（自定义大小限制）
     pub fn with_limits(
         shard_manager: Arc<ShardManager>,
         limits: crate::config::LimitsSection,
-    ) -> Self {
-        Self { shard_manager, limits }
+        config: &Config,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            shard_manager,
+            limits,
+            remote: RemoteShards::new(config)?,
+        })
+    }
+
+    /// stream 路由到 shard id（Phase 1 保持哈希；Phase 2 换路由表）。
+    fn route_shard_id(&self, stream_id: &str) -> u64 {
+        es_core::routing::route(stream_id, self.shard_manager.num_shards())
+    }
+
+    /// 取目标 shard；本节点不承载时给出标准重定向提示（写路径用）。
+    async fn resolve_write_shard(&self, shard_id: u64) -> Result<Arc<es_raft::Shard>, Status> {
+        match self.shard_manager.get_shard(shard_id).await {
+            Ok(s) => Ok(s),
+            // 本节点不承载该 shard：向 peers 探测 leader 并返回与本地
+            // ForwardToLeader 相同格式的重定向提示，客户端原样重定向
+            Err(_) => Err(self.remote.leader_hint_status(shard_id).await),
+        }
+    }
+
+    /// 取目标 shard；本节点不承载时返回 Unavailable（读路径用）。
+    ///
+    /// 客户端（es-client/es-ctl）对 Unavailable 轮换其它节点，直到命中
+    /// 承载该 shard 的节点；不能用 NotFound——那是客户端语义错误，
+    /// 轮换逻辑不会触发。
+    async fn resolve_read_shard(&self, shard_id: u64) -> Result<Arc<es_raft::Shard>, Status> {
+        match self.shard_manager.get_shard(shard_id).await {
+            Ok(s) => Ok(s),
+            Err(_) => Err(Status::unavailable(format!(
+                "shard {shard_id} not on this node, retry other nodes"
+            ))),
+        }
     }
 }
 
@@ -239,12 +364,9 @@ impl EventStore for EsService {
             }
         }
 
-        // 1. 根据 stream_id 路由到对应分片
-        let shard = self
-            .shard_manager
-            .route_shard(stream_id)
-            .await
-            .map_err(|e| Status::internal(format!("route shard failed: {}", e)))?;
+        // 1. 根据 stream_id 路由到对应分片；本节点不承载时给出 leader 重定向提示
+        let shard_id = self.route_shard_id(stream_id);
+        let shard = self.resolve_write_shard(shard_id).await?;
 
         // 2. 转换 proto 请求为领域模型
         let expected_version = req
@@ -311,12 +433,9 @@ impl EventStore for EsService {
         let req = request.into_inner();
         tracing::debug!("ReadStream request for stream: {}", req.stream_id);
 
-        // 路由到分片
-        let shard = self
-            .shard_manager
-            .route_shard(&req.stream_id)
-            .await
-            .map_err(|e| Status::internal(format!("route shard failed: {}", e)))?;
+        // 路由到分片；本节点不承载 → Unavailable，客户端轮换其它节点
+        let shard_id = self.route_shard_id(&req.stream_id);
+        let shard = self.resolve_read_shard(shard_id).await?;
 
         // 读取事件（直接从存储层读，无需走 Raft —— 读本地副本即可）
         let desc = req.direction == Direction::Backward as i32;
@@ -401,11 +520,8 @@ impl EventStore for EsService {
         let mut streams: Vec<Vec<Event>> = Vec::with_capacity(cursors.len());
         for cursor in &cursors {
             let shard_id = cursor.shard_id;
-            let shard = self
-                .shard_manager
-                .get_shard(shard_id)
-                .await
-                .map_err(|e| Status::not_found(format!("分片 {shard_id}: {e}")))?;
+            // 本节点不承载 → Unavailable，客户端轮换其它节点
+            let shard = self.resolve_read_shard(shard_id).await?;
 
             // 反向读尽（ended=true）的分片不再有更早事件，直接给空流；
             // 不能仅靠 from==0 判断——「消费到 position 1 → 游标 0」时
@@ -507,12 +623,10 @@ impl EventStore for EsService {
         use subscribe_request::Target;
         let (stream_id, shard_id, from_position) = match target {
             Target::StreamId(sid) => {
-                // 订阅单个流：路由到分片
-                let shard = self
-                    .shard_manager
-                    .route_shard(&sid)
-                    .await
-                    .map_err(|e| Status::internal(format!("route failed: {}", e)))?;
+                // 订阅单个流：路由到分片；本节点不承载 → Unavailable，客户端轮换
+                let shard_id = self.route_shard_id(&sid);
+                let shard = self.resolve_read_shard(shard_id).await?;
+                let _ = shard; // shard 仅用于承载校验，后续按 id 取回
 
                 // 起始位置：from_start=true 从头，否则用 from_exclusive+1
                 // （saturating_add 防 u64::MAX 溢出回绕）
@@ -522,7 +636,7 @@ impl EventStore for EsService {
                     req.from_exclusive.saturating_add(1)
                 };
 
-                (Some(sid), shard.id(), from_version)
+                (Some(sid), shard_id, from_version)
             }
             Target::All(_) => {
                 // 订阅 $all：按请求指定分片订阅（proto SubscribeRequest.shard_id，
@@ -536,11 +650,8 @@ impl EventStore for EsService {
             }
         };
 
-        let shard = self
-            .shard_manager
-            .get_shard(shard_id)
-            .await
-            .map_err(|e| Status::not_found(format!("shard {} not found: {}", shard_id, e)))?;
+        // 取分片（承载校验与存储访问）；$all 分支的 shard 由客户端指定
+        let shard = self.resolve_read_shard(shard_id).await?;
 
         // 创建响应流
         let (tx, rx) = tokio::sync::mpsc::channel(100);
@@ -681,11 +792,9 @@ impl EventStore for EsService {
         let req = request.into_inner();
         tracing::debug!("GetStreamMeta request for stream: {}", req.stream_id);
 
-        let shard = self
-            .shard_manager
-            .route_shard(&req.stream_id)
-            .await
-            .map_err(|e| Status::internal(format!("route shard failed: {}", e)))?;
+        // 路由到分片；本节点不承载 → Unavailable，客户端轮换其它节点
+        let shard_id = self.route_shard_id(&req.stream_id);
+        let shard = self.resolve_read_shard(shard_id).await?;
 
         let meta = shard
             .storage

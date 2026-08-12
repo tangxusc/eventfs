@@ -15,7 +15,9 @@ use es_core::{LeaderRetryPlan, parse_leader_hint};
 use es_proto::endpoint::normalize_endpoint;
 use es_proto::eventstore::event_store_client::EventStoreClient;
 use es_proto::eventstore::raft_admin_client::RaftAdminClient;
-use es_proto::eventstore::{GetRaftStateRequest, GetRaftStateResponse};
+use es_proto::eventstore::{
+    GetRaftStateRequest, GetRaftStateResponse, ListShardsRequest, ListShardsResponse,
+};
 use es_proto::tls::{TlsClientConfig, apply_endpoint_tls};
 
 /// 集群客户端。
@@ -157,6 +159,21 @@ impl ClusterClient {
             .get_raft_state(GetRaftStateRequest { shard_id })
             .await?
             .into_inner();
+        Ok(resp)
+    }
+
+    /// 调单个端点的 ListShards（返回该节点承载的分片；NotFound 等状态原样返回）。
+    ///
+    /// 分片探测用：各节点只承载放置表分配的子集，集群全部分片 = 全部端点并集。
+    pub(crate) async fn list_shards_via(
+        &self,
+        endpoint: &str,
+    ) -> Result<ListShardsResponse, Status> {
+        let mut client = self
+            .admin_client(endpoint)
+            .await
+            .map_err(|e| Status::internal(format!("连接失败: {e}")))?;
+        let resp = client.list_shards(ListShardsRequest {}).await?.into_inner();
         Ok(resp)
     }
 

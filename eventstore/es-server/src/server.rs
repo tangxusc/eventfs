@@ -3,9 +3,9 @@
 use std::sync::Arc;
 use anyhow::Result;
 
-use es_raft::{ShardManager, GrpcNetwork, Shard};
-use es_storage::EsStorage;
+use es_raft::{ShardManager, Shard};
 use crate::config::Config;
+use crate::factory;
 use crate::service::EsService;
 
 /// EventStore 服务器
@@ -17,12 +17,17 @@ pub struct Server {
 impl Server {
     /// 创建服务器实例
     pub fn new(config: Config) -> Result<Self> {
-        // 配置启动期校验（fail-fast）：num_shards ≥ 1、TLS cert/key 成对且文件存在
+        // 配置启动期校验（fail-fast）：放置表不变式、TLS cert/key 成对且文件存在
         config.validate().map_err(anyhow::Error::msg)?;
+
+        // shard 总数 = 放置表派生值（max shard_id + 1，允许稀疏布局）。
+        // 注意：本节点只创建/注册 local_shards，未承载的分片 id < shard_count，
+        // register_shard 的上界校验据此保持有效。
+        let shard_count = config.shard_count();
 
         let shard_manager = Arc::new(ShardManager::new(
             config.node.id,
-            config.shards.num_shards,
+            shard_count,
         ));
 
         Ok(Self {
@@ -36,24 +41,15 @@ impl Server {
         &self.shard_manager
     }
 
-    /// 初始化存储与 Raft 节点
+    /// 初始化存储与 Raft 节点（本节点承载的 shards，每个 shard 独立 LSM tree）。
     pub async fn init(&self) -> Result<()> {
         tracing::info!("Initializing storage and Raft nodes...");
 
         // 创建数据目录
         std::fs::create_dir_all(&self.config.storage.data_dir)?;
 
-        // 打开共享 tree（所有分片共享，通过 key 前缀隔离）
-        let tree_path = self.config.storage.data_dir.clone();
-        let tree = Arc::new(
-            surrealkv::TreeBuilder::new()
-                .with_path(tree_path)
-                .build()?,
-        );
-
-        tracing::info!("Opened shared surrealkv tree at {:?}", self.config.storage.data_dir);
-
         // 快照目录：缺省 {data_dir}/snapshots，独立于 surrealkv 业务数据文件
+        // （create_shard 也会幂等创建，这里先建保证早期失败路径不炸）
         let snap_dir = self
             .config
             .snapshot
@@ -61,70 +57,40 @@ impl Server {
             .clone()
             .unwrap_or_else(|| self.config.storage.data_dir.join("snapshots"));
         std::fs::create_dir_all(&snap_dir)?;
-        let snap_cfg = es_storage::snapshot::SnapshotConfig {
-            dir: snap_dir,
-            compression: self.config.snapshot.compression,
-            keep: self.config.snapshot.keep,
-        };
 
-        // 节点间 Raft RPC 的客户端信任策略（https 对端生效；明文集群为 None）
-        let client_tls: Option<es_raft::TlsClientConfig> = match &self.config.tls {
-            Some(t) => Some(t.client_trust().map_err(anyhow::Error::msg)?),
-            None => None,
-        };
-
-        // 为每个分片创建存储 + Raft 节点
-        for shard_id in 0..self.config.shards.num_shards {
-            let storage = EsStorage::new(shard_id, tree.clone(), snap_cfg.clone())?;
-
-            // 恢复已应用状态（openraft 启动前必须调用，否则会从错误位置重放）
-            storage.restore_applied_state().await?;
-
-            // 创建 Raft 配置：单节点集群先不启用心跳，避免选举风暴
-            let raft_config = Arc::new(
-                openraft::Config {
-                    cluster_name: format!("eventstore-shard-{}", shard_id),
-                    heartbeat_interval: 300,
-                    election_timeout_min: 600,
-                    election_timeout_max: 900,
-                    // 快照策略：每 5000 条日志建一次快照，之后只保留 1000 条。
-                    // 不设的话日志会无限增长——磁盘被吃满，且新节点加入时
-                    // 需重放全部历史日志，恢复时间随运行时长线性增长。
-                    snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(5000),
-                    max_in_snapshot_log_to_keep: 1000,
-                    // 分块大小来自配置：默认 3MiB，上限 6MiB（config validate 保证）
-                    snapshot_max_chunk_size: self.config.snapshot.max_chunk_size,
-                    ..Default::default()
-                }
-                .validate()?,
-            );
-
-            // 每个分片一个独立的 network：RaftNetworkFactory::new_client 只传
-            // target 节点不传分片，分片信息必须由工厂自身携带
-            let network = GrpcNetwork::new(shard_id, client_tls.clone());
-
-            let raft = openraft::Raft::new(
-                self.config.node.id,
-                raft_config,
-                network,
-                storage.clone(), // RaftLogStorage
-                storage.clone(), // RaftStateMachine
-            )
-            .await?;
-
-            let shard = Arc::new(Shard::new(shard_id, raft, Arc::new(storage)));
+        // 为每个承载的分片创建存储 + Raft 节点（每 shard 一个独立 LSM tree）
+        for shard_id in self.config.local_shards() {
+            let shard = factory::create_shard(&self.config, shard_id).await?;
             self.shard_manager.register_shard(shard).await?;
-
-            tracing::info!("Initialized shard {} on node {}", shard_id, self.config.node.id);
         }
 
-        tracing::info!("Initialization complete: {} shards", self.config.shards.num_shards);
+        tracing::info!(
+            "Initialization complete: {} shards on node {}",
+            self.config.local_shards().len(),
+            self.config.node.id
+        );
 
         // 配置了 node.peers 时后台自动组建集群（etcd 静态引导语义）。
         // 不阻塞 serve：组建失败仅告警，可经 RaftAdmin 手动接管。
         self.spawn_bootstrap();
 
         Ok(())
+    }
+
+    /// 优雅关闭：逐 shard 停 Raft 并关闭存储（flush WAL + 释放 LOCK 文件）。
+    ///
+    /// surrealkv 的 `Tree::drop` 在无 tokio runtime 的路径下不会异步关闭，
+    /// 锁会一直持有到进程退出；进程重启前必须显式关闭，否则同目录
+    /// 重新打开会报 "already locked"。
+    pub async fn shutdown(&self) {
+        let ids = self.shard_manager.shard_ids().await;
+        tracing::info!("Shutting down {} shards...", ids.len());
+        for id in ids {
+            match self.shard_manager.get_shard(id).await {
+                Ok(shard) => close_shard(&shard).await,
+                Err(e) => tracing::warn!(shard_id = id, "关闭时取分片失败：{e}"),
+            }
+        }
     }
 
     /// 后台自动组建集群任务。
@@ -146,7 +112,9 @@ impl Server {
         let es_service = EsService::with_limits(
             self.shard_manager.clone(),
             self.config.limits.clone(),
-        );
+            &self.config,
+        )
+        .map_err(anyhow::Error::msg)?;
         let raft_service = es_raft::RaftRpcService::new(self.shard_manager.clone());
         let admin_service = es_raft::RaftAdminService::new(self.shard_manager.clone());
 
@@ -197,4 +165,19 @@ impl Server {
 
         Ok(())
     }
+}
+
+/// 关闭单个分片：先停 Raft（停止心跳/选举任务），再关存储（flush + 释放 LOCK）。
+///
+/// 顺序不可颠倒：Raft 停止后再关存储，避免关闭期间 Raft 后台任务还在写。
+/// openraft 的 shutdown 会等待内部任务退出（存在超时上限，见其实现）。
+async fn close_shard(shard: &Arc<Shard>) {
+    tracing::info!(shard_id = shard.id(), "closing shard...");
+    if let Err(e) = shard.raft.shutdown().await {
+        tracing::warn!(shard_id = shard.id(), "raft shutdown 失败：{e}");
+    }
+    if let Err(e) = shard.storage.close().await {
+        tracing::warn!(shard_id = shard.id(), "storage close 失败：{e}");
+    }
+    tracing::info!(shard_id = shard.id(), "shard closed");
 }

@@ -3,7 +3,7 @@
 use std::time::Duration;
 use tokio::time::timeout;
 
-use es_server::config::{Config, NodeConfig, ShardConfig, StorageConfig};
+use es_server::config::{Config, NodeConfig, PlacementConfig, PlacementNode, StorageConfig};
 use es_server::Server;
 
 #[tokio::test]
@@ -23,8 +23,17 @@ async fn server_starts_and_inits_raft() {
         },
         storage: StorageConfig {
             data_dir: dir.path().to_path_buf(),
+            memtable_arena_bytes: 4 * 1024 * 1024,
         },
-        shards: ShardConfig { num_shards: 2 },
+        // 单节点 2 分片：rf=1，node1 主承载 [0,1]
+        placement: PlacementConfig {
+            replication_factor: 1,
+            nodes: vec![PlacementNode {
+                id: 1,
+                primary: (0..2).collect(),
+                replica: vec![],
+            }],
+        },
         snapshot: Default::default(),
         tls: None,
         limits: Default::default(),

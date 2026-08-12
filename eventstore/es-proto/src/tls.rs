@@ -156,6 +156,15 @@ mod tests {
         ) -> Result<Response<GetRaftStateResponse>, Status> {
             Ok(Response::new(GetRaftStateResponse::default()))
         }
+        async fn list_shards(
+            &self,
+            _request: Request<ListShardsRequest>,
+        ) -> Result<Response<ListShardsResponse>, Status> {
+            Ok(Response::new(ListShardsResponse {
+                node_id: 0,
+                shard_ids: vec![0],
+            }))
+        }
     }
 
     /// 生成一张 127.0.0.1 的自签证书，返回 (cert_pem, key_pem)

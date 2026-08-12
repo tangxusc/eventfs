@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use es_proto::eventstore::event_store_server::EventStoreServer;
 use es_proto::eventstore::*;
-use es_server::config::{Config, NodeConfig, ShardConfig, StorageConfig};
+use es_server::config::{Config, NodeConfig, PlacementConfig, PlacementNode, StorageConfig};
 use es_server::Server;
 use openraft::storage::RaftStateMachine;
 use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
@@ -33,13 +33,22 @@ async fn start_server() -> (String, Server, tempfile::TempDir) {
         },
         storage: StorageConfig {
             data_dir: dir.path().to_path_buf(),
+            memtable_arena_bytes: 4 * 1024 * 1024,
         },
-        shards: ShardConfig { num_shards: 2 },
+        // 单节点 2 分片：rf=1，node1 主承载 [0,1]
+        placement: PlacementConfig {
+            replication_factor: 1,
+            nodes: vec![PlacementNode {
+                id: 1,
+                primary: (0..2).collect(),
+                replica: vec![],
+            }],
+        },
         snapshot: Default::default(),
         tls: None,
         limits: Default::default(),
     };
-    let server = Server::new(config).expect("创建服务器");
+    let server = Server::new(config.clone()).expect("创建服务器");
     server.init().await.expect("初始化");
 
     let members = BTreeSet::from([1u64]);
@@ -60,7 +69,8 @@ async fn start_server() -> (String, Server, tempfile::TempDir) {
         .await
         .expect("绑定端口");
     let addr = format!("http://{}", listener.local_addr().expect("取本地地址"));
-    let service = es_server::service::EsService::new(server.shard_manager().clone());
+    let service = es_server::service::EsService::new(server.shard_manager().clone(), &config)
+        .expect("创建服务");
     let admin = es_raft::admin_service::RaftAdminService::new(server.shard_manager().clone());
     let raft = es_raft::rpc_service::RaftRpcService::new(server.shard_manager().clone());
     tokio::spawn(async move {
@@ -557,7 +567,7 @@ async fn shards_probe_and_cache() {
     let (addr, _s, _dir) = start_server().await;
     let ctx = ctx_with(addr, Format::Simple);
     let scope1 = ctx.shards().await.expect("首次探测");
-    assert_eq!(scope1.count, 2, "应探测到 2 分片");
+    assert_eq!(scope1.count(), 2, "应探测到 2 分片");
     let scope2 = ctx.shards().await.expect("缓存命中");
     assert_eq!(scope1, scope2, "缓存应返回同一结果");
 }
@@ -857,6 +867,17 @@ impl raft_admin_server::RaftAdmin for FlakyStub {
             has_last_applied: false,
             last_applied: 0,
             voter_ids: voters,
+        }))
+    }
+
+    async fn list_shards(
+        &self,
+        _request: Request<ListShardsRequest>,
+    ) -> Result<Response<ListShardsResponse>, Status> {
+        // stub 只"承载"分片 0（分片探测用；调用方一般显式 --shards 跳过探测）
+        Ok(Response::new(ListShardsResponse {
+            node_id: 1,
+            shard_ids: vec![0],
         }))
     }
 }

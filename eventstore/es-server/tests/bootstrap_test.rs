@@ -10,7 +10,9 @@ use std::time::Duration;
 use es_proto::eventstore::raft_admin_client::RaftAdminClient;
 use es_proto::eventstore::GetRaftStateRequest;
 use es_proto::tls::{apply_endpoint_tls, TlsClientConfig};
-use es_server::config::{Config, NodeConfig, PeerConfig, ShardConfig, StorageConfig, TlsConfig};
+use es_server::config::{
+    Config, NodeConfig, PeerConfig, PlacementConfig, PlacementNode, StorageConfig, TlsConfig,
+};
 use es_server::Server;
 
 /// 测试固定用分片 0
@@ -114,8 +116,22 @@ async fn start_node(
         },
         storage: StorageConfig {
             data_dir: dir.path().to_path_buf(),
+            memtable_arena_bytes: 4 * 1024 * 1024,
         },
-        shards: ShardConfig { num_shards },
+        // 全复制语义（原 num_shards 全量分片、全部节点都是成员）：rf = 节点数，
+        // node1 主承载全部分片，其余节点副本承载全部分片 —— primary 分区互斥，
+        // 每个 shard 的承载数 = 节点数 = rf，成员 = 全部节点
+        placement: PlacementConfig {
+            replication_factor: peers.len() as u64,
+            nodes: peers
+                .iter()
+                .map(|(pid, _)| PlacementNode {
+                    id: *pid,
+                    primary: if *pid == 1 { (0..num_shards).collect() } else { vec![] },
+                    replica: if *pid == 1 { vec![] } else { (0..num_shards).collect() },
+                })
+                .collect(),
+        },
         snapshot: Default::default(),
         tls: tls_config,
         limits: Default::default(),

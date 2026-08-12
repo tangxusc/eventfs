@@ -110,8 +110,10 @@ impl TestCluster {
             let data_dir = dir.path().join("data");
             std::fs::write(
                 &config_path,
+                // 手动组建路径（无 peers）：放置表节点须 ∈ peers∪self，只能引用
+                // 本节点——rf=1、本节点主承载分片 0，成员关系由 esctl member add 组建
                 format!(
-                    "[node]\nid = {id}\nlisten_addr = \"127.0.0.1:{port}\"\n\n[storage]\ndata_dir = \"{}\"\n\n[shards]\nnum_shards = 1\n",
+                    "[node]\nid = {id}\nlisten_addr = \"127.0.0.1:{port}\"\n\n[storage]\ndata_dir = \"{}\"\n\n[placement]\nreplication_factor = 1\n\n[[placement.nodes]]\nid = {id}\nprimary = [0]\n",
                     data_dir.display()
                 ),
             )

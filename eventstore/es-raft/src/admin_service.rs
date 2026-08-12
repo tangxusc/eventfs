@@ -130,6 +130,18 @@ impl RaftAdmin for RaftAdminService {
         Ok(Response::new(ChangeMembershipResponse {}))
     }
 
+    async fn list_shards(
+        &self,
+        _request: Request<ListShardsRequest>,
+    ) -> Result<Response<ListShardsResponse>, Status> {
+        // 返回本节点已注册（承载）的分片。客户端（esctl 探测）用并集
+        // 汇总集群全部分片——各节点只承载放置表分配给它的子集。
+        Ok(Response::new(ListShardsResponse {
+            node_id: self.shard_manager.node_id(),
+            shard_ids: self.shard_manager.shard_ids().await,
+        }))
+    }
+
     async fn get_raft_state(
         &self,
         request: Request<GetRaftStateRequest>,

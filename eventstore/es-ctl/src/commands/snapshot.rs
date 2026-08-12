@@ -238,8 +238,12 @@ pub async fn run_restore(format: Format, args: &SnapshotRestoreArgs) -> Result<(
     // 2. 停机确认
     confirm(args)?;
 
-    // 3. 打开 tree（LOCK 安全网：集群未停时 build() 报 "already locked"）
-    let tree = open_tree(&args.data_dir)?;
+    // 3. 打开该分片的 tree（LOCK 安全网：集群未停时 build() 报 "already locked"）。
+    //    Phase 1 per-shard 布局：每个分片独立 tree 在 {data_dir}/shard-{id}/，
+    //    服务器运行时该分片的 LOCK 正被持有（与 es-server factory.rs 的目录约定一致）；
+    //    旧共享 tree 布局的顶层目录已无锁文件，不能作为安全网。
+    let shard_dir = args.data_dir.join(format!("shard-{shard_id}"));
+    let tree = open_tree(&shard_dir)?;
 
     // 4. 执行恢复（无论成败都收尾关闭）
     let started = std::time::Instant::now();
@@ -253,7 +257,7 @@ pub async fn run_restore(format: Format, args: &SnapshotRestoreArgs) -> Result<(
     .context("恢复失败");
 
     // 5. 收尾：失败也要关（flush+close），错误合并上报
-    let close_res = close_tree(&args.data_dir, tree).await;
+    let close_res = close_tree(&shard_dir, tree).await;
     let report = result?;
     if let Err(e) = close_res {
         eprintln!("警告：关闭数据目录失败: {e:#}");

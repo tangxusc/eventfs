@@ -122,19 +122,42 @@ pub async fn run(config: &Config, sm: Arc<ShardManager>) {
     };
     let self_id = config.node.id;
 
-    // 每分片独立探测/自举，分片间并行（分片是独立 Raft group）
+    // 每分片独立探测/自举，分片间并行（分片是独立 Raft group）。
+    // 关键：每个 shard 的 membership 只是放置表中承载它的节点子集，而非全量
+    // peers——未承载该 shard 的节点不会注册它，向它复制日志会得到 NotFound。
     let mut tasks = Vec::new();
-    for shard_id in 0..sm.num_shards() {
+    for shard_id in config.local_shards() {
         let sm = sm.clone();
-        let members = members.clone();
         let clients = clients.clone();
+        let shard_members = shard_members_map(&members, config, shard_id);
+        if shard_members.is_empty() {
+            tracing::warn!(shard_id, "放置表中该分片无承载节点（或地址缺失），跳过自举");
+            continue;
+        }
         tasks.push(tokio::spawn(async move {
-            bootstrap_shard(shard_id, members, clients, self_id, sm).await;
+            bootstrap_shard(shard_id, shard_members, clients, self_id, sm).await;
         }));
     }
     for t in tasks {
         let _ = t.await;
     }
+}
+
+/// 该 shard 的 raft 成员 map（node_id -> BasicNode）。
+///
+/// 从已 normalize 的全量成员表按放置表过滤。所有节点对同一 shard 的
+/// 计算结果一致（要求全节点放置表相同）——这是 bootstrap membership 与
+/// 双集群防护的基础，配置不一致会被 probe 的 voter_ids 对比告警。
+fn shard_members_map(
+    all: &BTreeMap<u64, BasicNode>,
+    config: &Config,
+    shard_id: u64,
+) -> BTreeMap<u64, BasicNode> {
+    config
+        .shard_members(shard_id)
+        .into_iter()
+        .filter_map(|id| all.get(&id).map(|n| (id, n.clone())))
+        .collect()
 }
 
 /// 单个分片的探测与自举。
@@ -320,7 +343,8 @@ async fn wait_peers_ready(addrs: &[String], timeout: Duration) -> bool {
 ///
 /// decide_mode 已校验地址合法；https 目标按信任策略装配 TLS（缺省跳过校验）。
 /// 返回 Err 的场景：地址非法（decide_mode 后不应发生）或 CA PEM 解析失败。
-fn build_clients(
+/// 供 service.rs（远程 shard leader 探测）复用。
+pub(crate) fn build_clients(
     members: &BTreeMap<u64, BasicNode>,
     tls: Option<&TlsClientConfig>,
 ) -> Result<BTreeMap<u64, RaftAdminClient<Channel>>, String> {
@@ -385,12 +409,39 @@ mod tests {
             },
             storage: crate::config::StorageConfig {
                 data_dir: std::path::PathBuf::from("./data"),
+                memtable_arena_bytes: 4 * 1024 * 1024,
             },
-            shards: crate::config::ShardConfig { num_shards: 1 },
+            placement: crate::config::PlacementConfig {
+                replication_factor: 1,
+                nodes: vec![crate::config::PlacementNode {
+                    id: 1,
+                    primary: vec![0],
+                    replica: Vec::new(),
+                }],
+            },
             snapshot: Default::default(),
             tls: None,
             limits: Default::default(),
         }
+    }
+
+    #[test]
+    fn shard_members_map_filters_by_placement() {
+        let cfg = config_with_peers(vec![
+            (1, "127.0.0.1:50051"),
+            (2, "127.0.0.1:50052"),
+            (3, "127.0.0.1:50053"),
+        ]);
+        let all: BTreeMap<u64, BasicNode> = BTreeMap::from([
+            (1u64, BasicNode { addr: "http://127.0.0.1:50051".into() }),
+            (2u64, BasicNode { addr: "http://127.0.0.1:50052".into() }),
+            (3u64, BasicNode { addr: "http://127.0.0.1:50053".into() }),
+        ]);
+        // 放置表只承载 shard 0（node1）：members 子集只含 node1
+        let m = shard_members_map(&all, &cfg, 0);
+        assert_eq!(m.keys().copied().collect::<Vec<_>>(), vec![1]);
+        // 未承载的 shard → 空
+        assert!(shard_members_map(&all, &cfg, 5).is_empty());
     }
 
     #[test]

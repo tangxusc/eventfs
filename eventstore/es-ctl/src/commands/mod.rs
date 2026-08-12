@@ -40,11 +40,11 @@ impl Ctx {
     /// 分片范围：首次调用时探测并缓存（探测失败回退默认值并告警）。
     pub async fn shards(&self) -> Result<ShardScope> {
         let mut guard = self.shard_scope.lock().await;
-        if let Some(scope) = *guard {
-            return Ok(scope);
+        if let Some(scope) = guard.as_ref() {
+            return Ok(scope.clone());
         }
         let scope = resolve_shard_scope(&self.cluster, &self.global).await?;
-        *guard = Some(scope);
+        *guard = Some(scope.clone());
         Ok(scope)
     }
 }

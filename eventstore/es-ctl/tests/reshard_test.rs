@@ -5,107 +5,107 @@
 use std::collections::{HashMap, HashSet};
 use std::process::{Command, Output};
 use std::sync::Arc;
-use std::time::Duration;
 
-use es_proto::eventstore::event_store_server::EventStoreServer;
-use es_server::Server;
-use es_server::config::{Config, NodeConfig, ShardConfig, StorageConfig};
+use openraft::storage::RaftStateMachine;
+use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
 use surrealkv::LSMIterator;
 
-/// 启动 2 分片单节点服务器并写入数据，返回 (数据目录, 服务器, 临时目录)。
-async fn start_and_write() -> (tempfile::TempDir, Server, usize) {
+/// 启动 2 分片旧布局数据目录并写入数据，返回 (数据目录, 事件总数)。
+async fn start_and_write() -> (tempfile::TempDir, usize) {
     let dir = tempfile::tempdir().expect("临时目录");
-    let config = Config {
-        node: NodeConfig {
-            id: 1,
-            listen_addr: "127.0.0.1:0".to_string(),
-            peers: vec![],
-        },
-        storage: StorageConfig {
-            data_dir: dir.path().to_path_buf(),
-        },
-        shards: ShardConfig { num_shards: 2 },
-        snapshot: Default::default(),
-        tls: None,
-        limits: Default::default(),
-    };
+    let total = write_old_layout(dir.path()).await;
+    (dir, total)
+}
 
-    let server = Server::new(config).expect("创建服务器");
-    server.init().await.expect("初始化");
+/// 在指定目录构造旧布局数据（单共享 tree + 分片 key 前缀）：6 流 × 2 事件，
+/// 每分片 3 个流。返回事件总数。
+///
+/// Phase 1 起服务器改为 per-shard tree（{data_dir}/shard-{id}/），但 esctl
+/// reshard 命令本期仍按旧布局读取——es_storage::reshard 的枚举/路由建立在
+/// 共享 tree + 分片前缀 key 上（Phase 3 才随命令替换）。测试直接构造命令
+/// 能理解的旧布局（与 tests_e2e.rs 的 make_reshard_src 同款），语义不变。
+async fn write_old_layout(dir: &std::path::Path) -> usize {
+    let tree = Arc::new(
+        surrealkv::TreeBuilder::new()
+            .with_path(dir.to_path_buf())
+            .build()
+            .expect("建 src tree"),
+    );
+    let mut sts = (0..2u64)
+        .map(|id| {
+            es_storage::EsStorage::new(
+                id,
+                tree.clone(),
+                es_storage::snapshot::SnapshotConfig {
+                    dir: dir.join("snapshots"),
+                    ..Default::default()
+                },
+            )
+            .expect("建存储")
+        })
+        .collect::<Vec<_>>();
 
-    let members = std::collections::BTreeSet::from([1u64]);
-    for shard_id in 0..2 {
-        let shard = server
-            .shard_manager()
-            .get_shard(shard_id)
-            .await
-            .expect("取分片");
-        shard
-            .raft
-            .initialize(members.clone())
-            .await
-            .expect("初始化 raft");
-    }
-
-    // 起 gRPC 服务（仅 EventStore 够写入）
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("绑定端口");
-    let addr = format!("http://{}", listener.local_addr().expect("取地址"));
-    let sm = server.shard_manager().clone();
-    let handle = tokio::spawn(async move {
-        let _ = tonic::transport::Server::builder()
-            .add_service(EventStoreServer::new(es_server::service::EsService::new(
-                sm,
-            )))
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-            .await;
-    });
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // 写 6 个流 × 2 条事件（覆盖两个分片）
-    let mut total = 0;
-    for i in 0..6 {
-        let stream = format!("stream-{i}");
-        for v in 0..2 {
-            let data = format!("{{\"v\":{i}-{v}}}");
-            let out = esctl(
-                &addr,
-                &["append", &stream, "--event-type", "E", "--data", &data],
-            );
-            assert!(out.status.success(), "append {stream} 失败: {}", err(&out));
-            total += 1;
+    // 每分片 3 个流：按 es_core::route(stream, 2) 实际路由挑选，保证两个
+    // 分片都有数据（infer_shard_count 按最大分片 ID 推断，缺一个分片会低估）
+    let mut names_by_shard: [Vec<String>; 2] = [vec![], vec![]];
+    for i in 0..100u64 {
+        let name = format!("stream-{i}");
+        let s = es_core::route(&name, 2) as usize;
+        if names_by_shard[s].len() < 3 {
+            names_by_shard[s].push(name);
+        }
+        if names_by_shard.iter().all(|v| v.len() == 3) {
+            break;
         }
     }
+    assert!(
+        names_by_shard.iter().all(|v| v.len() == 3),
+        "应能找到 3 个流路由到每个分片: {names_by_shard:?}"
+    );
 
-    // 停 gRPC 服务，确保落盘
-    handle.abort();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // 释放 LOCK：逐分片关存储（Tree 是共享的，最后一个 close 释放锁文件）
-    for shard_id in 0..2 {
-        let shard = server
-            .shard_manager()
-            .get_shard(shard_id)
-            .await
-            .expect("取分片");
-        shard.storage.close().await.expect("关闭存储");
+    let mut total = 0;
+    for (shard_id, names) in names_by_shard.iter().enumerate() {
+        let entries: Vec<Entry<es_storage::TypeConfig>> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| Entry {
+                log_id: LogId::new(CommittedLeaderId::new(1, 0), (i + 1) as u64),
+                payload: EntryPayload::Normal(es_storage::EsRequest::Append {
+                    stream_id: name.clone(),
+                    expected_version: es_core::ExpectedVersion::NoStream,
+                    events: vec![
+                        es_core::NewEvent {
+                            event_id: uuid::Uuid::new_v4(),
+                            event_type: "E".into(),
+                            data: format!("{{\"v\":{shard_id}-{i}-0}}").into_bytes(),
+                            metadata: vec![],
+                        },
+                        es_core::NewEvent {
+                            event_id: uuid::Uuid::new_v4(),
+                            event_type: "E".into(),
+                            data: format!("{{\"v\":{shard_id}-{i}-1}}").into_bytes(),
+                            metadata: vec![],
+                        },
+                    ],
+                    hlc: es_core::Hlc { wall: 1, logical: 0 },
+                }),
+            })
+            .collect();
+        sts[shard_id].apply(entries).await.expect("写分片");
+        total += names.len() * 2;
     }
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
-    (dir, server, total)
+    // 释放 LOCK：逐分片关存储（共享 tree，最后一个 close 释放锁文件）
+    for st in &sts {
+        st.close().await.expect("关闭存储");
+    }
+
+    total
 }
 
 /// 运行 esctl（不带 --endpoints，离线命令不需要）
 fn esctl_offline(args: &[&str]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_esctl"));
-    cmd.args(args);
-    cmd.output().expect("运行 esctl")
-}
-
-fn esctl(endpoints: &str, args: &[&str]) -> Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_esctl"));
-    cmd.args(["--endpoints", endpoints]);
     cmd.args(args);
     cmd.output().expect("运行 esctl")
 }
@@ -175,7 +175,7 @@ fn key_prefix(shard_id: u64) -> Vec<u8> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn reshard_2_to_4_data_intact() {
-    let (dir, _server, total) = start_and_write().await;
+    let (dir, total) = start_and_write().await;
 
     let dst_dir = tempfile::tempdir().expect("目标临时目录");
     let out = esctl_offline(&[
@@ -219,7 +219,7 @@ async fn reshard_2_to_4_data_intact() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn reshard_negative_cases_rejected() {
-    let (dir, _server, _) = start_and_write().await;
+    let (dir, _) = start_and_write().await;
 
     // src == dst
     let out = esctl_offline(&[
@@ -271,7 +271,7 @@ async fn reshard_negative_cases_rejected() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn reshard_dst_nonempty_requires_confirm() {
-    let (dir, _server, _) = start_and_write().await;
+    let (dir, _) = start_and_write().await;
 
     // 目标目录已存在且有文件
     let dst_dir = tempfile::tempdir().expect("目标临时目录");
@@ -310,24 +310,41 @@ async fn reshard_dst_nonempty_requires_confirm() {
 #[tokio::test(flavor = "multi_thread")]
 async fn reshard_lock_held_rejected() {
     let dir = tempfile::tempdir().expect("临时目录");
-    let config = Config {
-        node: NodeConfig {
-            id: 1,
-            listen_addr: "127.0.0.1:0".to_string(),
-            peers: vec![],
+    // 旧布局（共享 tree）：分片 0 写入 1 条事件后保持打开 → 持有顶层 LOCK
+    // （Phase 1 起服务器改为 per-shard tree，顶层的锁语义由本测试直接构造）
+    let tree = Arc::new(
+        surrealkv::TreeBuilder::new()
+            .with_path(dir.path().to_path_buf())
+            .build()
+            .expect("建 src tree"),
+    );
+    let mut st = es_storage::EsStorage::new(
+        0,
+        tree,
+        es_storage::snapshot::SnapshotConfig {
+            dir: dir.path().join("snapshots"),
+            ..Default::default()
         },
-        storage: StorageConfig {
-            data_dir: dir.path().to_path_buf(),
-        },
-        shards: ShardConfig { num_shards: 1 },
-        snapshot: Default::default(),
-        tls: None,
-        limits: Default::default(),
-    };
-    let server = Server::new(config).expect("创建服务器");
-    server.init().await.expect("初始化");
+    )
+    .expect("建存储");
+    st.apply(vec![Entry::<es_storage::TypeConfig> {
+        log_id: LogId::new(CommittedLeaderId::new(1, 0), 1),
+        payload: EntryPayload::Normal(es_storage::EsRequest::Append {
+            stream_id: "s0".into(),
+            expected_version: es_core::ExpectedVersion::NoStream,
+            events: vec![es_core::NewEvent {
+                event_id: uuid::Uuid::new_v4(),
+                event_type: "E".into(),
+                data: b"x".to_vec(),
+                metadata: vec![],
+            }],
+            hlc: es_core::Hlc { wall: 1, logical: 0 },
+        }),
+    }])
+    .await
+    .expect("写分片 0");
 
-    // 服务器持有 LOCK 未释放，reshard 打开源目录必须失败
+    // 存储未关闭 → 持有 LOCK，reshard 打开源目录必须失败
     let dst_dir = tempfile::tempdir().expect("目标临时目录");
     let out = esctl_offline(&[
         "reshard",
@@ -354,8 +371,7 @@ async fn reshard_lock_held_rejected() {
     );
 
     // 释放后成功
-    let shard = server.shard_manager().get_shard(0).await.expect("取分片");
-    shard.storage.close().await.expect("关闭存储");
+    st.close().await.expect("关闭存储");
     let out = esctl_offline(&[
         "reshard",
         "--src-dir",
@@ -373,7 +389,7 @@ async fn reshard_lock_held_rejected() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn reshard_json_output_format() {
-    let (dir, _server, _) = start_and_write().await;
+    let (dir, _) = start_and_write().await;
     let dst_dir = tempfile::tempdir().expect("目标临时目录");
 
     let out = Command::new(env!("CARGO_BIN_EXE_esctl"))
@@ -405,7 +421,7 @@ async fn reshard_json_output_format() {
 /// 文档示例流程直接失败）
 #[tokio::test(flavor = "multi_thread")]
 async fn reshard_fresh_dst_no_precreate() {
-    let (dir, _server, total) = start_and_write().await;
+    let (dir, total) = start_and_write().await;
 
     // dst 路径不存在：validate 的 canonicalize 曾对它报 NotFound
     let dst_dir = dir.path().join("dst-new");
@@ -440,7 +456,7 @@ async fn reshard_fresh_dst_no_precreate() {
 /// 且 src/dst 计数来自同一枚举子集，完整性校验拦不住）
 #[tokio::test(flavor = "multi_thread")]
 async fn reshard_src_shard_mismatch_rejected() {
-    let (dir, _server, _) = start_and_write().await;
+    let (dir, _) = start_and_write().await;
     let dst_dir = tempfile::tempdir().expect("目标临时目录");
 
     // 数据是 2 分片布局（start_and_write 写满两个分片），少报为 1

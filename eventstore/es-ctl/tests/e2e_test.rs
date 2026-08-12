@@ -8,9 +8,9 @@ use es_proto::eventstore::event_store_server::EventStoreServer;
 use es_proto::eventstore::raft_admin_server::RaftAdminServer;
 use es_proto::eventstore::raft_rpc_server::RaftRpcServer;
 use es_server::Server;
-use es_server::config::{Config, NodeConfig, ShardConfig, StorageConfig};
+use es_server::config::{Config, NodeConfig, PlacementConfig, PlacementNode, StorageConfig};
 
-/// 启动测试服务器（单节点、num_shards=2、每分片单成员自举）。
+/// 启动测试服务器（单节点、2 分片、每分片单成员自举）。
 ///
 /// 与 es-server 的 e2e 基建差异：补注册 RaftAdminServer，esctl 管理面命令可用。
 /// 返回 (地址, 服务句柄, Server, TempDir)；TempDir 由调用方持有至测试结束。
@@ -29,14 +29,23 @@ async fn start_server() -> (
         },
         storage: StorageConfig {
             data_dir: dir.path().to_path_buf(),
+            memtable_arena_bytes: 4 * 1024 * 1024,
         },
-        shards: ShardConfig { num_shards: 2 },
+        // 单节点 2 分片：rf=1，node1 主承载 [0,1]
+        placement: PlacementConfig {
+            replication_factor: 1,
+            nodes: vec![PlacementNode {
+                id: 1,
+                primary: (0..2).collect(),
+                replica: vec![],
+            }],
+        },
         snapshot: Default::default(),
         tls: None,
         limits: Default::default(),
     };
 
-    let server = Server::new(config).expect("创建服务器");
+    let server = Server::new(config.clone()).expect("创建服务器");
     server.init().await.expect("初始化");
 
     // 单节点集群：每个分片把自己设为唯一成员，立即成为 leader
@@ -62,9 +71,9 @@ async fn start_server() -> (
     let sm = server.shard_manager().clone();
     let handle = tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
-            .add_service(EventStoreServer::new(es_server::service::EsService::new(
-                sm.clone(),
-            )))
+            .add_service(EventStoreServer::new(
+                es_server::service::EsService::new(sm.clone(), &config).expect("创建服务"),
+            ))
             .add_service(RaftAdminServer::new(es_raft::RaftAdminService::new(sm)))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await;
@@ -92,14 +101,23 @@ async fn start_server_uninitialized(num_shards: u64) -> (
         },
         storage: StorageConfig {
             data_dir: dir.path().to_path_buf(),
+            memtable_arena_bytes: 4 * 1024 * 1024,
         },
-        shards: ShardConfig { num_shards },
+        // 单节点 num_shards 分片：rf=1，node1 主承载全部分片
+        placement: PlacementConfig {
+            replication_factor: 1,
+            nodes: vec![PlacementNode {
+                id: 1,
+                primary: (0..num_shards).collect(),
+                replica: vec![],
+            }],
+        },
         snapshot: Default::default(),
         tls: None,
         limits: Default::default(),
     };
 
-    let server = Server::new(config).expect("创建服务器");
+    let server = Server::new(config.clone()).expect("创建服务器");
     server.init().await.expect("初始化");
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -110,9 +128,9 @@ async fn start_server_uninitialized(num_shards: u64) -> (
     let sm = server.shard_manager().clone();
     let handle = tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
-            .add_service(EventStoreServer::new(es_server::service::EsService::new(
-                sm.clone(),
-            )))
+            .add_service(EventStoreServer::new(
+                es_server::service::EsService::new(sm.clone(), &config).expect("创建服务"),
+            ))
             .add_service(RaftAdminServer::new(es_raft::RaftAdminService::new(sm)))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await;
@@ -405,13 +423,22 @@ async fn https_self_signed_cert() {
         },
         storage: StorageConfig {
             data_dir: dir.path().to_path_buf(),
+            memtable_arena_bytes: 4 * 1024 * 1024,
         },
-        shards: ShardConfig { num_shards: 1 },
+        // 单节点 1 分片：rf=1，node1 主承载 [0]
+        placement: PlacementConfig {
+            replication_factor: 1,
+            nodes: vec![PlacementNode {
+                id: 1,
+                primary: vec![0],
+                replica: vec![],
+            }],
+        },
         snapshot: Default::default(),
         tls: None,
         limits: Default::default(),
     };
-    let server = Server::new(config).expect("创建服务器");
+    let server = Server::new(config.clone()).expect("创建服务器");
     server.init().await.expect("初始化");
     let members = std::collections::BTreeSet::from([1u64]);
     for shard_id in 0..1 {
@@ -443,9 +470,9 @@ async fn https_self_signed_cert() {
         let _ = tonic::transport::Server::builder()
             .tls_config(ServerTlsConfig::new().identity(identity))
             .expect("TLS 配置")
-            .add_service(EventStoreServer::new(es_server::service::EsService::new(
-                sm.clone(),
-            )))
+            .add_service(EventStoreServer::new(
+                es_server::service::EsService::new(sm.clone(), &config).expect("创建服务"),
+            ))
             .add_service(RaftAdminServer::new(es_raft::RaftAdminService::new(sm)))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await;
@@ -560,13 +587,23 @@ async fn start_two_nodes() -> (
             },
             storage: StorageConfig {
                 data_dir: dir.path().to_path_buf(),
+                memtable_arena_bytes: 4 * 1024 * 1024,
             },
-            shards: ShardConfig { num_shards: 1 },
+            // 手动组建路径（无 peers）：validate 要求放置表节点 ∈ peers∪self，
+            // 每节点 rf=1 承载自己的全部分片（单分片）；成员关系由 member add 组建
+            placement: PlacementConfig {
+                replication_factor: 1,
+                nodes: vec![PlacementNode {
+                    id,
+                    primary: vec![0],
+                    replica: vec![],
+                }],
+            },
             snapshot: Default::default(),
             tls: None,
             limits: Default::default(),
         };
-        let server = Server::new(config).expect("创建服务器");
+        let server = Server::new(config.clone()).expect("创建服务器");
         server.init().await.expect("初始化");
 
         // 只有 node1 自举（单成员）
@@ -586,9 +623,9 @@ async fn start_two_nodes() -> (
         let sm = server.shard_manager().clone();
         let handle = tokio::spawn(async move {
             let _ = tonic::transport::Server::builder()
-                .add_service(EventStoreServer::new(es_server::service::EsService::new(
-                    sm.clone(),
-                )))
+                .add_service(EventStoreServer::new(
+                    es_server::service::EsService::new(sm.clone(), &config).expect("创建服务"),
+                ))
                 .add_service(RaftRpcServer::new(es_raft::RaftRpcService::new(sm.clone())))
                 .add_service(RaftAdminServer::new(es_raft::RaftAdminService::new(sm)))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))

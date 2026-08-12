@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use es_proto::eventstore::event_store_server::EventStoreServer;
 use es_server::Server;
-use es_server::config::{Config, NodeConfig, ShardConfig, StorageConfig};
+use es_server::config::{Config, NodeConfig, PlacementConfig, PlacementNode, StorageConfig};
 
-/// 启动测试服务器（单节点、num_shards=2）。
+/// 启动测试服务器（单节点、2 分片）。
 /// `init`: true 时每分片单成员自举；false 用于 restore 后的重启
 /// （vote 保留，节点以快照点直接恢复领导，无需也不能重新 init）。
 async fn start_server(
@@ -22,13 +22,24 @@ async fn start_server(
             listen_addr: "127.0.0.1:0".to_string(),
             peers: vec![],
         },
-        storage: StorageConfig { data_dir },
-        shards: ShardConfig { num_shards: 2 },
+        storage: StorageConfig {
+            data_dir,
+            memtable_arena_bytes: 4 * 1024 * 1024,
+        },
+        // 单节点 2 分片：rf=1，node1 主承载 [0,1]
+        placement: PlacementConfig {
+            replication_factor: 1,
+            nodes: vec![PlacementNode {
+                id: 1,
+                primary: (0..2).collect(),
+                replica: vec![],
+            }],
+        },
         snapshot: Default::default(),
         tls: None,
         limits: Default::default(),
     };
-    let server = Server::new(config).expect("创建服务器");
+    let server = Server::new(config.clone()).expect("创建服务器");
     server.init().await.expect("初始化");
 
     if init {
@@ -54,9 +65,9 @@ async fn start_server(
     let sm = server.shard_manager().clone();
     let handle = tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
-            .add_service(EventStoreServer::new(es_server::service::EsService::new(
-                sm,
-            )))
+            .add_service(EventStoreServer::new(
+                es_server::service::EsService::new(sm, &config).expect("创建服务"),
+            ))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await;
     });

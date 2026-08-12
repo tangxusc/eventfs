@@ -61,10 +61,10 @@ pub async fn run(ctx: &Ctx, args: &AppendArgs) -> Result<()> {
     // count=0 时 route 取模除零会 panic：clap 已拒绝显式 --shards 0，
     // 但探测路径（集群未初始化、探测到 0 分片）也可能返回 0，这里兜底。
     let scope = ctx.shards().await?;
-    if scope.count == 0 {
+    if scope.is_empty() {
         bail!("分片数为 0（集群未初始化或探测失败），无法路由：请用 --shards 指定分片数");
     }
-    let route_shard = es_core::routing::route(&args.stream, scope.count);
+    let route_shard = es_core::routing::route(&args.stream, scope.count());
 
     let new_event = NewEvent {
         event_id: event_id.as_bytes().to_vec(),

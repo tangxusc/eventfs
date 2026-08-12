@@ -215,6 +215,16 @@ service RaftAdmin {
   rpc ChangeMembership(ChangeMembershipRequest) returns (ChangeMembershipResponse);
   // 查询某分片的 Raft 运行状态
   rpc GetRaftState(GetRaftStateRequest) returns (GetRaftStateResponse);
+  // 列出本节点已注册（承载）的分片
+  rpc ListShards(ListShardsRequest) returns (ListShardsResponse);
+}
+
+message ListShardsRequest {}
+
+message ListShardsResponse {
+  uint64 node_id = 1;
+  // 本节点承载的分片 ID（已注册，可被 GetRaftState/读写访问）
+  repeated uint64 shard_ids = 2;
 }
 
 // 集群成员：node_id 与其 Raft RPC 地址

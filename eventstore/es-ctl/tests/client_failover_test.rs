@@ -204,6 +204,17 @@ impl RaftAdmin for MockAdmin {
     ) -> Result<Response<ChangeMembershipResponse>, Status> {
         Err(Status::unimplemented("mock 未实现"))
     }
+
+    async fn list_shards(
+        &self,
+        _r: Request<ListShardsRequest>,
+    ) -> Result<Response<ListShardsResponse>, Status> {
+        // 与 mock 的"仅分片 0 存在"一致（分片探测用）
+        Ok(Response::new(ListShardsResponse {
+            node_id: 1,
+            shard_ids: vec![0],
+        }))
+    }
 }
 
 /// 发现 3：多端点列表里首个端点建连失败，必须故障转移到下一个端点

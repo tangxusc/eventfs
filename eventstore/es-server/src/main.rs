@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use clap::Parser;
+use std::sync::Arc;
 use es_server::{Config, Server};
 
 /// EventStore 服务器命令行参数
@@ -34,12 +35,20 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // 加载配置
-    let mut config = load_config(&args.config).unwrap_or_else(|e| {
-        tracing::warn!("Failed to load config from {}: {}", args.config, e);
-        tracing::info!("Using default configuration");
-        Config::default()
-    });
+    // 加载配置。解析失败必须 fail-fast：静默回退默认配置会让用户以为
+    // 配置已生效（尤其是旧格式的 [shards] num_shards 配置），实际却在
+    // 用最小默认布局跑——数据目录与放置表都可能不对。
+    let mut config = match load_config(&args.config) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(
+                "配置加载失败：{e:#}\n\
+                 若使用了旧格式（[shards] num_shards），请迁移为 [placement] 放置表\n\
+                 （config.example.toml 有示例）"
+            );
+            std::process::exit(1);
+        }
+    };
 
     // 命令行参数覆盖
     config = apply_overrides(config, args.node_id, args.listen);
@@ -51,18 +60,54 @@ async fn main() -> Result<()> {
         if config.tls.is_some() { "https" } else { "disabled" }
     );
     tracing::info!("Data directory: {:?}", config.storage.data_dir);
-    tracing::info!("Number of shards: {}", config.shards.num_shards);
+    tracing::info!(
+        "Local shards: {:?} (cluster total {})",
+        config.local_shards(),
+        config.shard_count()
+    );
 
     // 创建服务器
-    let server = Server::new(config)?;
+    let server = Arc::new(Server::new(config)?);
 
     // 初始化
     server.init().await?;
 
-    // 启动服务
-    server.serve().await?;
+    // 启动服务（监听阻塞）
+    let serve_server = server.clone();
+    let serve = tokio::spawn(async move {
+        serve_server.serve().await
+    });
+
+    // 优雅关闭：Ctrl-C / SIGTERM → 逐 shard 停 Raft 并关闭存储
+    // （flush WAL + 释放 surrealkv LOCK，否则重启报 "already locked"）
+    tokio::select! {
+        res = serve => return res?,
+        _ = shutdown_signal() => {
+            tracing::info!("收到退出信号，优雅关闭...");
+        }
+    }
+    server.shutdown().await;
 
     Ok(())
+}
+
+/// 等待 Ctrl-C 或 SIGTERM（unix）退出信号。
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    let sigterm = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("注册 SIGTERM 处理器")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let sigterm = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = sigterm => {},
+    }
 }
 
 fn load_config(path: &str) -> Result<Config> {
@@ -96,8 +141,61 @@ mod tests {
     use clap::Parser;
 
     /// 完整 toml 配置（Config 全字段必填，缺一不可反序列化）
-    fn full_toml(num_shards: u64) -> String {
-        format!(
+    fn full_toml() -> String {
+        r#"
+[node]
+id = 1
+listen_addr = "127.0.0.1:50051"
+peers = []
+
+[storage]
+data_dir = "/tmp/es-data"
+
+[placement]
+replication_factor = 1
+
+[[placement.nodes]]
+id = 1
+primary = [0]
+"#
+        .to_string()
+    }
+
+    fn full_json() -> String {
+        r#"{"node":{"id":2,"listen_addr":"127.0.0.1:50052","peers":[]},"storage":{"data_dir":"/tmp/es-data"},"placement":{"replication_factor":1,"nodes":[{"id":2,"primary":[0],"replica":[]}]},"tls":null}"#
+            .to_string()
+    }
+
+    #[test]
+    fn load_config_toml_branch() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, full_toml()).expect("写配置");
+        let cfg = load_config(path.to_str().unwrap()).expect("解析 toml");
+        assert_eq!(cfg.node.id, 1);
+        assert_eq!(cfg.local_shards(), vec![0]);
+    }
+
+    #[test]
+    fn load_config_json_branch() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, full_json()).expect("写配置");
+        let cfg = load_config(path.to_str().unwrap()).expect("解析 json");
+        assert_eq!(cfg.node.id, 2);
+        assert_eq!(cfg.local_shards(), vec![0]);
+    }
+
+    #[test]
+    fn load_config_old_shards_format_rejected() {
+        // 旧格式（[shards] num_shards）解析层已不再报错：serde 对未知段
+        // 默认忽略、placement 走 default（rf=2 空表）。但 fail-fast 语义
+        // 保留——空放置表在 validate() 处被拒，启动必然失败并提示迁移
+        // [placement]，不会静默用默认布局运行。
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
             r#"
 [node]
 id = 1
@@ -108,35 +206,16 @@ peers = []
 data_dir = "/tmp/es-data"
 
 [shards]
-num_shards = {num_shards}
-"#
+num_shards = 8
+"#,
         )
-    }
-
-    fn full_json(num_shards: u64) -> String {
-        format!(
-            r#"{{"node":{{"id":2,"listen_addr":"127.0.0.1:50052","peers":[]}},"storage":{{"data_dir":"/tmp/es-data"}},"shards":{{"num_shards":{num_shards}}},"tls":null}}"#
-        )
-    }
-
-    #[test]
-    fn load_config_toml_branch() {
-        let dir = tempfile::tempdir().expect("临时目录");
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, full_toml(4)).expect("写配置");
-        let cfg = load_config(path.to_str().unwrap()).expect("解析 toml");
-        assert_eq!(cfg.node.id, 1);
-        assert_eq!(cfg.shards.num_shards, 4);
-    }
-
-    #[test]
-    fn load_config_json_branch() {
-        let dir = tempfile::tempdir().expect("临时目录");
-        let path = dir.path().join("config.json");
-        std::fs::write(&path, full_json(8)).expect("写配置");
-        let cfg = load_config(path.to_str().unwrap()).expect("解析 json");
-        assert_eq!(cfg.node.id, 2);
-        assert_eq!(cfg.shards.num_shards, 8);
+        .expect("写配置");
+        let cfg = load_config(path.to_str().unwrap()).expect("旧格式可解析（未知段被忽略）");
+        let err = cfg.validate().expect_err("空放置表应被拒绝（fail-fast）");
+        assert!(
+            err.contains("nodes"),
+            "错误应说明 placement nodes 为空: {err}"
+        );
     }
 
     #[test]

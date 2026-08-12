@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use es_proto::eventstore::event_store_server::EventStoreServer;
 use es_proto::eventstore::{event_store_client::EventStoreClient, *};
-use es_server::config::{Config, NodeConfig, ShardConfig, StorageConfig};
+use es_server::config::{Config, NodeConfig, PlacementConfig, PlacementNode, StorageConfig};
 use es_server::Server;
 
 /// 启动测试服务器。
@@ -28,14 +28,23 @@ async fn start_test_server() -> (
         },
         storage: StorageConfig {
             data_dir: dir.path().to_path_buf(),
+            memtable_arena_bytes: 4 * 1024 * 1024,
         },
-        shards: ShardConfig { num_shards: 2 },
+        // 单节点 2 分片：rf=1，node1 主承载 [0,1]
+        placement: PlacementConfig {
+            replication_factor: 1,
+            nodes: vec![PlacementNode {
+                id: 1,
+                primary: (0..2).collect(),
+                replica: vec![],
+            }],
+        },
         snapshot: Default::default(),
         tls: None,
         limits: Default::default(),
     };
 
-    let server = Server::new(config).expect("创建服务器");
+    let server = Server::new(config.clone()).expect("创建服务器");
     server.init().await.expect("初始化");
 
     // 单节点集群：把自己设为唯一成员，立即成为 leader
@@ -58,7 +67,8 @@ async fn start_test_server() -> (
         .expect("绑定端口");
     let addr = format!("http://{}", listener.local_addr().expect("取本地地址"));
 
-    let service = es_server::service::EsService::new(server.shard_manager().clone());
+    let service = es_server::service::EsService::new(server.shard_manager().clone(), &config)
+        .expect("创建服务");
     let handle = tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
             .add_service(EventStoreServer::new(service))

@@ -133,13 +133,51 @@ impl TestCluster {
             if write_peers {
                 node_json["peers"] = serde_json::Value::Array(all_peers.clone());
             }
+            // 放置表：
+            // - write_peers=true（自动组建）：全复制语义（原「每节点全量 N 分片、
+            //   全部节点都是成员」）——rf=节点数，node1 主承载全部分片，其余节点
+            //   副本承载全部分片（primary 分区互斥，每 shard 承载数=节点数=rf）；
+            // - write_peers=false（手动组建）：无 peers，validate 要求放置表节点
+            //   ∈ peers∪self，只能引用本节点——rf=1、本节点主承载全部分片，
+            //   成员关系由 RaftAdmin 手动组建，承载语义与原全量一致。
+            let placement_nodes: Vec<serde_json::Value> = if write_peers {
+                ports
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| {
+                        let pid = (i + 1) as u64;
+                        serde_json::json!({
+                            "id": pid,
+                            "primary": if pid == 1 {
+                                (0..num_shards).collect::<Vec<u64>>()
+                            } else {
+                                vec![]
+                            },
+                            "replica": if pid == 1 {
+                                vec![]
+                            } else {
+                                (0..num_shards).collect::<Vec<u64>>()
+                            },
+                        })
+                    })
+                    .collect()
+            } else {
+                let nodes: Vec<serde_json::Value> = vec![serde_json::json!({
+                    "id": node_id,
+                    "primary": (0..num_shards).collect::<Vec<u64>>(),
+                    "replica": Vec::<u64>::new(),
+                })];
+                nodes
+            };
             let config = serde_json::json!({
                 "node": node_json,
                 "storage": {
                     "data_dir": dir.path().to_str().unwrap(),
+                    "memtable_arena_bytes": 4 * 1024 * 1024,
                 },
-                "shards": {
-                    "num_shards": num_shards,
+                "placement": {
+                    "replication_factor": if write_peers { n } else { 1 },
+                    "nodes": placement_nodes,
                 },
             });
 

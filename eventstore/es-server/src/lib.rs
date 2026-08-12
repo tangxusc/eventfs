@@ -2,6 +2,7 @@
 
 pub mod bootstrap;
 pub mod config;
+pub mod factory;
 pub mod server;
 pub mod service;
 

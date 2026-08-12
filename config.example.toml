@@ -38,6 +38,36 @@ ca_file = "./certs/ca.crt"   # 可选；删掉本行则跳过校验
 
 [storage]
 data_dir = "./data/node1"
+# 每个 shard 的 surrealkv LSM memtable arena（字节），范围 [1MiB, 16MiB]，默认 4MiB。
+# surrealkv 默认 100MB/实例且打开即预分配；每 shard 一个 LSM tree 的布局下
+# N 个 shard 就是 N 个实例，必须调小，否则内存被固定开销吃满。
+memtable_arena_bytes = 4194304
+
+# 分片放置表（替代旧 [shards] num_shards）：
+# - 每个 shard 一个 raft group，成员 = 放置表中承载它的全部节点
+# - replication_factor：每个 shard 的投票成员数（primary + replica 合计），默认 2
+# - primary：主承载（管理偏好标签，leader 仍由 raft 选举产生）
+# - replica：副本承载
+# - 不变式（启动校验强制）：primary 分区互斥、每 shard 承载数 == replication_factor
+# - 配置变更（加节点/加 shards）由节点 watch 热加载后运行期生效，无需重启
+# 示例：3 节点 rf=2，6 个 shard 环形分布
+[placement]
+replication_factor = 2
+
+[[placement.nodes]]
+id = 1
+primary = [0, 1]
+replica = [2, 3]
+
+[[placement.nodes]]
+id = 2
+primary = [2, 3]
+replica = [4, 5]
+
+[[placement.nodes]]
+id = 3
+primary = [4, 5]
+replica = [0, 1]
 
 # 快照配置（可选，可整体缺省；缺省值见注释）
 # compression：快照压缩算法，zstd（压缩率高）/ lz4（速度快）/ none（不压缩）；
@@ -63,6 +93,3 @@ max_chunk_size = 3145728
 [limits]
 max_event_bytes = 1048576
 max_append_batch_bytes = 7340032
-
-[shards]
-num_shards = 8
