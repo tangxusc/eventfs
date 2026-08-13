@@ -263,11 +263,14 @@ esctl snapshot restore ./data/node1 ./data/node1/snapshots/snap-0-1-100.esnap --
 ## 测试
 
 ```bash
-# 默认套件，422 项全绿
+# 默认套件：422 项（不含 14 项真实多进程用例）
 cargo test --workspace
 
-# 多节点测试：12 项（7 手动组建 + 5 自动组建），测试框架自动构建并直接运行二进制
+# 真实多进程测试：es-server 12 项（7 手动组建 + 5 自动组建）
 cargo test -p es-server --test multi_node_test -- --ignored --test-threads=1
+
+# 真实多进程测试：esctl 2 项
+cargo test -p es-ctl --test multi_node_test -- --ignored --test-threads=1
 ```
 
 | 套件 | 项数 | 内容 |
@@ -292,7 +295,10 @@ cargo test -p es-server --test multi_node_test -- --ignored --test-threads=1
 cargo test -p es-ctl --test multi_node_test -- --ignored --test-threads=1
 ```
 
-覆盖率（`cargo llvm-cov --workspace`）：行 87.87%、分支 80.24%。
+本次覆盖率（`cargo llvm-cov --workspace`，2026-08-13）：行 89.43%、区域 87.70%、
+函数 80.28%。
+`cargo-llvm-cov 0.8.7` 在本次统计中未输出分支数据；因此分支覆盖率需使用能产生
+分支统计的工具链重新验收。
 
 ```bash
 # 存储层基准
@@ -335,8 +341,8 @@ cargo bench -p es-storage
 
 **可观测性与基准**
 - [ ] Prometheus 指标（当前只有 tracing 日志）
-- [ ] 端到端写入吞吐基准（单节点集群 gRPC 压测 Append）
-- [ ] 大流读取延迟（1k / 10k / 100k 事件的流）
+- [x] 端到端写入吞吐基准（3 节点 TLS 集群 gRPC 压测 Append）
+- [x] 大流读取延迟（1KB / 10KB / 100KB 事件、各 50MB 全量读与订阅追平）
 - [ ] Raft 复制延迟（leader 写入到 follower apply 的时间分布）
 - [ ] 真实数据量的迁移基准（含事件而非只有 StreamMeta）
 
