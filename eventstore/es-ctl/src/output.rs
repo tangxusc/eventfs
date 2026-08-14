@@ -85,6 +85,38 @@ pub fn event_simple_line(ev: &Event) -> String {
     )
 }
 
+/// 订阅公开事件转 JSON：订阅接口刻意不暴露内部 shard 与 position。
+pub fn subscription_event_to_json(
+    ev: &es_proto::eventstore::SubscriptionEvent,
+) -> serde_json::Value {
+    json!({
+        "stream_id": ev.stream_id,
+        "version": ev.version,
+        "event_id": event_id_text(&ev.event_id),
+        "event_type": ev.event_type,
+        "data": event_data_json(&ev.data),
+        "metadata": event_data_json(&ev.metadata),
+        "hlc": { "wall": ev.hlc.as_ref().map(|h| h.wall).unwrap_or(0),
+                 "logical": ev.hlc.as_ref().map(|h| h.logical).unwrap_or(0) },
+    })
+}
+
+/// 渲染公开订阅事件，保持与普通事件一致的可读字段但不泄露路由细节。
+pub fn subscription_event_simple_line(ev: &es_proto::eventstore::SubscriptionEvent) -> String {
+    let hlc = ev
+        .hlc
+        .as_ref()
+        .map(|h| hlc_to_rfc3339(h.wall))
+        .unwrap_or_else(|| "-".into());
+    format!(
+        "{}\t{}\t[{}]\t{}",
+        ev.version,
+        hlc,
+        ev.event_type,
+        event_data_text(&ev.data)
+    )
+}
+
 /// 渲染简单对齐表格：每列按内容最宽对齐，列间两个空格
 pub fn render_table(header: &[&str], rows: &[Vec<String>]) -> String {
     let widths: Vec<usize> = header

@@ -1075,6 +1075,44 @@ mod tests {
         assert!(!latest.to_str().unwrap().contains("-00000000000000000011-"));
     }
 
+    /// 恢复前扫描必须容忍缺失目录、无关文件和损坏快照，并过滤领先状态机的残留。
+    #[test]
+    fn store_scan_skips_invalid_entries_and_future_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_dir = dir.path().join("snapshots");
+        let store = SnapshotStore::new(
+            SnapshotConfig {
+                dir: snapshot_dir,
+                compression: Compression::None,
+                keep: 2,
+            },
+            0,
+        )
+        .unwrap();
+
+        assert!(store.list_entries().unwrap().is_empty(), "缺失目录应视为空");
+        assert_eq!(store.cleanup_incoming().unwrap(), 0, "缺失 incoming 不应报错");
+
+        store.ensure_dirs().unwrap();
+        std::fs::create_dir(store.cfg.dir.join("nested")).unwrap();
+        std::fs::write(store.cfg.dir.join("ignored.txt"), b"not a snapshot").unwrap();
+        std::fs::write(store.cfg.dir.join("broken.esnap"), b"broken").unwrap();
+        let entries = store.list_entries().unwrap();
+        assert_eq!(entries.len(), 1, "只列出 .esnap 普通文件");
+        assert!(!entries[0].valid, "损坏快照必须标记为无效而不是中断扫描");
+
+        let applied = log_id(1, 10);
+        let retained = store.final_path(Some(applied));
+        let future = store.final_path(Some(log_id(2, 1)));
+        write_snap_file(&retained, Compression::None, 1, 10, &[]);
+        write_snap_file(&future, Compression::None, 2, 1, &[]);
+        assert_eq!(
+            store.latest(Some(applied)).unwrap(),
+            Some(retained),
+            "领先于已应用位置的残留快照不能参与恢复"
+        );
+    }
+
     #[test]
     fn store_retain_keeps_newest_n() {
         let dir = tempfile::tempdir().unwrap();
@@ -1418,4 +1456,3 @@ pub async fn restore(
         snapshot_file: final_path,
     })
 }
-

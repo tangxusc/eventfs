@@ -14,19 +14,19 @@ use es_core::{LeaderRetryPlan, parse_leader_hint};
 use es_proto::endpoint::normalize_endpoint;
 use es_proto::eventstore::event_store_client::EventStoreClient as GrpcClient;
 use es_proto::eventstore::*;
-use es_proto::tls::{apply_endpoint_tls, TlsClientConfig};
+use es_proto::tls::{TlsClientConfig, apply_endpoint_tls};
 
 /// 选举中（`leader unknown`）退避间隔，与 es-ctl 一致。
 /// 单节点选举最坏情况 append 耗时 ≈ 4 次重试 × 200ms ≈ 800ms。
 const ELECTION_RETRY_DELAY: Duration = Duration::from_millis(200);
 
-/// 订阅目标：订阅单个流或全部分片（对应 proto `SubscribeRequest.target` oneof）。
+/// 订阅目标：订阅一个或多个 stream，或订阅全部 stream。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubscribeTarget {
-    /// 订阅单个流
-    Stream(String),
-    /// 订阅全部分片（`shard_id` 指定分片，默认 0）
-    All { shard_id: u64 },
+    /// 订阅一个或多个 stream
+    Streams(Vec<String>),
+    /// 订阅当前集群全部 stream
+    All,
 }
 
 /// 订阅响应流：逐条投递 `SubscribeResponse`（事件或 `caught_up` 分界信号）。
@@ -390,28 +390,19 @@ impl EventStoreClient {
     /// 错误在流上以 `Err` 投递，由调用方决定是否以已读位置重新发起订阅。
     ///
     /// # 参数
-    /// - `target`: 订阅单个流或全部分片
-    /// - `from_exclusive`: 订阅流时按 version、订阅 all 时按 position（不含起点）。
-    ///   注意服务端会对其 +1 作为起始，**不要传 `u64::MAX`**（会回绕到 0 从头重放）
-    /// - `from_start`: true 从头开始，忽略 `from_exclusive`
+    /// - `target`: 订阅一个或多个 stream，或当前集群全部 stream
     pub async fn subscribe(
         &mut self,
         target: SubscribeTarget,
-        from_exclusive: u64,
-        from_start: bool,
     ) -> Result<SubscribeStream, ClientError> {
         let request = match &target {
-            SubscribeTarget::Stream(stream_id) => SubscribeRequest {
-                target: Some(subscribe_request::Target::StreamId(stream_id.clone())),
-                from_exclusive,
-                from_start,
-                shard_id: 0,
+            SubscribeTarget::Streams(stream_ids) => SubscribeRequest {
+                target: Some(subscribe_request::Target::Streams(SubscribeStreams {
+                    stream_ids: stream_ids.clone(),
+                })),
             },
-            SubscribeTarget::All { shard_id } => SubscribeRequest {
+            SubscribeTarget::All => SubscribeRequest {
                 target: Some(subscribe_request::Target::All(Empty {})),
-                from_exclusive,
-                from_start,
-                shard_id: *shard_id,
             },
         };
 
@@ -615,8 +606,8 @@ mod tests {
     /// 单事件超限 → PayloadTooLarge（不发 RPC）
     #[test]
     fn single_event_over_limit_rejected() {
-        let err = check_append_limits(&[new_event(MAX_EVENT_PAYLOAD_BYTES + 1)])
-            .expect_err("超限应报错");
+        let err =
+            check_append_limits(&[new_event(MAX_EVENT_PAYLOAD_BYTES + 1)]).expect_err("超限应报错");
         assert!(
             matches!(err, ClientError::PayloadTooLarge(_)),
             "应为 PayloadTooLarge,实际 {err:?}"

@@ -4,9 +4,14 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use es_proto::eventstore::event_store_server::EventStoreServer;
+use es_proto::eventstore::internal_subscription_client::InternalSubscriptionClient;
+use es_proto::eventstore::internal_subscription_server::InternalSubscriptionServer;
+use es_proto::eventstore::raft_admin_server::RaftAdminServer;
 use es_proto::eventstore::{event_store_client::EventStoreClient, *};
-use es_server::config::{Config, NodeConfig, PlacementConfig, PlacementNode, StorageConfig};
 use es_server::Server;
+use es_server::config::{
+    Config, NodeConfig, PeerConfig, PlacementConfig, PlacementNode, StorageConfig,
+};
 
 /// 启动测试服务器。
 ///
@@ -24,6 +29,7 @@ async fn start_test_server() -> (
         node: NodeConfig {
             id: 1,
             listen_addr: "127.0.0.1:0".to_string(),
+            internal_listen_addr: None,
             peers: vec![],
         },
         storage: StorageConfig {
@@ -86,6 +92,194 @@ async fn start_test_server() -> (
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     (addr, handle, server, dir)
+}
+
+/// 启动两个各承载一个分片的节点，覆盖公开订阅经内部 RPC 聚合远程来源。
+async fn start_two_shard_servers() -> (
+    String,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<()>,
+    Server,
+    Server,
+    tempfile::TempDir,
+    tempfile::TempDir,
+) {
+    let first_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("绑定节点一端口");
+    let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("绑定节点二端口");
+    let first_internal_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("绑定节点一内部端口");
+    let second_internal_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("绑定节点二内部端口");
+    let first_addr = format!(
+        "http://{}",
+        first_listener.local_addr().expect("节点一地址")
+    );
+    let second_addr = format!(
+        "http://{}",
+        second_listener.local_addr().expect("节点二地址")
+    );
+    let first_internal_addr = format!(
+        "http://{}",
+        first_internal_listener
+            .local_addr()
+            .expect("节点一内部地址")
+    );
+    let first_internal_listen_addr = first_internal_listener
+        .local_addr()
+        .expect("节点一内部监听地址")
+        .to_string();
+    let second_internal_addr = format!(
+        "http://{}",
+        second_internal_listener
+            .local_addr()
+            .expect("节点二内部地址")
+    );
+    let second_internal_listen_addr = second_internal_listener
+        .local_addr()
+        .expect("节点二内部监听地址")
+        .to_string();
+    let first_dir = tempfile::tempdir().expect("节点一目录");
+    let second_dir = tempfile::tempdir().expect("节点二目录");
+    let placement = PlacementConfig {
+        replication_factor: 1,
+        nodes: vec![
+            PlacementNode {
+                id: 1,
+                primary: vec![1],
+                replica: vec![],
+            },
+            PlacementNode {
+                id: 2,
+                primary: vec![0],
+                replica: vec![],
+            },
+        ],
+    };
+    let first_config = Config {
+        node: NodeConfig {
+            id: 1,
+            listen_addr: "127.0.0.1:0".into(),
+            internal_listen_addr: Some(first_internal_listen_addr),
+            peers: vec![PeerConfig {
+                id: 2,
+                addr: second_addr.clone(),
+                internal_addr: Some(second_internal_addr.clone()),
+            }],
+        },
+        storage: StorageConfig {
+            data_dir: first_dir.path().to_path_buf(),
+            memtable_arena_bytes: 4 * 1024 * 1024,
+        },
+        placement: placement.clone(),
+        snapshot: Default::default(),
+        tls: None,
+        limits: Default::default(),
+    };
+    let second_config = Config {
+        node: NodeConfig {
+            id: 2,
+            listen_addr: "127.0.0.1:0".into(),
+            internal_listen_addr: Some(second_internal_listen_addr),
+            peers: vec![PeerConfig {
+                id: 1,
+                addr: first_addr.clone(),
+                internal_addr: Some(first_internal_addr),
+            }],
+        },
+        storage: StorageConfig {
+            data_dir: second_dir.path().to_path_buf(),
+            memtable_arena_bytes: 4 * 1024 * 1024,
+        },
+        placement,
+        snapshot: Default::default(),
+        tls: None,
+        limits: Default::default(),
+    };
+    let first = Server::new(first_config.clone()).expect("创建节点一");
+    let second = Server::new(second_config.clone()).expect("创建节点二");
+    first.init().await.expect("初始化节点一");
+    second.init().await.expect("初始化节点二");
+    first
+        .shard_manager()
+        .get_shard(1)
+        .await
+        .expect("节点一分片")
+        .raft
+        .initialize(std::collections::BTreeSet::from([1u64]))
+        .await
+        .expect("初始化节点一 raft");
+    second
+        .shard_manager()
+        .get_shard(0)
+        .await
+        .expect("节点二分片")
+        .raft
+        .initialize(std::collections::BTreeSet::from([2u64]))
+        .await
+        .expect("初始化节点二 raft");
+
+    let first_service = es_server::service::EsService::with_limits(
+        first.shard_manager().clone(),
+        first_config.limits.clone(),
+        first.route_table().clone(),
+        &first_config,
+    )
+    .expect("节点一服务");
+    let second_service = es_server::service::EsService::with_limits(
+        second.shard_manager().clone(),
+        second_config.limits.clone(),
+        second.route_table().clone(),
+        &second_config,
+    )
+    .expect("节点二服务");
+    let first_admin = es_raft::RaftAdminService::new(first.shard_manager().clone());
+    let second_admin = es_raft::RaftAdminService::new(second.shard_manager().clone());
+    let first_handle = tokio::spawn(async move {
+        let _ = tokio::try_join!(
+            tonic::transport::Server::builder()
+                .add_service(EventStoreServer::new(first_service.clone()))
+                .add_service(RaftAdminServer::new(first_admin))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
+                    first_listener
+                )),
+            tonic::transport::Server::builder()
+                .add_service(InternalSubscriptionServer::new(first_service))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
+                    first_internal_listener
+                )),
+        );
+    });
+    let second_handle = tokio::spawn(async move {
+        let _ = tokio::try_join!(
+            tonic::transport::Server::builder()
+                .add_service(EventStoreServer::new(second_service.clone()))
+                .add_service(RaftAdminServer::new(second_admin))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
+                    second_listener
+                )),
+            tonic::transport::Server::builder()
+                .add_service(InternalSubscriptionServer::new(second_service))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
+                    second_internal_listener
+                )),
+        );
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    (
+        first_addr,
+        first_handle,
+        second_handle,
+        first,
+        second,
+        first_dir,
+        second_dir,
+    )
 }
 
 /// 期望版本：不校验
@@ -339,8 +533,16 @@ async fn idempotent_event_id_no_duplicate() {
     let r2 = client.append(req()).await.expect("重放").into_inner();
 
     assert_eq!(
-        (r1.next_expected_version, r1.first_position, r1.last_position),
-        (r2.next_expected_version, r2.first_position, r2.last_position),
+        (
+            r1.next_expected_version,
+            r1.first_position,
+            r1.last_position
+        ),
+        (
+            r2.next_expected_version,
+            r2.first_position,
+            r2.last_position
+        ),
         "重放必须返回与首次相同的结果"
     );
 
@@ -498,11 +700,7 @@ async fn read_all_position_ordered_across_streams() {
         events.extend(resp.events);
     }
 
-    assert_eq!(
-        events.len(),
-        streams.len(),
-        "ReadAll 应返回该分片全部事件"
-    );
+    assert_eq!(events.len(), streams.len(), "ReadAll 应返回该分片全部事件");
 
     // position 严格递增，即提交序
     for i in 1..events.len() {
@@ -585,11 +783,13 @@ async fn read_all_merge_per_shard_position_order() {
     let mut client = EventStoreClient::connect(addr).await.expect("连接");
 
     // 交错写入 10 个流，num_shards=2 故必然分布在两个分片上
-    let mut per_shard: std::collections::HashMap<u64, Vec<u64>> =
-        std::collections::HashMap::new();
+    let mut per_shard: std::collections::HashMap<u64, Vec<u64>> = std::collections::HashMap::new();
     for i in 0..10u8 {
         let r = append_one(&mut client, &format!("x-{i}"), &[i]).await;
-        per_shard.entry(r.shard_id).or_default().push(r.first_position);
+        per_shard
+            .entry(r.shard_id)
+            .or_default()
+            .push(r.first_position);
     }
     assert_eq!(per_shard.len(), 2, "应覆盖 2 个分片");
 
@@ -835,12 +1035,7 @@ async fn cross_shard_read_all_backward() {
     for w in back.windows(2) {
         let h0 = w[0].hlc.as_ref().unwrap();
         let h1 = w[1].hlc.as_ref().unwrap();
-        assert!(
-            h0.wall >= h1.wall,
-            "HLC 应降序: {} vs {}",
-            h0.wall,
-            h1.wall
-        );
+        assert!(h0.wall >= h1.wall, "HLC 应降序: {} vs {}", h0.wall, h1.wall);
     }
 
     // 倒序结果应与正序相反(按事件标识,如 stream_id)
@@ -886,7 +1081,10 @@ async fn read_all_backward_paging_terminates() {
     let mut last_next: Vec<ShardPosition> = Vec::new();
     loop {
         pages += 1;
-        assert!(pages < 10, "反向翻页应干净终止（最多 ~4 页），当前卡在第 {pages} 页");
+        assert!(
+            pages < 10,
+            "反向翻页应干净终止（最多 ~4 页），当前卡在第 {pages} 页"
+        );
         let mut s = client
             .read_all(ReadAllRequest {
                 shard_ids: vec![],
@@ -1003,7 +1201,6 @@ async fn read_all_backward_last_page_cursor_zero_kept() {
     handle.abort();
 }
 
-
 /// 从订阅流里取下一条响应，带超时。
 ///
 /// 必须带超时：订阅流在 live 阶段会一直挂着等新事件，
@@ -1022,12 +1219,15 @@ async fn next_sub(
 }
 
 /// 收取 catch-up 阶段的全部事件，直到收到 caught_up 分界信号
-async fn drain_until_caught_up(s: &mut tonic::Streaming<SubscribeResponse>) -> Vec<Event> {
+async fn drain_until_caught_up(
+    s: &mut tonic::Streaming<SubscribeResponse>,
+) -> Vec<SubscriptionEvent> {
     let mut out = Vec::new();
     loop {
         match next_sub(s).await {
             Some(subscribe_response::Payload::Event(e)) => out.push(e),
             Some(subscribe_response::Payload::CaughtUp(_)) => return out,
+            Some(subscribe_response::Payload::Degraded(_)) => panic!("健康订阅不应降级"),
             None => panic!("订阅流在收到 caught_up 前就结束了"),
         }
     }
@@ -1045,10 +1245,9 @@ async fn subscribe_catchup_then_live() {
 
     let mut s = client
         .subscribe(SubscribeRequest {
-            target: Some(subscribe_request::Target::StreamId("sub".to_string())),
-            from_exclusive: 0,
-            from_start: true,
-            shard_id: 0,
+            target: Some(subscribe_request::Target::Streams(SubscribeStreams {
+                stream_ids: vec!["sub".to_string()],
+            })),
         })
         .await
         .expect("subscribe")
@@ -1078,31 +1277,36 @@ async fn subscribe_catchup_then_live() {
 }
 
 #[tokio::test]
-async fn subscribe_from_middle_version() {
+async fn subscribe_client_disconnect_does_not_block_subsequent_subscription() {
     let (addr, handle, _server, _dir) = start_test_server().await;
     let mut client = EventStoreClient::connect(addr).await.expect("连接");
+    append_one(&mut client, "disconnect-stream", b"history").await;
 
-    for i in 0..5u8 {
-        append_one(&mut client, "submid", &[i]).await;
-    }
-
-    // from_exclusive=2 表示从 version 3 开始
-    let mut s = client
+    let cancelled = client
         .subscribe(SubscribeRequest {
-            target: Some(subscribe_request::Target::StreamId("submid".to_string())),
-            from_exclusive: 2,
-            from_start: false,
-            shard_id: 0,
+            target: Some(subscribe_request::Target::Streams(SubscribeStreams {
+                stream_ids: vec!["disconnect-stream".into()],
+            })),
         })
         .await
-        .expect("subscribe")
+        .expect("建立将取消的订阅")
         .into_inner();
+    drop(cancelled);
+    tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let history = drain_until_caught_up(&mut s).await;
-    let versions: Vec<u64> = history.iter().map(|e| e.version).collect();
-    assert_eq!(versions, vec![3, 4], "应只补齐 version 3 与 4");
+    let mut healthy = client
+        .subscribe(SubscribeRequest {
+            target: Some(subscribe_request::Target::Streams(SubscribeStreams {
+                stream_ids: vec!["disconnect-stream".into()],
+            })),
+        })
+        .await
+        .expect("取消旧订阅后仍可建立新订阅")
+        .into_inner();
+    let history = drain_until_caught_up(&mut healthy).await;
+    assert_eq!(history.len(), 1, "新订阅必须正常完成历史追平");
 
-    drop(s);
+    drop(healthy);
     handle.abort();
 }
 
@@ -1126,10 +1330,9 @@ async fn subscribe_only_this_stream() {
 
     let mut s = client
         .subscribe(SubscribeRequest {
-            target: Some(subscribe_request::Target::StreamId("filter-a".to_string())),
-            from_exclusive: 0,
-            from_start: true,
-            shard_id: 0,
+            target: Some(subscribe_request::Target::Streams(SubscribeStreams {
+                stream_ids: vec!["filter-a".to_string()],
+            })),
         })
         .await
         .expect("subscribe")
@@ -1146,10 +1349,7 @@ async fn subscribe_only_this_stream() {
 
     match next_sub(&mut s).await {
         Some(subscribe_response::Payload::Event(e)) => {
-            assert_eq!(
-                e.stream_id, "filter-a",
-                "订阅单流时不能收到其他流的事件"
-            );
+            assert_eq!(e.stream_id, "filter-a", "订阅单流时不能收到其他流的事件");
             assert_eq!(e.data, b"a1");
         }
         other => panic!("应收到本流事件，实际: {other:?}"),
@@ -1160,29 +1360,551 @@ async fn subscribe_only_this_stream() {
 }
 
 #[tokio::test]
+async fn subscribe_multiple_streams_across_shards() {
+    let (addr, handle, _server, _dir) = start_test_server().await;
+    let mut client = EventStoreClient::connect(addr).await.expect("连接");
+
+    let first = append_one(&mut client, "aggregate-a", b"a0").await;
+    let mut second = None;
+    for i in 0..20 {
+        let stream = format!("aggregate-b-{i}");
+        let response = append_one(&mut client, &stream, b"b0").await;
+        if response.shard_id != first.shard_id {
+            second = Some(stream);
+            break;
+        }
+    }
+    let second = second.expect("应找到另一个分片上的 stream");
+
+    let mut subscription = client
+        .subscribe(SubscribeRequest {
+            target: Some(subscribe_request::Target::Streams(SubscribeStreams {
+                stream_ids: vec!["aggregate-a".into(), second.clone()],
+            })),
+        })
+        .await
+        .expect("建立聚合订阅")
+        .into_inner();
+
+    let history = drain_until_caught_up(&mut subscription).await;
+    let streams: HashSet<_> = history
+        .iter()
+        .map(|event| event.stream_id.as_str())
+        .collect();
+    assert_eq!(streams, HashSet::from(["aggregate-a", second.as_str()]));
+
+    append_one(&mut client, "aggregate-a", b"a1").await;
+    append_one(&mut client, &second, b"b1").await;
+    let mut live = HashSet::new();
+    while live.len() < 2 {
+        match next_sub(&mut subscription).await {
+            Some(subscribe_response::Payload::Event(event)) => {
+                live.insert((event.stream_id, event.version, event.data));
+            }
+            Some(subscribe_response::Payload::Degraded(_)) => panic!("健康订阅不应降级"),
+            Some(subscribe_response::Payload::CaughtUp(_)) => {}
+            None => panic!("订阅流提前结束"),
+        }
+    }
+    assert!(live.contains(&(String::from("aggregate-a"), 1, b"a1".to_vec())));
+    assert!(live.contains(&(second, 1, b"b1".to_vec())));
+
+    drop(subscription);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn subscribe_aggregates_remote_shard_through_internal_rpc() {
+    let (first_addr, first_handle, second_handle, first, second, _first_dir, _second_dir) =
+        start_two_shard_servers().await;
+
+    // 两个路由表在相同顺序下分配，保证接入节点和远程承载节点对同一 stream 一致。
+    first
+        .route_table()
+        .allocate("remote-stream")
+        .await
+        .expect("节点一记录远程路由");
+    second
+        .route_table()
+        .allocate("remote-stream")
+        .await
+        .expect("节点二记录远程路由");
+    first
+        .route_table()
+        .allocate("local-stream")
+        .await
+        .expect("节点一记录本地路由");
+    second
+        .route_table()
+        .allocate("local-stream")
+        .await
+        .expect("节点二记录本地路由");
+    assert_eq!(first.route_table().lookup("remote-stream").await, Some(0));
+    assert_eq!(first.route_table().lookup("local-stream").await, Some(1));
+
+    let mut first_client = EventStoreClient::connect(first_addr)
+        .await
+        .expect("连接节点一");
+    let second_addr = first.config().node.peers[0].addr.clone();
+    let mut second_client = EventStoreClient::connect(second_addr)
+        .await
+        .expect("连接节点二");
+
+    append_one(&mut first_client, "local-stream", b"local-history").await;
+    append_one(&mut second_client, "remote-stream", b"remote-history").await;
+
+    let mut subscription = first_client
+        .subscribe(SubscribeRequest {
+            target: Some(subscribe_request::Target::Streams(SubscribeStreams {
+                stream_ids: vec!["local-stream".into(), "remote-stream".into()],
+            })),
+        })
+        .await
+        .expect("建立跨节点聚合订阅")
+        .into_inner();
+    let history = drain_until_caught_up(&mut subscription).await;
+    let identities: HashSet<_> = history
+        .iter()
+        .map(|event| (event.stream_id.as_str(), event.version))
+        .collect();
+    assert_eq!(
+        identities,
+        HashSet::from([("local-stream", 0), ("remote-stream", 0)])
+    );
+
+    append_one(&mut second_client, "remote-stream", b"remote-live").await;
+    match next_sub(&mut subscription).await {
+        Some(subscribe_response::Payload::Event(event)) => {
+            assert_eq!(event.stream_id, "remote-stream");
+            assert_eq!(event.version, 1);
+            assert_eq!(event.data, b"remote-live");
+        }
+        other => panic!("远程分片实时事件应经内部 RPC 转发，实际: {other:?}"),
+    }
+
+    drop(subscription);
+    first_handle.abort();
+    second_handle.abort();
+}
+
+#[tokio::test]
+async fn subscribe_from_follower_forwards_to_leader_internal_listener() {
+    let follower_public_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("绑定 follower 公共端口");
+    let leader_public_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("绑定 leader 公共端口");
+    let leader_internal_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("绑定 leader 内部端口");
+    let follower_internal_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("绑定 follower 内部端口");
+    let follower_public_addr = format!(
+        "http://{}",
+        follower_public_listener
+            .local_addr()
+            .expect("读取 follower 公共地址")
+    );
+    let leader_public_addr = format!(
+        "http://{}",
+        leader_public_listener
+            .local_addr()
+            .expect("读取 leader 公共地址")
+    );
+    let leader_internal_addr = format!(
+        "http://{}",
+        leader_internal_listener
+            .local_addr()
+            .expect("读取 leader 内部地址")
+    );
+    let follower_internal_addr = format!(
+        "http://{}",
+        follower_internal_listener
+            .local_addr()
+            .expect("读取 follower 内部地址")
+    );
+    let follower_dir = tempfile::tempdir().expect("follower 临时目录");
+    let leader_dir = tempfile::tempdir().expect("leader 临时目录");
+    let placement = PlacementConfig {
+        replication_factor: 2,
+        nodes: vec![
+            PlacementNode {
+                id: 1,
+                primary: vec![],
+                replica: vec![0],
+            },
+            PlacementNode {
+                id: 2,
+                primary: vec![0],
+                replica: vec![],
+            },
+        ],
+    };
+    let follower_config = Config {
+        node: NodeConfig {
+            id: 1,
+            listen_addr: "127.0.0.1:0".into(),
+            internal_listen_addr: Some(
+                follower_internal_listener
+                    .local_addr()
+                    .expect("读取 follower 内部监听地址")
+                    .to_string(),
+            ),
+            peers: vec![PeerConfig {
+                id: 2,
+                addr: leader_public_addr.clone(),
+                internal_addr: Some(leader_internal_addr.clone()),
+            }],
+        },
+        storage: StorageConfig {
+            data_dir: follower_dir.path().to_path_buf(),
+            memtable_arena_bytes: 4 * 1024 * 1024,
+        },
+        placement: placement.clone(),
+        snapshot: Default::default(),
+        tls: None,
+        limits: Default::default(),
+    };
+    let leader_config = Config {
+        node: NodeConfig {
+            id: 2,
+            listen_addr: "127.0.0.1:0".into(),
+            internal_listen_addr: None,
+            peers: vec![PeerConfig {
+                id: 1,
+                addr: follower_public_addr.clone(),
+                internal_addr: None,
+            }],
+        },
+        storage: StorageConfig {
+            data_dir: leader_dir.path().to_path_buf(),
+            memtable_arena_bytes: 4 * 1024 * 1024,
+        },
+        placement,
+        snapshot: Default::default(),
+        tls: None,
+        limits: Default::default(),
+    };
+    let follower = Server::new(follower_config.clone()).expect("创建 follower");
+    let leader = Server::new(leader_config.clone()).expect("创建 leader");
+    follower.init().await.expect("初始化 follower");
+    leader.init().await.expect("初始化 leader");
+    leader
+        .shard_manager()
+        .get_shard(0)
+        .await
+        .expect("获取 leader shard")
+        .raft
+        .initialize(std::collections::BTreeSet::from([2u64]))
+        .await
+        .expect("初始化 leader raft");
+
+    follower
+        .route_table()
+        .allocate("follower-stream")
+        .await
+        .expect("记录 follower 路由");
+    leader
+        .route_table()
+        .allocate("follower-stream")
+        .await
+        .expect("记录 leader 路由");
+
+    let follower_service = es_server::service::EsService::with_limits(
+        follower.shard_manager().clone(),
+        follower_config.limits.clone(),
+        follower.route_table().clone(),
+        &follower_config,
+    )
+    .expect("创建 follower 服务");
+    let leader_service = es_server::service::EsService::with_limits(
+        leader.shard_manager().clone(),
+        leader_config.limits.clone(),
+        leader.route_table().clone(),
+        &leader_config,
+    )
+    .expect("创建 leader 服务");
+    let leader_admin = es_raft::RaftAdminService::new(leader.shard_manager().clone());
+    let follower_handle = tokio::spawn(async move {
+        let _ = tokio::try_join!(
+            tonic::transport::Server::builder()
+                .add_service(EventStoreServer::new(follower_service.clone()))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
+                    follower_public_listener,
+                )),
+            tonic::transport::Server::builder()
+                .add_service(InternalSubscriptionServer::new(follower_service))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
+                    follower_internal_listener,
+                )),
+        );
+    });
+    let leader_handle = tokio::spawn(async move {
+        let _ = tokio::try_join!(
+            tonic::transport::Server::builder()
+                .add_service(EventStoreServer::new(leader_service.clone()))
+                .add_service(RaftAdminServer::new(leader_admin))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
+                    leader_public_listener,
+                )),
+            tonic::transport::Server::builder()
+                .add_service(InternalSubscriptionServer::new(leader_service))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
+                    leader_internal_listener,
+                )),
+        );
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut follower_internal = InternalSubscriptionClient::connect(follower_internal_addr)
+        .await
+        .expect("连接 follower 内部端口");
+    let internal_err = follower_internal
+        .subscribe_internal(InternalSubscribeRequest {
+            shard_id: 0,
+            stream_ids: vec!["follower-stream".into()],
+        })
+        .await
+        .expect_err("follower 不得作为内部订阅的追平来源");
+    assert_eq!(internal_err.code(), tonic::Code::Unavailable);
+
+    let mut leader_client = EventStoreClient::connect(leader_public_addr)
+        .await
+        .expect("连接 leader");
+    append_one(&mut leader_client, "follower-stream", b"leader-history").await;
+
+    let mut follower_client = EventStoreClient::connect(follower_public_addr)
+        .await
+        .expect("连接 follower");
+    let mut subscription = follower_client
+        .subscribe(SubscribeRequest {
+            target: Some(subscribe_request::Target::Streams(SubscribeStreams {
+                stream_ids: vec!["follower-stream".into()],
+            })),
+        })
+        .await
+        .expect("从 follower 建立订阅")
+        .into_inner();
+    let history = drain_until_caught_up(&mut subscription).await;
+    assert_eq!(history.len(), 1, "follower 必须转发 leader 的历史事件");
+    assert_eq!(history[0].data, b"leader-history");
+
+    drop(subscription);
+    follower_handle.abort();
+    leader_handle.abort();
+}
+
+#[tokio::test]
+async fn subscribe_validates_public_target_without_exposing_shards() {
+    let (addr, handle, _server, _dir) = start_test_server().await;
+    let mut client = EventStoreClient::connect(addr).await.expect("连接");
+
+    let missing = client
+        .subscribe(SubscribeRequest { target: None })
+        .await
+        .expect_err("缺失目标必须拒绝");
+    assert_eq!(missing.code(), tonic::Code::InvalidArgument);
+    assert!(missing.message().contains("target"));
+
+    let empty = client
+        .subscribe(SubscribeRequest {
+            target: Some(subscribe_request::Target::Streams(SubscribeStreams {
+                stream_ids: vec![],
+            })),
+        })
+        .await
+        .expect_err("空 stream 列表必须拒绝");
+    assert_eq!(empty.code(), tonic::Code::InvalidArgument);
+    assert!(empty.message().contains("stream_ids"));
+
+    let empty_create = client
+        .create_stream(CreateStreamRequest {
+            stream_id: String::new(),
+        })
+        .await
+        .expect_err("空 stream ID 必须拒绝");
+    assert_eq!(empty_create.code(), tonic::Code::InvalidArgument);
+    assert!(empty_create.message().contains("stream_id"));
+
+    let unknown = client
+        .subscribe(SubscribeRequest {
+            target: Some(subscribe_request::Target::Streams(SubscribeStreams {
+                stream_ids: vec!["missing-stream".into()],
+            })),
+        })
+        .await
+        .expect_err("未知 stream 必须拒绝");
+    assert_eq!(unknown.code(), tonic::Code::NotFound);
+    assert!(
+        !unknown.message().contains("shard"),
+        "公开错误不能泄露分片: {unknown}"
+    );
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn public_listener_does_not_expose_internal_subscription() {
+    let (addr, handle, _server, _dir) = start_test_server().await;
+    let mut client = InternalSubscriptionClient::connect(addr)
+        .await
+        .expect("连接公共服务");
+    let err = client
+        .subscribe_internal(InternalSubscribeRequest {
+            shard_id: 0,
+            stream_ids: vec![],
+        })
+        .await
+        .expect_err("公共端口不能暴露内部订阅");
+    assert_eq!(err.code(), tonic::Code::Unimplemented);
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn server_serve_separates_public_and_internal_subscription_listeners() {
+    let public_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("预留公共端口");
+    let internal_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("预留内部端口");
+    let public_addr = public_listener.local_addr().expect("读取公共端口");
+    let internal_addr = internal_listener.local_addr().expect("读取内部端口");
+    drop(public_listener);
+    drop(internal_listener);
+
+    let dir = tempfile::tempdir().expect("临时目录");
+    let config = Config {
+        node: NodeConfig {
+            id: 1,
+            listen_addr: public_addr.to_string(),
+            internal_listen_addr: Some(internal_addr.to_string()),
+            peers: vec![],
+        },
+        storage: StorageConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_arena_bytes: 4 * 1024 * 1024,
+        },
+        placement: PlacementConfig {
+            replication_factor: 1,
+            nodes: vec![PlacementNode {
+                id: 1,
+                primary: vec![0],
+                replica: vec![],
+            }],
+        },
+        snapshot: Default::default(),
+        tls: None,
+        limits: Default::default(),
+    };
+    let server = Server::new(config).expect("创建服务器");
+    server.init().await.expect("初始化服务器");
+    let shard = server.shard_manager().get_shard(0).await.expect("获取分片");
+    shard
+        .raft
+        .initialize(std::collections::BTreeSet::from([1u64]))
+        .await
+        .expect("初始化 raft");
+
+    let handle = tokio::spawn(async move {
+        let _ = server.serve().await;
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut public_client = InternalSubscriptionClient::connect(format!("http://{public_addr}"))
+        .await
+        .expect("连接公共端口");
+    let public_err = public_client
+        .subscribe_internal(InternalSubscribeRequest {
+            shard_id: 0,
+            stream_ids: vec![],
+        })
+        .await
+        .expect_err("公共端口不得注册内部服务");
+    assert_eq!(public_err.code(), tonic::Code::Unimplemented);
+
+    let mut internal_client =
+        InternalSubscriptionClient::connect(format!("http://{internal_addr}"))
+            .await
+            .expect("连接内部端口");
+    let mut internal_stream = internal_client
+        .subscribe_internal(InternalSubscribeRequest {
+            shard_id: 0,
+            stream_ids: vec![],
+        })
+        .await
+        .expect("内部端口应提供内部服务")
+        .into_inner();
+    match internal_stream.message().await.expect("读取内部响应") {
+        Some(InternalSubscribeResponse {
+            payload: Some(internal_subscribe_response::Payload::CaughtUp(_)),
+        }) => {}
+        other => panic!("内部端口应返回 caught-up，实际: {other:?}"),
+    }
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn subscribe_reports_degraded_when_remote_source_is_unavailable() {
+    let (first_addr, first_handle, second_handle, first, second, _first_dir, _second_dir) =
+        start_two_shard_servers().await;
+    first
+        .route_table()
+        .allocate("remote-only")
+        .await
+        .expect("节点一记录路由");
+    second
+        .route_table()
+        .allocate("remote-only")
+        .await
+        .expect("节点二记录路由");
+    assert_eq!(first.route_table().lookup("remote-only").await, Some(0));
+
+    // 接入节点保持可用，但远程分片节点下线：聚合器必须隐去内部细节并降级。
+    second_handle.abort();
+    let mut client = EventStoreClient::connect(first_addr)
+        .await
+        .expect("连接节点一");
+    let mut stream = client
+        .subscribe(SubscribeRequest {
+            target: Some(subscribe_request::Target::Streams(SubscribeStreams {
+                stream_ids: vec!["remote-only".into()],
+            })),
+        })
+        .await
+        .expect("建立订阅")
+        .into_inner();
+    match next_sub(&mut stream).await {
+        Some(subscribe_response::Payload::Degraded(_)) => {}
+        other => panic!("远程来源不可用应只发送 degraded，实际: {other:?}"),
+    }
+    drop(stream);
+    first_handle.abort();
+}
+
+#[tokio::test]
 async fn subscribe_all_shard_streams() {
     let (addr, handle, _server, _dir) = start_test_server().await;
     let mut client = EventStoreClient::connect(addr).await.expect("连接");
 
-    // $all 订阅当前实现固定读 shard 0，先确保 shard 0 上有数据
-    let mut names_on_0 = Vec::new();
+    // `$all` 订阅全部 stream，不向客户端暴露它们所在的 shard。
+    let mut names = Vec::new();
     for i in 0..20 {
         let name = format!("sa-{i}");
-        if append_one(&mut client, &name, b"x").await.shard_id == 0 {
-            names_on_0.push(name);
-            if names_on_0.len() >= 2 {
-                break;
-            }
+        append_one(&mut client, &name, b"x").await;
+        names.push(name);
+        if names.len() >= 2 {
+            break;
         }
     }
-    assert!(names_on_0.len() >= 2, "shard 0 上应至少有 2 个流");
 
     let mut s = client
         .subscribe(SubscribeRequest {
             target: Some(subscribe_request::Target::All(Empty {})),
-            from_exclusive: 0,
-            from_start: true,
-            shard_id: 0,
         })
         .await
         .expect("subscribe")
@@ -1190,16 +1912,117 @@ async fn subscribe_all_shard_streams() {
 
     let history = drain_until_caught_up(&mut s).await;
     let names: HashSet<_> = history.iter().map(|e| e.stream_id.as_str()).collect();
-    assert!(
-        names.len() >= 2,
-        "$all 订阅应跨多个流，实际: {names:?}"
-    );
-
-    // position 递增
-    for i in 1..history.len() {
-        assert!(history[i].position > history[i - 1].position);
-    }
+    assert!(names.len() >= 2, "$all 订阅应跨多个流，实际: {names:?}");
 
     drop(s);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn subscribe_all_aggregates_remote_shards_and_emits_caught_up_once() {
+    let (first_addr, first_handle, second_handle, first, second, _first_dir, _second_dir) =
+        start_two_shard_servers().await;
+
+    // 两个节点用相同顺序创建路由，保证 $all 的本地和远程来源可分别写入。
+    for server in [&first, &second] {
+        server
+            .route_table()
+            .allocate("all-remote-stream")
+            .await
+            .expect("记录远程路由");
+        server
+            .route_table()
+            .allocate("all-local-stream")
+            .await
+            .expect("记录本地路由");
+    }
+    assert_eq!(
+        first.route_table().lookup("all-remote-stream").await,
+        Some(0)
+    );
+    assert_eq!(
+        first.route_table().lookup("all-local-stream").await,
+        Some(1)
+    );
+
+    let mut first_client = EventStoreClient::connect(first_addr)
+        .await
+        .expect("连接接入节点");
+    let mut second_client = EventStoreClient::connect(first.config().node.peers[0].addr.clone())
+        .await
+        .expect("连接远程节点");
+    append_one(&mut first_client, "all-local-stream", b"local-history").await;
+    append_one(&mut second_client, "all-remote-stream", b"remote-history").await;
+
+    let mut subscription = first_client
+        .subscribe(SubscribeRequest {
+            target: Some(subscribe_request::Target::All(Empty {})),
+        })
+        .await
+        .expect("建立跨节点 $all 订阅")
+        .into_inner();
+    let history = drain_until_caught_up(&mut subscription).await;
+    let streams: HashSet<_> = history
+        .iter()
+        .map(|event| event.stream_id.as_str())
+        .collect();
+    assert_eq!(
+        streams,
+        HashSet::from(["all-local-stream", "all-remote-stream"]),
+        "$all 必须聚合两个节点各自承载的 shard"
+    );
+
+    // 所有来源追平后只发送一个公共 caught_up；重复信号会让 --once 错判完成。
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), subscription.message())
+            .await
+            .is_err(),
+        "追平后不应再发送额外的订阅状态"
+    );
+
+    append_one(&mut first_client, "all-local-stream", b"local-live").await;
+    append_one(&mut second_client, "all-remote-stream", b"remote-live").await;
+    let mut live = HashSet::new();
+    while live.len() < 2 {
+        match next_sub(&mut subscription).await {
+            Some(subscribe_response::Payload::Event(event)) => {
+                live.insert((event.stream_id, event.data));
+            }
+            other => panic!("$all 实时阶段应只收到事件，实际: {other:?}"),
+        }
+    }
+    assert!(live.contains(&(String::from("all-local-stream"), b"local-live".to_vec())));
+    assert!(live.contains(&(String::from("all-remote-stream"), b"remote-live".to_vec())));
+
+    drop(subscription);
+    first_handle.abort();
+    second_handle.abort();
+}
+
+#[tokio::test]
+async fn subscribe_all_dynamically_includes_new_stream() {
+    let (addr, handle, _server, _dir) = start_test_server().await;
+    let mut client = EventStoreClient::connect(addr).await.expect("连接");
+    append_one(&mut client, "all-before", b"before").await;
+
+    let mut subscription = client
+        .subscribe(SubscribeRequest {
+            target: Some(subscribe_request::Target::All(Empty {})),
+        })
+        .await
+        .expect("建立 $all 订阅")
+        .into_inner();
+    let _ = drain_until_caught_up(&mut subscription).await;
+
+    append_one(&mut client, "all-created-after-subscribe", b"after").await;
+    match next_sub(&mut subscription).await {
+        Some(subscribe_response::Payload::Event(event)) => {
+            assert_eq!(event.stream_id, "all-created-after-subscribe");
+            assert_eq!(event.data, b"after");
+        }
+        other => panic!("$all 应纳入新 stream，实际: {other:?}"),
+    }
+
+    drop(subscription);
     handle.abort();
 }

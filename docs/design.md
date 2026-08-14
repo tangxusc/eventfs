@@ -122,7 +122,9 @@ rustls 0.23）；rustls 直接依赖仅 es-proto 一处（`NoCertVerify` 内部�
                       surrealkv LSM tree            （watcher 热更新 + 广播同步）
 ```
 
-四个 gRPC 服务（客户端 API / Raft 节点间 RPC / RaftAdmin / Migration）共用 `listen_addr` 单端口。
+客户端 API、Raft 节点间 RPC、RaftAdmin 与 Migration 共用公共 `listen_addr` 端口。
+跨节点聚合订阅的 `InternalSubscription` 只监听 `internal_listen_addr` 专用端口，
+该端口必须由网络策略限制为仅集群节点可访问，不能与客户端 API 共用。
 节点间通过 gRPC 交换 Raft 消息（Vote / AppendEntries / InstallSnapshot），
 每条消息携带 `shard_id` 用于路由到对应的 Raft 实例。
 
@@ -477,13 +479,21 @@ peer 时对比其 voter_ids 与本节点配置，不一致即告警，且要求�
 
 ### 7.4 订阅实现
 
-catch-up 与 live 两阶段：
+公共订阅面向 stream 集合而非 shard：请求指定一个或多个 stream，或 `$all`。服务端按
+路由表将目标 stream 分组到内部 shard。本机仅在自己是 leader 时直接读取；本机 follower
+和远程 shard 均通过仅节点间可用的 `InternalSubscription` RPC 向 leader 转发，公开事件
+不含 shard ID 或分片 position。该 RPC 仅监听 `internal_listen_addr` 专用端口，必须由网络
+策略限制为集群节点可访问。
+
+每个内部来源均按 catch-up 与 live 两阶段执行：
 
 1. 从请求起始位置扫描存储，推送历史事件
 2. 追平后切到 `tokio::sync::broadcast`（每分片一个通道）接收实时事件
 
 切换点需处理边界：先订阅 broadcast 再做最后一段扫描，避免两阶段之间漏事件。
-广播落后（`RecvError::Lagged`）时直接关闭订阅，客户端需重新订阅（`--once` 场景以退出码 1 报错）。
+聚合器不承诺跨 stream 顺序，但保留每个 stream 内的 version 顺序。全部内部来源追平后才
+发送一次 `caught_up`。来源广播落后、连接失败或关闭时，聚合器发送不含内部细节的
+`degraded` 状态并继续健康来源；`--once` 场景以退出码 1 报错。
 
 ### 7.5 路由表同步与在线迁移 API（Migration 服务，节点间）
 
@@ -511,15 +521,18 @@ catch-up 与 live 两阶段：
 [node]
 id = 1
 listen_addr = "127.0.0.1:50051"   # 四个 gRPC 服务共用一个端口
+internal_listen_addr = "127.0.0.1:51051" # 仅节点间内部订阅；网络层限制为节点可访问
 
 # 集群节点列表（3 节点示例；非空即触发启动时自动组建，见 7.3）
 # 必须包含本节点，且所有节点配置完全一致；addr 可省略 http:// 前缀
 [[node.peers]]
 id = 1
 addr = "127.0.0.1:50051"
+internal_addr = "127.0.0.1:51051"
 [[node.peers]]
 id = 2
 addr = "127.0.0.1:50052"
+internal_addr = "127.0.0.1:51052"
 
 [storage]
 data_dir = "./data/node1"         # 每节点独立

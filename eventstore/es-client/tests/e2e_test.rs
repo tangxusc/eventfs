@@ -6,13 +6,12 @@ use std::time::Duration;
 use tokio_stream::StreamExt;
 
 use es_client::{
-    ClientError, Direction, EventStoreClient, SubscribeStream, SubscribeTarget,
-    subscribe_response,
+    ClientError, Direction, EventStoreClient, SubscribeStream, SubscribeTarget, subscribe_response,
 };
-use es_client::{ExpectedVersionBuilder, EventBuilder};
-use tonic::Code;
-use es_server::config::{Config, NodeConfig, PlacementConfig, PlacementNode, StorageConfig};
+use es_client::{EventBuilder, ExpectedVersionBuilder};
 use es_server::Server;
+use es_server::config::{Config, NodeConfig, PlacementConfig, PlacementNode, StorageConfig};
+use tonic::Code;
 
 /// 启动进程内测试服务器（单节点，2 分片，立即成为 leader，默认大小限制）。
 ///
@@ -28,7 +27,9 @@ async fn start_test_server() -> (
 }
 
 /// 启动进程内测试服务器（可自定义 [LimitsSection] 大小限制）。
-async fn start_test_server_with_limits(limits: es_server::config::LimitsSection) -> (
+async fn start_test_server_with_limits(
+    limits: es_server::config::LimitsSection,
+) -> (
     String,
     tokio::task::JoinHandle<()>,
     Server,
@@ -40,6 +41,7 @@ async fn start_test_server_with_limits(limits: es_server::config::LimitsSection)
         node: NodeConfig {
             id: 1,
             listen_addr: "127.0.0.1:0".to_string(),
+            internal_listen_addr: None,
             peers: vec![],
         },
         storage: StorageConfig {
@@ -92,9 +94,7 @@ async fn start_test_server_with_limits(limits: es_server::config::LimitsSection)
     .expect("创建服务");
     let handle = tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
-            .add_service(
-                es_proto::eventstore::event_store_server::EventStoreServer::new(service),
-            )
+            .add_service(es_proto::eventstore::event_store_server::EventStoreServer::new(service))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await;
     });
@@ -109,8 +109,8 @@ async fn start_test_server_with_limits(limits: es_server::config::LimitsSection)
 async fn wait_server_ready(addr: &str, timeout: Duration) {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let endpoint = tonic::transport::Endpoint::from_shared(addr.to_string())
-            .expect("测试地址合法");
+        let endpoint =
+            tonic::transport::Endpoint::from_shared(addr.to_string()).expect("测试地址合法");
         match endpoint.connect().await {
             Ok(_channel) => return,
             Err(_) if tokio::time::Instant::now() < deadline => {
@@ -134,13 +134,16 @@ async fn append_one(client: &mut EventStoreClient, stream_id: &str, data: u8) {
 }
 
 /// 收订阅流直到 caught_up 分界信号，返回期间的事件。
-async fn drain_until_caught_up(stream: &mut SubscribeStream) -> Vec<es_proto::eventstore::Event> {
+async fn drain_until_caught_up(
+    stream: &mut SubscribeStream,
+) -> Vec<es_proto::eventstore::SubscriptionEvent> {
     let mut events = Vec::new();
     while let Some(resp) = stream.next().await {
         let resp = resp.expect("订阅流无错误");
         match resp.payload {
             Some(subscribe_response::Payload::Event(e)) => events.push(e),
             Some(subscribe_response::Payload::CaughtUp(_)) => break,
+            Some(subscribe_response::Payload::Degraded(_)) => panic!("健康订阅不应降级"),
             None => {}
         }
     }
@@ -205,7 +208,13 @@ async fn read_all_backward_pages_roundtrip() {
     // 首页从 u64::MAX 哨兵反向读；翻页把 next_positions 原样透传，直到空页
     let mut all = Vec::new();
     let (page, mut cursor) = client
-        .read_all(vec![0, 1], u64::MAX, 4, es_client::Direction::Backward, vec![])
+        .read_all(
+            vec![0, 1],
+            u64::MAX,
+            4,
+            es_client::Direction::Backward,
+            vec![],
+        )
         .await
         .expect("首页");
     all.extend(page);
@@ -243,11 +252,7 @@ async fn subscribe_catch_up_then_live() {
     }
 
     let mut stream = client
-        .subscribe(
-            SubscribeTarget::Stream("sub".to_string()),
-            0,
-            true, // 从头开始
-        )
+        .subscribe(SubscribeTarget::Streams(vec!["sub".to_string()]))
         .await
         .expect("订阅成功");
 
@@ -287,7 +292,7 @@ async fn subscribe_all_target_receives_shard_events() {
     assert!(meta.exists);
 
     let mut stream = client
-        .subscribe(SubscribeTarget::All { shard_id: meta.shard_id }, 0, true)
+        .subscribe(SubscribeTarget::All)
         .await
         .expect("订阅全部");
 
@@ -338,9 +343,7 @@ async fn get_stream_meta_reports_version_and_shard() {
 ///
 /// 订阅流在 live 阶段会一直挂着等新事件，若服务端丢事件或测试断言写错，
 /// `next()` 会永久阻塞，表现为整个测试卡死而非失败——必须带超时。
-async fn next_sub_timeout(
-    stream: &mut SubscribeStream,
-) -> Option<subscribe_response::Payload> {
+async fn next_sub_timeout(stream: &mut SubscribeStream) -> Option<subscribe_response::Payload> {
     let fut = stream.next();
     match tokio::time::timeout(Duration::from_secs(5), fut).await {
         Ok(Some(Ok(resp))) => resp.payload,
@@ -369,7 +372,7 @@ async fn subscribe_writes_during_catchup_exactly_once() {
     }
 
     let mut stream = client
-        .subscribe(SubscribeTarget::Stream("sub".to_string()), 0, true)
+        .subscribe(SubscribeTarget::Streams(vec!["sub".to_string()]))
         .await
         .expect("订阅成功");
 
@@ -385,12 +388,15 @@ async fn subscribe_writes_during_catchup_exactly_once() {
         assert!(versions.insert(ev.version), "版本 {} 重复投递", ev.version);
     }
     while versions.len() < 2005 {
-        let payload = next_sub_timeout(&mut stream).await.expect("订阅流不应提前结束");
+        let payload = next_sub_timeout(&mut stream)
+            .await
+            .expect("订阅流不应提前结束");
         match payload {
             subscribe_response::Payload::Event(e) => {
                 assert!(versions.insert(e.version), "版本 {} 重复投递", e.version);
             }
             subscribe_response::Payload::CaughtUp(_) => continue, // 防重入
+            subscribe_response::Payload::Degraded(_) => panic!("健康订阅不应降级"),
         }
     }
 
@@ -400,20 +406,13 @@ async fn subscribe_writes_during_catchup_exactly_once() {
     }
 }
 
-/// $all 变体：走 position 去重分支（service.rs last_position 水位），
-/// 结构与流订阅测试相同，身份用 position 唯一性。
+/// `$all` 变体以公开业务身份 `(stream_id, version)` 去重。
 #[tokio::test]
 async fn subscribe_all_writes_during_catchup_exactly_once() {
     let (addr, _handle, _server, _dir) = start_test_server().await;
     let mut client = EventStoreClient::connect(vec![addr]).await.expect("连接");
 
-    // 先确认所在分片（$all 订阅按分片）
     append_one(&mut client, "all-sub", 1).await;
-    let meta = client
-        .get_stream_meta("all-sub".to_string())
-        .await
-        .expect("get_stream_meta");
-    let shard_id = meta.shard_id;
 
     // 大历史：拉开 catch-up 扫描窗口
     for i in 1..2000 {
@@ -421,7 +420,7 @@ async fn subscribe_all_writes_during_catchup_exactly_once() {
     }
 
     let mut stream = client
-        .subscribe(SubscribeTarget::All { shard_id }, 0, true)
+        .subscribe(SubscribeTarget::All)
         .await
         .expect("订阅全部");
 
@@ -430,23 +429,30 @@ async fn subscribe_all_writes_during_catchup_exactly_once() {
         append_one(&mut client, "all-sub", (200 + i) as u8).await;
     }
 
-    let mut positions: HashSet<u64> = HashSet::new();
+    let mut versions: HashSet<u64> = HashSet::new();
     for ev in drain_until_caught_up(&mut stream).await {
-        assert!(positions.insert(ev.position), "position {} 重复投递", ev.position);
+        if ev.stream_id == "all-sub" {
+            assert!(versions.insert(ev.version), "版本 {} 重复投递", ev.version);
+        }
     }
-    while positions.len() < 2005 {
-        let payload = next_sub_timeout(&mut stream).await.expect("订阅流不应提前结束");
+    while versions.len() < 2005 {
+        let payload = next_sub_timeout(&mut stream)
+            .await
+            .expect("订阅流不应提前结束");
         match payload {
             subscribe_response::Payload::Event(e) => {
-                assert!(positions.insert(e.position), "position {} 重复投递", e.position);
+                if e.stream_id == "all-sub" {
+                    assert!(versions.insert(e.version), "版本 {} 重复投递", e.version);
+                }
             }
             subscribe_response::Payload::CaughtUp(_) => continue,
+            subscribe_response::Payload::Degraded(_) => panic!("健康订阅不应降级"),
         }
     }
 
-    assert_eq!(positions.len(), 2005, "应恰收到 2005 条");
-    for p in 0..2005 {
-        assert!(positions.contains(&p), "position {p} 缺失");
+    assert_eq!(versions.len(), 2005, "应恰收到 2005 条");
+    for version in 0..2005 {
+        assert!(versions.contains(&version), "版本 {version} 缺失");
     }
 }
 
@@ -488,7 +494,13 @@ async fn append_oversized_event_rejected_by_server_limits() {
         .await
         .expect_err("未创建流应读不到");
     assert!(
-        matches!(err, ClientError::RpcFailed { code: Code::NotFound, .. }),
+        matches!(
+            err,
+            ClientError::RpcFailed {
+                code: Code::NotFound,
+                ..
+            }
+        ),
         "应为 NotFound,实际 {err:?}"
     );
 }
@@ -509,7 +521,11 @@ async fn append_batch_encoded_len_over_limit_rejected() {
     // 5 × 1000B:单事件(1000 ≤ 1024)过逐事件检查;总和 5000B,
     // proto 编码后(每事件 ~21B 头)≈ 5100 > 4096,触发 batch 级拒绝
     let events = (0..5)
-        .map(|i| EventBuilder::new(&format!("T{i}")).data(vec![0u8; 1000]).build())
+        .map(|i| {
+            EventBuilder::new(&format!("T{i}"))
+                .data(vec![0u8; 1000])
+                .build()
+        })
         .collect::<Vec<_>>();
     let err = client
         .append("s".into(), ExpectedVersionBuilder::any(), events)
@@ -555,7 +571,13 @@ async fn append_client_side_limit_rejects_without_rpc() {
         .await
         .expect_err("未创建流应读不到");
     assert!(
-        matches!(err, ClientError::RpcFailed { code: Code::NotFound, .. }),
+        matches!(
+            err,
+            ClientError::RpcFailed {
+                code: Code::NotFound,
+                ..
+            }
+        ),
         "应为 NotFound,实际 {err:?}"
     );
 }

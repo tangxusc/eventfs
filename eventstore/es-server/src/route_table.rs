@@ -144,9 +144,12 @@ impl RouteTableManager {
         let json = serde_json::to_vec_pretty(table).map_err(|e| format!("序列化失败: {e}"))?;
         {
             use std::io::Write;
-            let mut f = std::fs::File::create(&tmp).map_err(|e| format!("创建临时文件失败: {e}"))?;
-            f.write_all(&json).map_err(|e| format!("写临时文件失败: {e}"))?;
-            f.sync_all().map_err(|e| format!("临时文件 fsync 失败: {e}"))?;
+            let mut f =
+                std::fs::File::create(&tmp).map_err(|e| format!("创建临时文件失败: {e}"))?;
+            f.write_all(&json)
+                .map_err(|e| format!("写临时文件失败: {e}"))?;
+            f.sync_all()
+                .map_err(|e| format!("临时文件 fsync 失败: {e}"))?;
         }
         std::fs::rename(&tmp, &self.path).map_err(|e| format!("rename 失败: {e}"))?;
         // 目录 fsync：保证 rename 的目录项也落盘
@@ -301,7 +304,10 @@ impl RouteTableManager {
     ///
     /// 请求超时 2s：广播/拉取不能因 peer 挂起（接受连接但不响应）而无限
     /// 等待——广播失败由「下次变更全表重发」自愈。
-    fn migration_client(&self, addr: &str) -> Result<MigrationClient<tonic::transport::Channel>, String> {
+    fn migration_client(
+        &self,
+        addr: &str,
+    ) -> Result<MigrationClient<tonic::transport::Channel>, String> {
         const BROADCAST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
         let endpoint = tonic::transport::Endpoint::from_shared(addr.to_string())
             .map_err(|e| format!("地址非法 {addr}: {e}"))?;
@@ -343,6 +349,7 @@ mod tests {
             node: crate::config::NodeConfig {
                 id: 1,
                 listen_addr: "127.0.0.1:0".into(),
+                internal_listen_addr: None,
                 peers: Vec::new(),
             },
             storage: crate::config::StorageConfig {
@@ -383,7 +390,10 @@ mod tests {
         assert!(inserted2);
         let t = mgr.snapshot().await;
         assert_eq!(t.version, 2);
-        assert_eq!(t.shard_stream_counts, BTreeMap::from([(0u64, 1u64), (1u64, 1u64)]));
+        assert_eq!(
+            t.shard_stream_counts,
+            BTreeMap::from([(0u64, 1u64), (1u64, 1u64)])
+        );
     }
 
     #[tokio::test]
@@ -434,6 +444,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_stream_shard_repairs_unassigned_stream_and_persists() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = routes_path(dir.path());
+        let mgr = RouteTableManager::new(&test_config(dir.path()), path.clone()).expect("创建");
+
+        // 迁移可修复路由表缺失但数据已存在的孤儿流，切换结果必须可恢复。
+        let table = mgr
+            .set_stream_shard("orphan-stream", 2)
+            .await
+            .expect("补齐孤儿流路由");
+        assert_eq!(table.lookup("orphan-stream"), Some(2));
+        assert_eq!(table.shard_stream_counts.get(&2), Some(&1));
+
+        let recovered = RouteTableManager::new(&test_config(dir.path()), path).expect("重建管理器");
+        recovered.load().await.expect("恢复路由表");
+        assert_eq!(recovered.lookup("orphan-stream").await, Some(2));
+    }
+
+    #[tokio::test]
     async fn apply_remote_version_arbitration() {
         let dir = tempfile::tempdir().expect("临时目录");
         let mgr = RouteTableManager::new(&test_config(dir.path()), routes_path(dir.path()))
@@ -472,6 +501,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reload_missing_file_keeps_memory_state() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = routes_path(dir.path());
+        let mgr = RouteTableManager::new(&test_config(dir.path()), path.clone()).expect("创建");
+        mgr.allocate("stable-stream").await.expect("分配");
+
+        // 原子替换 routes.json 时 watcher 可能先看到删除事件，不能清空内存路由。
+        std::fs::remove_file(&path).expect("模拟替换中的旧文件删除");
+        mgr.reload().await;
+        assert_eq!(mgr.lookup("stable-stream").await, Some(0));
+    }
+
+    #[tokio::test]
+    async fn reload_io_failure_keeps_memory_state() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = routes_path(dir.path());
+        let mgr = RouteTableManager::new(&test_config(dir.path()), path.clone()).expect("创建");
+        mgr.allocate("stable-stream").await.expect("分配");
+
+        // 运维误把路由表文件替换为目录时，读失败不能清空已生效的内存路由。
+        std::fs::remove_file(&path).expect("移除路由表文件");
+        std::fs::create_dir(&path).expect("模拟错误的目录替换");
+        mgr.reload().await;
+        assert_eq!(mgr.lookup("stable-stream").await, Some(0));
+    }
+
+    #[tokio::test]
     async fn corrupted_file_keeps_memory_state() {
         let dir = tempfile::tempdir().expect("临时目录");
         let path = routes_path(dir.path());
@@ -491,7 +547,10 @@ mod tests {
         mgr.allocate("b").await.expect("b");
         mgr.allocate("c").await.expect("c");
         let t = mgr.recount().await.expect("校准");
-        assert_eq!(t.shard_stream_counts, BTreeMap::from([(0u64, 1u64), (1u64, 1u64), (2u64, 1u64)]));
+        assert_eq!(
+            t.shard_stream_counts,
+            BTreeMap::from([(0u64, 1u64), (1u64, 1u64), (2u64, 1u64)])
+        );
     }
 
     #[tokio::test]
@@ -512,5 +571,61 @@ mod tests {
         let mgr2 = RouteTableManager::new(&test_config(dir.path()), path.clone()).expect("创建");
         mgr2.load().await.expect("加载");
         assert_eq!(mgr2.lookup("s").await, Some(0));
+    }
+
+    #[tokio::test]
+    async fn allocation_survives_invalid_peer_endpoint() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let mut config = test_config(dir.path());
+        config.node.peers.push(crate::config::PeerConfig {
+            id: 2,
+            // 运行期配置热更新的过渡态可能包含非法地址；广播失败不能回滚已落盘路由。
+            addr: "http://[::1".into(),
+            internal_addr: None,
+        });
+        let path = routes_path(dir.path());
+        let mgr = RouteTableManager::new(&config, path.clone()).expect("创建");
+
+        let (shard, inserted) = mgr.allocate("local-durable").await.expect("本地分配");
+        assert!(inserted);
+        assert_eq!(shard, 0);
+
+        let recovered = RouteTableManager::new(&test_config(dir.path()), path).expect("重建管理器");
+        recovered.load().await.expect("恢复路由表");
+        assert_eq!(recovered.lookup("local-durable").await, Some(0));
+    }
+
+    #[tokio::test]
+    async fn allocation_survives_unreachable_peer() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("预留端口");
+        let addr = listener.local_addr().expect("读取预留端口");
+        drop(listener);
+
+        let mut config = test_config(dir.path());
+        config.node.peers.push(crate::config::PeerConfig {
+            id: 2,
+            // 客户端可构建但 peer 已下线时，整表广播应降级而非阻塞写入。
+            addr: format!("http://{addr}"),
+            internal_addr: None,
+        });
+        let path = routes_path(dir.path());
+        let mgr = RouteTableManager::new(&config, path.clone()).expect("创建");
+
+        let (shard, inserted) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            mgr.allocate("local-with-offline-peer"),
+        )
+        .await
+        .expect("不可达 peer 不应阻塞本地分配")
+        .expect("本地分配");
+        assert!(inserted);
+        assert_eq!(shard, 0);
+
+        let recovered = RouteTableManager::new(&test_config(dir.path()), path).expect("重建管理器");
+        recovered.load().await.expect("恢复路由表");
+        assert_eq!(recovered.lookup("local-with-offline-peer").await, Some(0));
     }
 }

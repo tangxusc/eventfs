@@ -1,11 +1,13 @@
 //! gRPC 服务实现。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use tonic::{Request, Response, Status};
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::{Request, Response, Status};
 
 use es_proto::eventstore::event_store_server::EventStore;
+use es_proto::eventstore::internal_subscription_client::InternalSubscriptionClient;
+use es_proto::eventstore::internal_subscription_server::InternalSubscription;
 use es_proto::eventstore::*;
 use es_proto::tls::TlsClientConfig;
 use es_raft::ShardManager;
@@ -19,13 +21,21 @@ use crate::route_table::{RouteTableManager, routes_path};
 /// 无法在本地处理，需要向 peers 探测该 shard 的 leader 并把客户端引过去。
 /// 探测结果与本地 openraft `ForwardToLeader` 的错误格式对齐，
 /// 客户端 `LeaderRetryPlan` 无需感知差别。
+#[derive(Clone)]
 pub struct RemoteShards {
     /// 本节点 ID（探测时跳过自己）
     self_id: u64,
     /// peers 的 RaftAdmin 客户端（惰性连接）
-    clients: BTreeMap<u64, es_proto::eventstore::raft_admin_client::RaftAdminClient<tonic::transport::Channel>>,
+    clients: BTreeMap<
+        u64,
+        es_proto::eventstore::raft_admin_client::RaftAdminClient<tonic::transport::Channel>,
+    >,
     /// node_id -> 已 normalize 的地址（重定向提示用）
     addrs: BTreeMap<u64, String>,
+    /// node_id -> 仅节点间可访问的内部订阅地址。
+    internal_addrs: BTreeMap<u64, String>,
+    /// 内部订阅转发沿用节点间 TLS 信任策略。
+    tls: Option<TlsClientConfig>,
 }
 
 impl RemoteShards {
@@ -46,10 +56,22 @@ impl RemoteShards {
         };
         let clients = crate::bootstrap::build_clients(&members, tls.as_ref())?;
         let addrs = members.into_iter().map(|(id, n)| (id, n.addr)).collect();
+        let internal_addrs = config
+            .node
+            .peers
+            .iter()
+            .filter_map(|peer| {
+                peer.internal_addr
+                    .as_ref()
+                    .map(|addr| (peer.id, es_raft::normalize_endpoint(addr)))
+            })
+            .collect();
         Ok(Self {
             self_id: config.node.id,
             clients,
             addrs,
+            internal_addrs,
+            tls,
         })
     }
 
@@ -63,10 +85,7 @@ impl RemoteShards {
                 continue;
             }
             let mut c = client.clone();
-            match c
-                .get_raft_state(GetRaftStateRequest { shard_id })
-                .await
-            {
+            match c.get_raft_state(GetRaftStateRequest { shard_id }).await {
                 Ok(resp) => {
                     let r = resp.into_inner();
                     if r.is_leader {
@@ -86,11 +105,37 @@ impl RemoteShards {
     /// 目标 shard 不在本节点时的标准重定向提示（与本地 ForwardToLeader 同格式）。
     async fn leader_hint_status(&self, shard_id: u64) -> Status {
         match self.find_leader(shard_id).await {
-            Some((id, addr)) => Status::unavailable(format!(
-                "not leader; leader_id={id} leader_addr={addr}"
-            )),
+            Some((id, addr)) => {
+                Status::unavailable(format!("not leader; leader_id={id} leader_addr={addr}"))
+            }
             None => Status::unavailable("not leader; leader unknown, retry later"),
         }
+    }
+
+    /// 连接远程 shard leader 的内部订阅服务。
+    async fn internal_client(
+        &self,
+        shard_id: u64,
+    ) -> Result<InternalSubscriptionClient<tonic::transport::Channel>, Status> {
+        let (leader_id, _) = self
+            .find_leader(shard_id)
+            .await
+            .ok_or_else(|| Status::unavailable("internal subscription source unavailable"))?;
+        let addr = self
+            .internal_addrs
+            .get(&leader_id)
+            .ok_or_else(|| Status::unavailable("internal subscription source unavailable"))?;
+        let endpoint = tonic::transport::Endpoint::from_shared(addr.clone())
+            .map_err(|_| Status::unavailable("internal subscription source unavailable"))?;
+        let endpoint = es_proto::tls::apply_endpoint_tls(endpoint, self.tls.as_ref())
+            .map_err(|_| Status::unavailable("internal subscription source unavailable"))?;
+        let channel = endpoint
+            .connect()
+            .await
+            .map_err(|_| Status::unavailable("internal subscription source unavailable"))?;
+        Ok(InternalSubscriptionClient::new(channel)
+            .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
+            .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE))
     }
 }
 
@@ -162,7 +207,11 @@ fn merge_by_hlc(
     let mut cursors = vec![0usize; streams.len()];
 
     let head_of = |idx: usize, e: &Event| MergeHead {
-        hlc: e.hlc.as_ref().map(|h| (h.wall, h.logical)).unwrap_or((0, 0)),
+        hlc: e
+            .hlc
+            .as_ref()
+            .map(|h| (h.wall, h.logical))
+            .unwrap_or((0, 0)),
         shard_id: e.shard_id,
         position: e.position,
         stream_idx: idx,
@@ -241,9 +290,9 @@ pub(crate) fn client_write_to_status(
                 .map(|n| n.addr.clone())
                 .unwrap_or_default();
             match fwd.leader_id {
-                Some(id) => Status::unavailable(format!(
-                    "not leader; leader_id={id} leader_addr={addr}"
-                )),
+                Some(id) => {
+                    Status::unavailable(format!("not leader; leader_id={id} leader_addr={addr}"))
+                }
                 // 选举中，暂无 leader，客户端应稍后重试
                 None => Status::unavailable("not leader; leader unknown, retry later"),
             }
@@ -268,6 +317,7 @@ pub(crate) fn proto_to_expected_version(ev: ExpectedVersion) -> es_core::Expecte
 }
 
 /// EventStore gRPC 服务
+#[derive(Clone)]
 pub struct EsService {
     shard_manager: Arc<ShardManager>,
     /// 请求大小限制（append 权威校验）
@@ -276,6 +326,8 @@ pub struct EsService {
     route_table: Arc<RouteTableManager>,
     /// 远程 shard 定位（本节点不承载的目标分片）
     remote: RemoteShards,
+    /// 建立 `$all` 聚合订阅时的 shard 快照；公共接口不暴露这些内部 ID。
+    all_shards: Vec<u64>,
 }
 
 impl EsService {
@@ -300,6 +352,15 @@ impl EsService {
             limits,
             route_table,
             remote: RemoteShards::new(config)?,
+            all_shards: config
+                .placement
+                .nodes
+                .iter()
+                .flat_map(|node| node.primary.iter().chain(node.replica.iter()))
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
         })
     }
 
@@ -346,6 +407,169 @@ impl EsService {
             Err(_) => Err(Status::unavailable(format!(
                 "shard {shard_id} not on this node, retry other nodes"
             ))),
+        }
+    }
+}
+
+/// 将内部事件投影为公开订阅事件，避免向客户端泄露分片位置与 shard ID。
+fn public_subscription_event(event: Event) -> SubscriptionEvent {
+    SubscriptionEvent {
+        stream_id: event.stream_id,
+        version: event.version,
+        event_id: event.event_id,
+        event_type: event.event_type,
+        data: event.data,
+        metadata: event.metadata,
+        hlc: event.hlc,
+    }
+}
+
+/// 聚合器接收的内部来源状态；不会序列化到公开协议。
+enum SourceMessage {
+    Event(Event),
+    CaughtUp(u64),
+    Degraded(u64),
+}
+
+/// 将内部来源消息转换为公开订阅消息，并维护聚合阶段状态。
+fn aggregate_source_message(
+    message: SourceMessage,
+    pending_catch_up: &mut BTreeSet<u64>,
+    caught_up: &mut bool,
+    degraded: &mut bool,
+) -> Option<SubscribeResponse> {
+    match message {
+        SourceMessage::Event(event) => Some(SubscribeResponse {
+            payload: Some(subscribe_response::Payload::Event(
+                public_subscription_event(event),
+            )),
+        }),
+        SourceMessage::CaughtUp(source) => {
+            pending_catch_up.remove(&source);
+            if !pending_catch_up.is_empty() || *caught_up {
+                return None;
+            }
+            *caught_up = true;
+            Some(SubscribeResponse {
+                payload: Some(subscribe_response::Payload::CaughtUp(Empty {})),
+            })
+        }
+        SourceMessage::Degraded(source) if !*degraded => {
+            *degraded = true;
+            tracing::warn!(source, "聚合订阅的内部来源已降级");
+            Some(SubscribeResponse {
+                payload: Some(subscribe_response::Payload::Degraded(Empty {})),
+            })
+        }
+        SourceMessage::Degraded(_) => None,
+    }
+}
+
+/// 在一个本地 shard 上执行“先注册广播、再补历史、最后实时推送”的内部订阅。
+///
+/// stream_ids 为空时订阅该 shard 的全部 stream；非空时仅转发指定 stream。
+async fn run_local_subscription(
+    shard_id: u64,
+    storage: Arc<es_storage::EsStorage>,
+    stream_ids: Vec<String>,
+    tx: tokio::sync::mpsc::Sender<Result<InternalSubscribeResponse, Status>>,
+) {
+    let streams: BTreeSet<String> = stream_ids.into_iter().collect();
+    let all_streams = streams.is_empty();
+    let mut event_rx = storage.subscribe_events();
+
+    let historical = if all_streams {
+        storage.read_all_events(0, 0).unwrap_or_default()
+    } else {
+        let mut events = Vec::new();
+        for stream_id in &streams {
+            events.extend(
+                storage
+                    .read_stream_events(stream_id, 0, 0)
+                    .unwrap_or_default(),
+            );
+        }
+        events
+    };
+
+    let mut watermarks: BTreeMap<String, u64> = BTreeMap::new();
+    for event in &historical {
+        watermarks.insert(event.stream_id.clone(), event.version);
+    }
+
+    for event in historical {
+        let event = Event {
+            stream_id: event.stream_id,
+            version: event.version,
+            event_id: event.event_id.as_bytes().to_vec(),
+            event_type: event.event_type,
+            data: event.data,
+            metadata: event.metadata,
+            hlc: Some(Hlc {
+                wall: event.hlc.wall,
+                logical: event.hlc.logical,
+            }),
+            position: event.position,
+            shard_id,
+        };
+        if tx
+            .send(Ok(InternalSubscribeResponse {
+                payload: Some(internal_subscribe_response::Payload::Event(event)),
+            }))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+
+    if tx
+        .send(Ok(InternalSubscribeResponse {
+            payload: Some(internal_subscribe_response::Payload::CaughtUp(Empty {})),
+        }))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    loop {
+        match event_rx.recv().await {
+            Ok(event) => {
+                if (!all_streams && !streams.contains(&event.stream_id))
+                    || watermarks
+                        .get(&event.stream_id)
+                        .is_some_and(|version| event.version <= *version)
+                {
+                    continue;
+                }
+                watermarks.insert(event.stream_id.clone(), event.version);
+                let event = Event {
+                    stream_id: event.stream_id,
+                    version: event.version,
+                    event_id: event.event_id.as_bytes().to_vec(),
+                    event_type: event.event_type,
+                    data: event.data,
+                    metadata: event.metadata,
+                    hlc: Some(Hlc {
+                        wall: event.hlc.wall,
+                        logical: event.hlc.logical,
+                    }),
+                    position: event.position,
+                    shard_id,
+                };
+                if tx
+                    .send(Ok(InternalSubscribeResponse {
+                        payload: Some(internal_subscribe_response::Payload::Event(event)),
+                    }))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => return,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         }
     }
 }
@@ -403,11 +627,12 @@ impl EventStore for EsService {
         // 去重（客户端重试同一请求生成新 id，重复追加）——显式报错
         let mut events = Vec::with_capacity(req.events.len());
         for e in req.events {
-            let event_id = uuid::Uuid::from_slice(&e.event_id)
-                .map_err(|_| Status::invalid_argument(format!(
+            let event_id = uuid::Uuid::from_slice(&e.event_id).map_err(|_| {
+                Status::invalid_argument(format!(
                     "event_id 必须是 16 字节 UUID，实际 {} 字节",
                     e.event_id.len()
-                )))?;
+                ))
+            })?;
             events.push(es_core::NewEvent {
                 event_id,
                 event_type: e.event_type,
@@ -473,9 +698,11 @@ impl EventStore for EsService {
         // 读取事件（直接从存储层读，无需走 Raft —— 读本地副本即可）
         let desc = req.direction == Direction::Backward as i32;
         let events = if desc {
-            shard
-                .storage
-                .read_stream_events_backward(&req.stream_id, req.from_version, req.max_count)
+            shard.storage.read_stream_events_backward(
+                &req.stream_id,
+                req.from_version,
+                req.max_count,
+            )
         } else {
             shard
                 .storage
@@ -645,177 +872,140 @@ impl EventStore for EsService {
         &self,
         request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
-        let req = request.into_inner();
-        tracing::debug!("Subscribe request: target={:?}", req.target);
-
-        // 解析订阅目标
-        let target = req
+        let target = request
+            .into_inner()
             .target
             .ok_or_else(|| Status::invalid_argument("target is required"))?;
 
-        use subscribe_request::Target;
-        let (stream_id, shard_id, from_position) = match target {
-            Target::StreamId(sid) => {
-                // 订阅单个流：解析归属 shard（只查不分配）；本节点不承载 → Unavailable 轮换
-                let shard_id = self.resolve_read_stream_shard(&sid).await?;
-                let shard = self.resolve_read_shard(shard_id).await?;
-                let _ = shard; // shard 仅用于承载校验，后续按 id 取回
-
-                // 起始位置：from_start=true 从头，否则用 from_exclusive+1
-                // （saturating_add 防 u64::MAX 溢出回绕）
-                let from_version = if req.from_start {
-                    0
-                } else {
-                    req.from_exclusive.saturating_add(1)
-                };
-
-                (Some(sid), shard_id, from_version)
-            }
-            Target::All(_) => {
-                // 订阅 $all：按请求指定分片订阅（proto SubscribeRequest.shard_id，
-                // 默认 0）。一次订阅一个分片的 $all，多分片需各自发起订阅。
-                let from_position = if req.from_start {
-                    0
-                } else {
-                    req.from_exclusive.saturating_add(1)
-                };
-                (None, req.shard_id, from_position)
-            }
-        };
-
-        // 取分片（承载校验与存储访问）；$all 分支的 shard 由客户端指定
-        let shard = self.resolve_read_shard(shard_id).await?;
-
-        // 创建响应流
-        let (tx, rx) = tokio::sync::mpsc::channel(100);
-
-        // 启动后台任务处理订阅
-        let storage = shard.storage.clone();
-        tokio::spawn(async move {
-            // Phase 0: 先注册实时广播接收器——必须在读历史之前。
-            // 若注册在「读历史 → 发 caught_up」之后,窗口内提交的事件
-            // 既不在快照也不在广播里(broadcast 对无接收者的 send 直接丢弃),
-            // 订阅者会在无感知的情况下永久丢失事件。
-            let mut event_rx = storage.subscribe_events();
-
-            // Phase 1: Catch-up（补齐历史）
-            let historical = match stream_id {
-                Some(ref sid) => {
-                    // 订阅单流：读取该流从 from_position 开始的事件
-                    // 简化：这里用 from_version，生产应转为 position
-                    storage
-                        .read_stream_events(sid, from_position, 0)
-                        .unwrap_or_default()
+        let mut groups: BTreeMap<u64, Vec<String>> = BTreeMap::new();
+        match target {
+            subscribe_request::Target::Streams(streams) => {
+                if streams.stream_ids.is_empty() {
+                    return Err(Status::invalid_argument("stream_ids cannot be empty"));
                 }
-                None => {
-                    // 订阅 $all：读取分片内所有事件
-                    storage
-                        .read_all_events(from_position, 0)
-                        .unwrap_or_default()
-                }
-            };
-
-            // 历史尾水位：Phase 2 消费实时事件时跳过注册与快照之间的
-            // 重复窗口（注册先于快照，窗口内提交的事件缓冲与快照各有一份）。
-            let last_version = historical.last().map(|e| e.version);
-            let last_position = historical.last().map(|e| e.position);
-
-            // 发送历史事件
-            for ev in historical {
-                let proto_event = Event {
-                    stream_id: ev.stream_id.clone(),
-                    version: ev.version,
-                    event_id: ev.event_id.as_bytes().to_vec(),
-                    event_type: ev.event_type.clone(),
-                    data: ev.data.clone(),
-                    metadata: ev.metadata.clone(),
-                    hlc: Some(Hlc {
-                        wall: ev.hlc.wall,
-                        logical: ev.hlc.logical,
-                    }),
-                    position: ev.position,
-                    shard_id,
-                };
-
-                if tx
-                    .send(Ok(SubscribeResponse {
-                        payload: Some(subscribe_response::Payload::Event(proto_event)),
-                    }))
-                    .await
-                    .is_err()
-                {
-                    // 客户端断开
-                    return;
+                for stream_id in streams.stream_ids.into_iter().collect::<BTreeSet<_>>() {
+                    let shard_id = self.resolve_read_stream_shard(&stream_id).await?;
+                    groups.entry(shard_id).or_default().push(stream_id);
                 }
             }
+            subscribe_request::Target::All(_) => {
+                for shard_id in &self.all_shards {
+                    groups.insert(*shard_id, Vec::new());
+                }
+            }
+        }
 
-            // 发送 caught_up 信号
-            if tx
-                .send(Ok(SubscribeResponse {
-                    payload: Some(subscribe_response::Payload::CaughtUp(Empty {})),
-                }))
+        let (public_tx, public_rx) = tokio::sync::mpsc::channel(100);
+        let (source_tx, mut source_rx) = tokio::sync::mpsc::channel(100);
+        let mut pending_catch_up: BTreeSet<u64> = groups.keys().copied().collect();
+
+        for (shard_id, stream_ids) in groups {
+            let source_tx = source_tx.clone();
+            let local_shard = self
+                .shard_manager
+                .get_shard(shard_id)
                 .await
-                .is_err()
-            {
-                return;
-            }
-
-            // Phase 2: Live（实时推送）
-            loop {
-                match event_rx.recv().await {
-                    Ok(ev) => {
-                        // 跳过快照已含的事件（注册先于快照的重复窗口），
-                        // 再按订阅目标过滤
-                        if let Some(ref sid) = stream_id {
-                            if ev.stream_id != *sid
-                                || last_version.is_some_and(|v| ev.version <= v)
-                            {
-                                continue;
+                .ok()
+                .filter(|shard| shard.raft.metrics().borrow().state.is_leader());
+            let remote = self.remote.clone();
+            tokio::spawn(async move {
+                let (child_tx, mut child_rx) = tokio::sync::mpsc::channel(100);
+                if let Some(shard) = local_shard {
+                    tokio::spawn(run_local_subscription(
+                        shard_id,
+                        shard.storage.clone(),
+                        stream_ids,
+                        child_tx,
+                    ));
+                    while let Some(item) = child_rx.recv().await {
+                        match item {
+                            Ok(InternalSubscribeResponse {
+                                payload: Some(internal_subscribe_response::Payload::Event(event)),
+                            }) => {
+                                if source_tx.send(SourceMessage::Event(event)).await.is_err() {
+                                    return;
+                                }
                             }
-                        } else if last_position.is_some_and(|p| ev.position <= p) {
-                            continue;
-                        }
-
-                        let proto_event = Event {
-                            stream_id: ev.stream_id,
-                            version: ev.version,
-                            event_id: ev.event_id.as_bytes().to_vec(),
-                            event_type: ev.event_type,
-                            data: ev.data,
-                            metadata: ev.metadata,
-                            hlc: Some(Hlc {
-                                wall: ev.hlc.wall,
-                                logical: ev.hlc.logical,
-                            }),
-                            position: ev.position,
-                            shard_id,
-                        };
-
-                        if tx
-                            .send(Ok(SubscribeResponse {
-                                payload: Some(subscribe_response::Payload::Event(proto_event)),
-                            }))
-                            .await
-                            .is_err()
-                        {
-                            // 客户端断开
-                            return;
+                            Ok(InternalSubscribeResponse {
+                                payload: Some(internal_subscribe_response::Payload::CaughtUp(_)),
+                            }) => {
+                                if source_tx
+                                    .send(SourceMessage::CaughtUp(shard_id))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            _ => break,
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        // 订阅者跟不上，关闭订阅（客户端应重新订阅）
-                        tracing::warn!("Subscriber lagged, closing subscription");
-                        return;
+                } else {
+                    let request = InternalSubscribeRequest {
+                        shard_id,
+                        stream_ids,
+                    };
+                    match remote.internal_client(shard_id).await {
+                        Ok(mut client) => match client.subscribe_internal(request).await {
+                            Ok(response) => {
+                                let mut stream = response.into_inner();
+                                while let Ok(Some(item)) = stream.message().await {
+                                    match item.payload {
+                                        Some(internal_subscribe_response::Payload::Event(
+                                            event,
+                                        )) => {
+                                            if source_tx
+                                                .send(SourceMessage::Event(event))
+                                                .await
+                                                .is_err()
+                                            {
+                                                return;
+                                            }
+                                        }
+                                        Some(internal_subscribe_response::Payload::CaughtUp(_)) => {
+                                            if source_tx
+                                                .send(SourceMessage::CaughtUp(shard_id))
+                                                .await
+                                                .is_err()
+                                            {
+                                                return;
+                                            }
+                                        }
+                                        None => break,
+                                    }
+                                }
+                            }
+                            Err(_) => {}
+                        },
+                        Err(_) => {}
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        // 广播通道关闭（不应发生）
-                        return;
-                    }
+                }
+
+                // 任一内部来源结束都可能造成后续事件缺口，必须显式降级。
+                let _ = source_tx.send(SourceMessage::Degraded(shard_id)).await;
+            });
+        }
+        drop(source_tx);
+
+        tokio::spawn(async move {
+            let mut caught_up = false;
+            let mut degraded = false;
+            while let Some(message) = source_rx.recv().await {
+                let Some(response) = aggregate_source_message(
+                    message,
+                    &mut pending_catch_up,
+                    &mut caught_up,
+                    &mut degraded,
+                ) else {
+                    continue;
+                };
+                if public_tx.send(Ok(response)).await.is_err() {
+                    return;
                 }
             }
         });
 
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(Response::new(ReceiverStream::new(public_rx)))
     }
 
     async fn get_stream_meta(
@@ -833,7 +1023,7 @@ impl EventStore for EsService {
                     shard_id: 0,
                     exists: false,
                     current_version: 0,
-                }))
+                }));
             }
         };
         // 本节点不承载 → Unavailable，客户端轮换其它节点
@@ -893,9 +1083,62 @@ impl EventStore for EsService {
     }
 }
 
+#[tonic::async_trait]
+impl InternalSubscription for EsService {
+    type SubscribeInternalStream = ReceiverStream<Result<InternalSubscribeResponse, Status>>;
+
+    async fn subscribe_internal(
+        &self,
+        request: Request<InternalSubscribeRequest>,
+    ) -> Result<Response<Self::SubscribeInternalStream>, Status> {
+        let request = request.into_inner();
+        let shard = self.resolve_read_shard(request.shard_id).await?;
+        if !shard.raft.metrics().borrow().state.is_leader() {
+            return Err(Status::unavailable(
+                "internal subscription source unavailable",
+            ));
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(100);
+        tokio::spawn(run_local_subscription(
+            request.shard_id,
+            shard.storage.clone(),
+            request.stream_ids,
+            tx,
+        ));
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    fn test_config(data_dir: std::path::PathBuf, node_id: u64) -> Config {
+        Config {
+            node: crate::config::NodeConfig {
+                id: node_id,
+                listen_addr: "127.0.0.1:0".into(),
+                internal_listen_addr: None,
+                peers: Vec::new(),
+            },
+            storage: crate::config::StorageConfig {
+                data_dir,
+                memtable_arena_bytes: 4 * 1024 * 1024,
+            },
+            placement: crate::config::PlacementConfig {
+                replication_factor: 1,
+                nodes: vec![crate::config::PlacementNode {
+                    id: node_id,
+                    primary: vec![0],
+                    replica: Vec::new(),
+                }],
+            },
+            snapshot: Default::default(),
+            tls: None,
+            limits: Default::default(),
+        }
+    }
 
     /// 构造事件：hlc 相同（wall, logical）时按 shard_id 再按 position 定序
     fn ev(shard: u64, pos: u64, wall: u64) -> Event {
@@ -947,7 +1190,11 @@ mod tests {
         ];
         // 降序：500(0,7) → 300(0,8) → 200(1,5) → 100(0,9)
         let (_, consumed) = merge_by_hlc(streams, 0, true);
-        assert_eq!(consumed, vec![Some(7), Some(5)], "倒序水位 = 各路最后输出的最小 position");
+        assert_eq!(
+            consumed,
+            vec![Some(7), Some(5)],
+            "倒序水位 = 各路最后输出的最小 position"
+        );
     }
 
     /// 单路：截断后水位 = 最后输出的 position
@@ -957,5 +1204,157 @@ mod tests {
         let (events, consumed) = merge_by_hlc(streams, 2, false);
         assert_eq!(events.len(), 2);
         assert_eq!(consumed, vec![Some(2)]);
+    }
+
+    proptest! {
+        #[test]
+    fn public_subscription_projection_keeps_stream_version_identity(
+            stream_id in "[a-z]{1,20}",
+            version in any::<u64>(),
+            data in prop::collection::vec(any::<u8>(), 0..64),
+        ) {
+            let event = Event {
+                stream_id: stream_id.clone(), version, event_id: vec![1; 16], event_type: "T".into(),
+                data: data.clone(), metadata: vec![], hlc: None, position: 99, shard_id: 7,
+            };
+            let projected = public_subscription_event(event);
+            prop_assert_eq!(projected.stream_id, stream_id);
+            prop_assert_eq!(projected.version, version);
+            prop_assert_eq!(projected.data, data);
+        }
+    }
+
+    #[test]
+    fn aggregate_source_messages_emit_each_state_transition_once() {
+        let mut pending = BTreeSet::from([3, 7]);
+        let mut caught_up = false;
+        let mut degraded = false;
+
+        assert!(matches!(
+            aggregate_source_message(
+                SourceMessage::Event(ev(3, 4, 9)),
+                &mut pending,
+                &mut caught_up,
+                &mut degraded,
+            )
+            .and_then(|response| response.payload),
+            Some(subscribe_response::Payload::Event(event))
+                if event.stream_id == "s3" && event.version == 4
+        ));
+        assert!(
+            aggregate_source_message(
+                SourceMessage::CaughtUp(3),
+                &mut pending,
+                &mut caught_up,
+                &mut degraded,
+            )
+            .is_none()
+        );
+        assert!(matches!(
+            aggregate_source_message(
+                SourceMessage::CaughtUp(7),
+                &mut pending,
+                &mut caught_up,
+                &mut degraded,
+            )
+            .and_then(|response| response.payload),
+            Some(subscribe_response::Payload::CaughtUp(_))
+        ));
+        assert!(
+            aggregate_source_message(
+                SourceMessage::CaughtUp(7),
+                &mut pending,
+                &mut caught_up,
+                &mut degraded,
+            )
+            .is_none()
+        );
+        assert!(matches!(
+            aggregate_source_message(
+                SourceMessage::Degraded(3),
+                &mut pending,
+                &mut caught_up,
+                &mut degraded,
+            )
+            .and_then(|response| response.payload),
+            Some(subscribe_response::Payload::Degraded(_))
+        ));
+        assert!(
+            aggregate_source_message(
+                SourceMessage::Degraded(7),
+                &mut pending,
+                &mut caught_up,
+                &mut degraded,
+            )
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn leader_probe_skips_self_and_rejects_uninitialized_peer() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let server = crate::server::Server::new(test_config(dir.path().to_path_buf(), 2))
+            .expect("创建未初始化节点");
+        server.init().await.expect("初始化未选主节点");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定管理端口");
+        let peer_addr = format!("http://{}", listener.local_addr().expect("读取管理端口"));
+        let admin = es_raft::RaftAdminService::new(server.shard_manager().clone());
+        let handle = tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(es_proto::eventstore::raft_admin_server::RaftAdminServer::new(admin))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut config = test_config(dir.path().join("remote"), 1);
+        config.node.peers = vec![
+            crate::config::PeerConfig {
+                id: 1,
+                addr: "http://127.0.0.1:1".into(),
+                internal_addr: None,
+            },
+            crate::config::PeerConfig {
+                id: 2,
+                addr: peer_addr,
+                internal_addr: None,
+            },
+        ];
+        let remote = RemoteShards::new(&config).expect("构造远程 shard 探测器");
+        assert_eq!(
+            remote.find_leader(0).await,
+            None,
+            "自身必须跳过，未选主 peer 不能被误判为 leader"
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn local_subscription_exits_when_receiver_is_closed() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let server = crate::server::Server::new(test_config(dir.path().to_path_buf(), 1))
+            .expect("创建服务器");
+        server.init().await.expect("初始化服务器");
+        let storage = server
+            .shard_manager()
+            .get_shard(0)
+            .await
+            .expect("读取本地分片")
+            .storage
+            .clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+
+        // 下游已断开时，发送 caught_up 必须立即失败并释放任务，避免泄漏订阅循环。
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_local_subscription(0, storage, Vec::new(), tx),
+        )
+        .await
+        .expect("下游断开后本地订阅必须退出");
     }
 }

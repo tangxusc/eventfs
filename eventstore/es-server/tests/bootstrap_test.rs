@@ -7,13 +7,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use es_proto::eventstore::raft_admin_client::RaftAdminClient;
 use es_proto::eventstore::GetRaftStateRequest;
-use es_proto::tls::{apply_endpoint_tls, TlsClientConfig};
+use es_proto::eventstore::raft_admin_client::RaftAdminClient;
+use es_proto::tls::{TlsClientConfig, apply_endpoint_tls};
+use es_server::Server;
 use es_server::config::{
     Config, NodeConfig, PeerConfig, PlacementConfig, PlacementNode, StorageConfig, TlsConfig,
 };
-use es_server::Server;
 
 /// 测试固定用分片 0
 const SHARD: u64 = 0;
@@ -32,9 +32,8 @@ fn gen_tls(n: usize) -> Vec<TestTls> {
     let mut all = String::new();
     let mut per_node = Vec::new();
     for _ in 0..n {
-        let certified =
-            rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()])
-                .expect("生成自签证书");
+        let certified = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()])
+            .expect("生成自签证书");
         let cert = certified.cert.pem();
         let key = certified.key_pair.serialize_pem();
         all.push_str(&cert);
@@ -106,11 +105,13 @@ async fn start_node(
         node: NodeConfig {
             id,
             listen_addr: format!("127.0.0.1:{}", port),
+            internal_listen_addr: None,
             peers: peers
                 .iter()
                 .map(|(pid, addr)| PeerConfig {
                     id: *pid,
                     addr: addr.clone(),
+                    internal_addr: None,
                 })
                 .collect(),
         },
@@ -127,8 +128,16 @@ async fn start_node(
                 .iter()
                 .map(|(pid, _)| PlacementNode {
                     id: *pid,
-                    primary: if *pid == 1 { (0..num_shards).collect() } else { vec![] },
-                    replica: if *pid == 1 { vec![] } else { (0..num_shards).collect() },
+                    primary: if *pid == 1 {
+                        (0..num_shards).collect()
+                    } else {
+                        vec![]
+                    },
+                    replica: if *pid == 1 {
+                        vec![]
+                    } else {
+                        (0..num_shards).collect()
+                    },
                 })
                 .collect(),
         },
@@ -361,7 +370,9 @@ async fn start_https_cluster(strict: bool) -> (Vec<TestNode>, u64, String) {
 
     // 轮询信任策略与集群一致：严格模式用 CA，否则默认跳过校验
     let trust = if strict {
-        Some(TlsClientConfig::Ca(certs[0].ca.clone().unwrap().into_bytes()))
+        Some(TlsClientConfig::Ca(
+            certs[0].ca.clone().unwrap().into_bytes(),
+        ))
     } else {
         None
     };

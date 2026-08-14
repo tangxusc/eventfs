@@ -3,8 +3,11 @@
 use std::collections::HashMap;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use es_proto::eventstore::event_store_client::EventStoreClient;
+use es_proto::eventstore::migration_client::MigrationClient;
 use es_proto::eventstore::raft_admin_client::RaftAdminClient;
 use es_proto::eventstore::*;
 
@@ -36,18 +39,42 @@ struct NodeHandle {
 ///
 /// 直接运行已编译的二进制（cargo 在测试编译时注入路径），而不是 `cargo run`：
 /// 后者是 cargo → 二进制的两层进程，测试 kill 掉 cargo 会留下孤儿二进制进程。
+/// 覆盖率运行可经 EVENTSTORED_BIN 注入带 instrumentation 的二进制；默认仍使用
+/// cargo 注入的路径，确保普通测试不依赖额外环境变量。
 /// 日志级别默认 warn，可用 RUST_LOG 环境变量覆盖（自动组建等测试排障用）。
 fn spawn_node(config_path: &std::path::Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_eventstored"))
-        .args([
-            "--config",
-            config_path.to_str().expect("配置路径非 UTF-8"),
-        ])
-        .env("RUST_LOG", std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".to_string()))
+    let binary = std::env::var("EVENTSTORED_BIN")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_eventstored").to_string());
+    Command::new(binary)
+        .args(["--config", config_path.to_str().expect("配置路径非 UTF-8")])
+        .env(
+            "RUST_LOG",
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".to_string()),
+        )
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("启动节点进程")
+}
+
+/// 优雅回收节点进程，保证覆盖率运行时子进程能写出 profile。
+fn terminate_node_process(process: &mut Child) {
+    #[cfg(unix)]
+    {
+        // SIGTERM 会触发服务端 flush WAL 与 LLVM profile；超时后才强制回收。
+        let _ = unsafe { libc::kill(process.id() as libc::pid_t, libc::SIGTERM) };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match process.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(_) => break,
+            }
+        }
+    }
+
+    let _ = process.kill();
+    let _ = process.wait();
 }
 
 /// 检测端口是否可连接（进程是否真正启动）
@@ -99,8 +126,7 @@ impl TestCluster {
         // 为节点分配端口（节点 id 与端口一一对应，id i 用 ports[i-1]）
         let ports: Vec<u16> = (0..n)
             .map(|_| {
-                let listener =
-                    std::net::TcpListener::bind("127.0.0.1:0").expect("绑定临时端口");
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定临时端口");
                 let port = listener.local_addr().expect("取地址").port();
                 drop(listener);
                 // 等待端口真正释放
@@ -258,6 +284,36 @@ impl TestCluster {
         self.nodes.get(&node_id).expect("节点不存在").addr.clone()
     }
 
+    /// 手动组建夹具未配置 peers，需要显式同步服务端路由表。
+    ///
+    /// 真实集群由 RouteTableManager 根据 peers 自动广播；此处通过同一 Migration
+    /// RPC 保持测试环境的路由元数据与已经复制的 Raft 数据一致。
+    async fn sync_route_table_from(&self, source: u64) {
+        let mut source_client = MigrationClient::connect(self.addr_of(source))
+            .await
+            .expect("连接路由表来源节点");
+        let table = source_client
+            .get_route_table(GetRouteTableRequest {})
+            .await
+            .expect("读取来源路由表")
+            .into_inner()
+            .table;
+        for node_id in self.nodes.keys().copied() {
+            if node_id == source {
+                continue;
+            }
+            let mut target = MigrationClient::connect(self.addr_of(node_id))
+                .await
+                .expect("连接路由表目标节点");
+            target
+                .push_route_table(PushRouteTableRequest {
+                    table: table.clone(),
+                })
+                .await
+                .expect("同步路由表");
+        }
+    }
+
     /// 查询某节点在分片 0 上的 Raft 状态
     async fn raft_state(&self, node_id: u64) -> GetRaftStateResponse {
         self.raft_state_of(node_id, SHARD).await
@@ -381,7 +437,8 @@ impl TestCluster {
     }
 
     /// 轮询直到某节点的 last_applied 追上目标值
-    async fn wait_applied(&self, node_id: u64, want: u64, timeout: Duration) {        let deadline = tokio::time::Instant::now() + timeout;
+    async fn wait_applied(&self, node_id: u64, want: u64, timeout: Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let s = self.raft_state(node_id).await;
             if s.has_last_applied && s.last_applied >= want {
@@ -452,7 +509,8 @@ impl TestCluster {
     }
 
     /// 杀掉指定节点，模拟进程崩溃
-    fn kill_node(&mut self, node_id: u64) {        let node = self.nodes.get_mut(&node_id).expect("节点不存在");
+    fn kill_node(&mut self, node_id: u64) {
+        let node = self.nodes.get_mut(&node_id).expect("节点不存在");
         let _ = node.process.kill();
         let _ = node.process.wait();
         eprintln!("✗ 已杀掉 node{node_id}");
@@ -485,8 +543,7 @@ impl TestCluster {
     /// 关闭集群
     fn shutdown(mut self) {
         for (node_id, node) in self.nodes.iter_mut() {
-            let _ = node.process.kill();
-            let _ = node.process.wait();
+            terminate_node_process(&mut node.process);
             eprintln!("✓ 节点 {} 已关闭", node_id);
         }
     }
@@ -495,12 +552,10 @@ impl TestCluster {
 impl Drop for TestCluster {
     fn drop(&mut self) {
         for (_, node) in self.nodes.iter_mut() {
-            let _ = node.process.kill();
-            let _ = node.process.wait();
+            terminate_node_process(&mut node.process);
         }
     }
 }
-
 
 #[tokio::test]
 #[ignore = "需要较长时间编译与启动进程"]
@@ -521,7 +576,11 @@ async fn three_node_start_and_accept() {
 
         match result {
             Ok(resp) => {
-                eprintln!("✓ 节点 {} 响应正常: exists={}", node_id, resp.into_inner().exists);
+                eprintln!(
+                    "✓ 节点 {} 响应正常: exists={}",
+                    node_id,
+                    resp.into_inner().exists
+                );
             }
             Err(e) => {
                 eprintln!("✗ 节点 {} 响应失败: {}", node_id, e);
@@ -605,6 +664,7 @@ async fn three_node_elect_and_replicate() {
         .into_inner();
     assert_eq!(resp.next_expected_version, 1);
     eprintln!("✓ 写入成功，version=0..=1");
+    cluster.sync_route_table_from(leader).await;
 
     eprintln!("\n=== 校验日志已复制到 follower ===");
     let applied = cluster.raft_state(leader).await.last_applied;
@@ -613,7 +673,9 @@ async fn three_node_elect_and_replicate() {
             continue;
         }
         // 复制是异步的，轮询等 follower 追平
-        cluster.wait_applied(id, applied, Duration::from_secs(10)).await;
+        cluster
+            .wait_applied(id, applied, Duration::from_secs(10))
+            .await;
 
         // 直接读 follower 的本地状态机，确认数据真的落到了对端
         let mut c = cluster.client(id).await;
@@ -666,6 +728,7 @@ async fn non_leader_write_rejected_read_ok() {
     })
     .await
     .expect("leader 写入");
+    cluster.sync_route_table_from(leader).await;
 
     let follower = (1..=3u64).find(|id| *id != leader).expect("应有 follower");
     let applied = cluster.raft_state(leader).await.last_applied;
@@ -769,7 +832,11 @@ async fn sdk_append_redirects_to_leader() {
     sdk.append(
         "sdk-redirect".to_string(),
         es_client::ExpectedVersionBuilder::any(),
-        vec![es_client::EventBuilder::new("E").data(b"x".to_vec()).build()],
+        vec![
+            es_client::EventBuilder::new("E")
+                .data(b"x".to_vec())
+                .build(),
+        ],
     )
     .await
     .expect("经 leader_addr 重定向后 append 成功");
@@ -830,11 +897,14 @@ async fn leader_killed_re_elect_data_intact() {
     })
     .await
     .expect("写入旧 leader");
+    cluster.sync_route_table_from(old_leader).await;
 
     let applied = cluster.raft_state(old_leader).await.last_applied;
     let survivors: Vec<u64> = (1..=3u64).filter(|id| *id != old_leader).collect();
     for &id in &survivors {
-        cluster.wait_applied(id, applied, Duration::from_secs(10)).await;
+        cluster
+            .wait_applied(id, applied, Duration::from_secs(10))
+            .await;
     }
     eprintln!("✓ 数据已复制到 {survivors:?}");
 
@@ -892,11 +962,7 @@ async fn leader_killed_re_elect_data_intact() {
 }
 
 /// 从指定节点读取某个流的全部事件
-async fn read_stream_from(
-    cluster: &TestCluster,
-    node_id: u64,
-    stream_id: &str,
-) -> Vec<Event> {
+async fn read_stream_from(cluster: &TestCluster, node_id: u64, stream_id: &str) -> Vec<Event> {
     let mut c = cluster.client(node_id).await;
     let mut s = c
         .read_stream(ReadStreamRequest {
@@ -1086,7 +1152,10 @@ async fn per_shard_election_independent() {
             .collect();
         let mut sorted = seq.clone();
         sorted.sort_unstable();
-        assert_eq!(seq, sorted, "分片 {shard_id} 在归并结果中应保持 position 序");
+        assert_eq!(
+            seq, sorted,
+            "分片 {shard_id} 在归并结果中应保持 position 序"
+        );
     }
     eprintln!("  ✓ 跨分片归并 30 条，各分片内序不乱");
 
@@ -1108,6 +1177,7 @@ async fn restart_rejoin_catchup() {
     // 第一批：重启前写入，重启后必须仍在（验证本地日志恢复）
     append_to(&cluster, leader, "restart", b"before-1").await;
     append_to(&cluster, leader, "restart", b"before-2").await;
+    cluster.sync_route_table_from(leader).await;
     let applied_before = cluster.raft_state(leader).await.last_applied;
     cluster
         .wait_applied(victim, applied_before, Duration::from_secs(10))
@@ -1198,7 +1268,9 @@ async fn three_node_peers_bootstrap_replicate() {
         if id == leader {
             continue;
         }
-        cluster.wait_applied(id, applied, Duration::from_secs(10)).await;
+        cluster
+            .wait_applied(id, applied, Duration::from_secs(10))
+            .await;
     }
     for id in 1..=3u64 {
         let events = read_stream_from(&cluster, id, "auto").await;
@@ -1305,7 +1377,9 @@ async fn out_of_order_start_bootstrap() {
     append_to(&cluster, leader, "auto-ordered", b"ok").await;
     let applied = cluster.raft_state(leader).await.last_applied;
     for id in 1..=3u64 {
-        cluster.wait_applied(id, applied, Duration::from_secs(10)).await;
+        cluster
+            .wait_applied(id, applied, Duration::from_secs(10))
+            .await;
     }
     for id in 1..=3u64 {
         let events = read_stream_from(&cluster, id, "auto-ordered").await;

@@ -163,7 +163,8 @@ async fn handle_config_change(
     // diff：新增的本地 shards → 串行创建（全部就绪后才更新分配池，
     // 避免扩容窗口内新流被分配到尚未创建的 shard）
     let new_local: std::collections::BTreeSet<u64> = cfg.local_shards().into_iter().collect();
-    let current: std::collections::BTreeSet<u64> = shard_manager.shard_ids().await.into_iter().collect();
+    let current: std::collections::BTreeSet<u64> =
+        shard_manager.shard_ids().await.into_iter().collect();
     let added: Vec<u64> = new_local.difference(&current).copied().collect();
     let removed: Vec<u64> = current.difference(&new_local).copied().collect();
 
@@ -267,6 +268,136 @@ data_dir = "./data"
 "#,
         )
         .expect("缺 placement 段可解析（serde default 空表）");
-        assert!(cfg.validate().is_err(), "空放置表校验失败（fail-soft 前置）");
+        assert!(
+            cfg.validate().is_err(),
+            "空放置表校验失败（fail-soft 前置）"
+        );
+    }
+
+    fn watcher_config(data_dir: &std::path::Path) -> Config {
+        Config {
+            node: crate::config::NodeConfig {
+                id: 1,
+                listen_addr: "127.0.0.1:0".into(),
+                internal_listen_addr: None,
+                peers: Vec::new(),
+            },
+            storage: crate::config::StorageConfig {
+                data_dir: data_dir.to_path_buf(),
+                memtable_arena_bytes: 4 * 1024 * 1024,
+            },
+            placement: crate::config::PlacementConfig {
+                replication_factor: 1,
+                nodes: vec![crate::config::PlacementNode {
+                    id: 1,
+                    primary: vec![0],
+                    replica: Vec::new(),
+                }],
+            },
+            snapshot: Default::default(),
+            tls: None,
+            limits: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_hot_config_inputs_leave_route_table_unchanged() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let config = watcher_config(dir.path());
+        let table = Arc::new(
+            RouteTableManager::new(&config, dir.path().join("routes.json"))
+                .expect("创建路由表管理器"),
+        );
+        let manager = Arc::new(ShardManager::new(1, 1));
+        let path = dir.path().join("config.toml");
+
+        // 文件缺失、语法错误和语义非法都必须保留运行期状态。
+        handle_config_change(&path, &table, &manager, 1).await;
+        std::fs::write(&path, "not [valid toml").expect("写入非法语法");
+        handle_config_change(&path, &table, &manager, 1).await;
+        std::fs::write(
+            &path,
+            r#"
+[node]
+id = 1
+listen_addr = "127.0.0.1:0"
+
+[storage]
+data_dir = "./data"
+"#,
+        )
+        .expect("写入语义非法配置");
+        handle_config_change(&path, &table, &manager, 1).await;
+
+        assert!(manager.shard_ids().await.is_empty());
+        assert!(table.snapshot().await.streams.is_empty());
+    }
+
+    /// 配置与路由分属不同目录时，两个目录都必须被监听并可正常停止。
+    #[tokio::test]
+    async fn watcher_accepts_config_and_routes_in_distinct_directories() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let config = watcher_config(dir.path());
+        let table = Arc::new(
+            RouteTableManager::new(&config, dir.path().join("table/routes.json"))
+                .expect("创建路由表管理器"),
+        );
+        let manager = Arc::new(ShardManager::new(1, 1));
+        let config_path = dir.path().join("config/config.toml");
+        let routes_path = dir.path().join("routes/routes.json");
+        std::fs::create_dir_all(config_path.parent().expect("配置目录")).expect("创建配置目录");
+        std::fs::create_dir_all(routes_path.parent().expect("路由目录")).expect("创建路由目录");
+
+        spawn(config_path, routes_path, table, manager, 1)
+            .expect("不同目录均可启动 watcher")
+            .stop()
+            .await;
+    }
+
+    /// 存储根路径是普通文件时，动态创建必须失败且不能注册半成品 shard。
+    #[tokio::test]
+    async fn create_shard_rejects_non_directory_data_root() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let data_file = dir.path().join("not-a-directory");
+        std::fs::write(&data_file, b"block shard directory").expect("写入占位文件");
+        let config = watcher_config(&data_file);
+        let manager = Arc::new(ShardManager::new(1, 1));
+
+        let err = create_shard_blocking(&config, &manager, 0)
+            .await
+            .expect_err("普通文件不能作为 shard 数据目录");
+        assert!(!err.to_string().is_empty(), "失败必须携带诊断信息");
+        assert!(manager.shard_ids().await.is_empty(), "失败不得注册 shard");
+    }
+
+    /// 热更新新增 shard 失败时，不能把未就绪 shard 暴露给流分配。
+    #[tokio::test]
+    async fn hot_config_creation_failure_keeps_previous_route_pool() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let data_file = dir.path().join("not-a-directory");
+        std::fs::write(&data_file, b"block shard directory").expect("写入占位文件");
+
+        let initial = watcher_config(&data_file);
+        let table = Arc::new(
+            RouteTableManager::new(&initial, dir.path().join("routes.json"))
+                .expect("创建路由表管理器"),
+        );
+        let manager = Arc::new(ShardManager::new(1, 1));
+        let mut reloaded = initial;
+        reloaded.placement.nodes[0].primary.push(1);
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            toml::to_string(&reloaded).expect("序列化热更新配置"),
+        )
+        .expect("写入热更新配置");
+
+        handle_config_change(&config_path, &table, &manager, 1).await;
+
+        assert!(manager.shard_ids().await.is_empty(), "失败不得注册任何新增 shard");
+        let (first, _) = table.allocate("route-pool-before").await.expect("分配首个流");
+        let (second, _) = table.allocate("route-pool-after").await.expect("分配第二个流");
+        assert_eq!(first, 0, "旧分配池只包含 shard 0");
+        assert_eq!(second, 0, "创建失败后不得分配到未就绪的 shard 1");
     }
 }

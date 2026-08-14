@@ -53,6 +53,21 @@ async fn wait_shard_registered(server: &Arc<Server>, shard_id: u64, timeout: Dur
     }
 }
 
+/// 轮询等待路由表载入指定流，避免依赖操作系统事件投递的固定时序。
+async fn wait_route_loaded(server: &Arc<Server>, stream: &str, timeout: Duration) -> u64 {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Some(shard) = server.route_table().lookup(stream).await {
+            return shard;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "等待流 {stream} 的路由表热更新超时"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// 配置热更新：运行中把 2 shards 扩到 4 shards → watcher 动态创建 2/3。
 #[tokio::test(flavor = "multi_thread")]
 async fn hot_config_adds_shards_dynamically() {
@@ -90,7 +105,11 @@ async fn hot_config_adds_shards_dynamically() {
 
     // 新 shard 可被 raft 初始化（数据面路径打通）
     for id in [2, 3] {
-        let shard = server.shard_manager().get_shard(id).await.expect("取新 shard");
+        let shard = server
+            .shard_manager()
+            .get_shard(id)
+            .await
+            .expect("取新 shard");
         shard
             .raft
             .initialize(std::collections::BTreeSet::from([1u64]))
@@ -155,5 +174,83 @@ replica = []
     ids.sort_unstable();
     assert_eq!(ids, vec![0, 1], "非法配置不应改变已注册 shards: {ids:?}");
 
+    watcher.stop().await;
+}
+
+/// 配置缩容只收紧新流的分配范围，不能删除本地已有 shard 或数据。
+#[tokio::test(flavor = "multi_thread")]
+async fn hot_config_removal_keeps_existing_shards_and_updates_route_pool() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let config_path = write_config(dir.path(), &[0, 1]);
+    let content = std::fs::read_to_string(&config_path).expect("读配置");
+    let config: es_server::Config = toml::from_str(&content).expect("解析配置");
+    let server = Arc::new(Server::new(config).expect("创建服务器"));
+    server.init().await.expect("初始化");
+
+    let watcher = es_server::watcher::spawn(
+        config_path.clone(),
+        es_server::route_table::routes_path(&server.config().storage.data_dir),
+        server.route_table().clone(),
+        server.shard_manager().clone(),
+        server.config().node.id,
+    )
+    .expect("watcher 启动");
+
+    // 移除 shard 1 后，已注册 shard 必须保留，避免把历史数据随配置变更删除。
+    write_config(dir.path(), &[0]);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let mut ids = server.shard_manager().shard_ids().await;
+    ids.sort_unstable();
+    assert_eq!(ids, vec![0, 1], "热更新不得移除已注册 shard");
+
+    let (shard, inserted) = server
+        .route_table()
+        .allocate("created-after-shard-removal")
+        .await
+        .expect("缩容后分配新流");
+    assert!(inserted, "新流应写入路由表");
+    assert_eq!(shard, 0, "缩容后新流不得再分配给已移除的 shard");
+
+    watcher.stop().await;
+}
+
+/// 路由表文件热更新：watcher 应把版本更高的文件装入内存态。
+#[tokio::test(flavor = "multi_thread")]
+async fn hot_routes_file_reloads_route_table() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let config_path = write_config(dir.path(), &[0, 1]);
+    let content = std::fs::read_to_string(&config_path).expect("读配置");
+    let config: es_server::Config = toml::from_str(&content).expect("解析配置");
+    let server = Arc::new(Server::new(config).expect("创建服务器"));
+    server.init().await.expect("初始化");
+
+    let routes_path = es_server::route_table::routes_path(&server.config().storage.data_dir);
+    // watcher 监听目录，但预先创建目标文件可避免不同平台对新建文件事件的差异。
+    server
+        .route_table()
+        .ensure_file()
+        .await
+        .expect("创建空路由表文件");
+    let watcher = es_server::watcher::spawn(
+        config_path,
+        routes_path.clone(),
+        server.route_table().clone(),
+        server.shard_manager().clone(),
+        server.config().node.id,
+    )
+    .expect("watcher 启动");
+
+    let mut updated = es_core::route::RouteTable::new();
+    updated.insert("hot-route", 1);
+    std::fs::write(
+        &routes_path,
+        serde_json::to_vec(&updated).expect("序列化路由表"),
+    )
+    .expect("写路由表");
+
+    assert_eq!(
+        wait_route_loaded(&server, "hot-route", Duration::from_secs(10)).await,
+        1
+    );
     watcher.stop().await;
 }

@@ -95,7 +95,10 @@ fn summarize(latencies: &[Duration]) -> (f64, f64, f64) {
 #[command(about = "EventFS 端到端性能压测客户端")]
 struct Args {
     /// 集群节点地址（逗号分隔，https）
-    #[arg(long, default_value = "https://127.0.0.1:50051,https://127.0.0.1:50052,https://127.0.0.1:50053")]
+    #[arg(
+        long,
+        default_value = "https://127.0.0.1:50051,https://127.0.0.1:50052,https://127.0.0.1:50053"
+    )]
     addrs: String,
     /// CA 证书 PEM 路径（严格校验对端证书链）
     #[arg(long)]
@@ -216,7 +219,13 @@ async fn batch_write(
         // 单次调用可能耗尽预算，外层再兜底 20s
         for attempt in 0..=WRITE_RETRY {
             let events: Vec<_> = (0..n)
-                .map(|i| make_event(XorShift(0x9000 + written as u64 + i as u64), event_type, size))
+                .map(|i| {
+                    make_event(
+                        XorShift(0x9000 + written as u64 + i as u64),
+                        event_type,
+                        size,
+                    )
+                })
                 .collect();
             match client
                 .append(stream.to_string(), ExpectedVersionBuilder::any(), events)
@@ -296,7 +305,7 @@ async fn subscribe_catchup_once(
 ) -> (usize, Duration, u64) {
     let t = Instant::now();
     let mut stream = client
-        .subscribe(SubscribeTarget::Stream(stream.to_string()), 0, true)
+        .subscribe(SubscribeTarget::Streams(vec![stream.to_string()]))
         .await
         .expect("订阅失败");
     let mut count = 0usize;
@@ -309,6 +318,9 @@ async fn subscribe_catchup_once(
                 count += 1;
             }
             Some(es_client::subscribe_response::Payload::CaughtUp(_)) => break,
+            Some(es_client::subscribe_response::Payload::Degraded(_)) => {
+                panic!("性能订阅不应降级")
+            }
             None => {}
         }
     }
@@ -357,7 +369,15 @@ async fn run_size(
     let (s_p50, s_p95, s_p99) = summarize(&single);
 
     // 2. 批量写入至固定总量
-    let (written, batch_times) = batch_write(client, stream, &event_type, size, total_events, batch_override).await;
+    let (written, batch_times) = batch_write(
+        client,
+        stream,
+        &event_type,
+        size,
+        total_events,
+        batch_override,
+    )
+    .await;
     let batch_elapsed: Duration = batch_times.iter().sum();
     let total_bytes = (written as u64) * (size as u64);
 
@@ -414,9 +434,17 @@ fn print_table(results: &[SizeResult]) {
     println!("=== 端到端性能压测结果（3 节点 TLS，单客户端） ===");
     println!(
         "{:<10} | {:<10} | {:<26} | {:<30} | {:<30} | {:<30}",
-        "事件大小", "事件数", "单条 append p50/p95/p99(ms)", "批量写入 条/s | MB/s", "全量读 条/s | MB/s", "订阅追平 条/s | MB/s"
+        "事件大小",
+        "事件数",
+        "单条 append p50/p95/p99(ms)",
+        "批量写入 条/s | MB/s",
+        "全量读 条/s | MB/s",
+        "订阅追平 条/s | MB/s"
     );
-    println!("{:-<10}-+-{:-<10}-+-{:-<26}-+-{:-<30}-+-{:-<30}-+-{:-<30}", "", "", "", "", "", "");
+    println!(
+        "{:-<10}-+-{:-<10}-+-{:-<26}-+-{:-<30}-+-{:-<30}-+-{:-<30}",
+        "", "", "", "", "", ""
+    );
     for r in results {
         println!(
             "{:<10} | {:<10} | p50={:.2} p95={:.2} p99={:.2} | {:.0} | {:.1} | {:.0} | {:.1} | {:.0} | {:.1}",
@@ -434,7 +462,8 @@ fn print_table(results: &[SizeResult]) {
         );
         println!(
             "{:<10}   {:<10}   批次耗时 {:.0} ms（{} 批）  页延迟 p50/p95/p99 = {:.2}/{:.2}/{:.2} ms   追平 {:.0} ms",
-            "", "",
+            "",
+            "",
             r.append_batch.elapsed_ms,
             r.append_batch.batches,
             r.read.page_p50_ms,
@@ -460,7 +489,11 @@ fn write_results(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let addrs: Vec<String> = args.addrs.split(',').map(|s| s.trim().to_string()).collect();
+    let addrs: Vec<String> = args
+        .addrs
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .collect();
     let sizes: Vec<usize> = args
         .sizes
         .split(',')
@@ -477,7 +510,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let ca = std::fs::read(&args.ca).expect("读取 CA 文件失败");
-    let mut client = EventStoreClient::connect_with_tls(addrs, Some(TlsClientConfig::Ca(ca))).await?;
+    let mut client =
+        EventStoreClient::connect_with_tls(addrs, Some(TlsClientConfig::Ca(ca))).await?;
 
     // 预热：确认集群可用。冷启动需选举收敛（3 节点 8 分片实测可达数秒，
     // 与脚本端口就绪无必然先后），用重试等待收敛替代固定 sleep；首次
@@ -486,15 +520,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for attempt in 0..60 {
         let warmup = make_event(XorShift(0xdeadbeef), "perf-warmup", 64);
         match client
-            .append(warmup_stream.clone(), ExpectedVersionBuilder::any(), vec![warmup])
+            .append(
+                warmup_stream.clone(),
+                ExpectedVersionBuilder::any(),
+                vec![warmup],
+            )
             .await
         {
             Ok(_) => break,
             Err(e) if attempt == 59 => {
-                return Err(format!(
-                    "预热 append 失败——60 次重试后集群仍不可用: {e}"
-                )
-                .into());
+                return Err(format!("预热 append 失败——60 次重试后集群仍不可用: {e}").into());
             }
             Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
         }
@@ -503,10 +538,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut results = Vec::new();
     for size in sizes {
         let stream = format!("{}-{}b", args.stream_prefix, size);
-        println!("▶ 规格 {} B（共 {} 条，总量 50MB）...", size, TOTAL_BYTES_PER_SIZE / size);
+        println!(
+            "▶ 规格 {} B（共 {} 条，总量 50MB）...",
+            size,
+            TOTAL_BYTES_PER_SIZE / size
+        );
         let r = run_size(&mut client, size, &stream, args.batch_size).await;
-        println!("  ✓ 完成：单条 p50={:.2}ms，批量 {:.1} MB/s，读 {:.1} MB/s，订阅追平 {:.1} MB/s",
-            r.append_single.p50_ms, r.append_batch.mb_per_s, r.read.mb_per_s, r.subscribe.mb_per_s);
+        println!(
+            "  ✓ 完成：单条 p50={:.2}ms，批量 {:.1} MB/s，读 {:.1} MB/s，订阅追平 {:.1} MB/s",
+            r.append_single.p50_ms, r.append_batch.mb_per_s, r.read.mb_per_s, r.subscribe.mb_per_s
+        );
         results.push(r);
         // 增量落盘：中途失败时已完成规格的结果不丢失
         write_results(&args.output, &results)?;

@@ -25,6 +25,7 @@ async fn start_server() -> (
         node: NodeConfig {
             id: 1,
             listen_addr: "127.0.0.1:0".to_string(),
+            internal_listen_addr: None,
             peers: vec![],
         },
         storage: StorageConfig {
@@ -47,7 +48,9 @@ async fn start_server() -> (
 
     // 测试服务器日志（try_init 幂等，多个测试共用进程不重复初始化）
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new("es_server=debug,es_storage=debug"))
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "es_server=debug,es_storage=debug",
+        ))
         .try_init();
 
     let server = Server::new(config.clone()).expect("创建服务器");
@@ -87,10 +90,14 @@ async fn start_server() -> (
                 )
                 .expect("创建服务"),
             ))
-            .add_service(RaftAdminServer::new(es_raft::RaftAdminService::new(sm.clone())))
-            .add_service(es_proto::eventstore::migration_server::MigrationServer::new(
-                es_server::migration_service::MigrationService::new(route_table, sm),
-            ))
+            .add_service(RaftAdminServer::new(es_raft::RaftAdminService::new(
+                sm.clone(),
+            )))
+            .add_service(
+                es_proto::eventstore::migration_server::MigrationServer::new(
+                    es_server::migration_service::MigrationService::new(route_table, sm),
+                ),
+            )
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await;
     });
@@ -102,7 +109,9 @@ async fn start_server() -> (
 }
 
 /// 启动测试服务器但不对分片自举（esctl init 用例）。
-async fn start_server_uninitialized(num_shards: u64) -> (
+async fn start_server_uninitialized(
+    num_shards: u64,
+) -> (
     String,
     tokio::task::JoinHandle<()>,
     Server,
@@ -113,6 +122,7 @@ async fn start_server_uninitialized(num_shards: u64) -> (
         node: NodeConfig {
             id: 1,
             listen_addr: "127.0.0.1:0".to_string(),
+            internal_listen_addr: None,
             peers: vec![],
         },
         storage: StorageConfig {
@@ -155,10 +165,14 @@ async fn start_server_uninitialized(num_shards: u64) -> (
                 )
                 .expect("创建服务"),
             ))
-            .add_service(RaftAdminServer::new(es_raft::RaftAdminService::new(sm.clone())))
-            .add_service(es_proto::eventstore::migration_server::MigrationServer::new(
-                es_server::migration_service::MigrationService::new(route_table, sm),
-            ))
+            .add_service(RaftAdminServer::new(es_raft::RaftAdminService::new(
+                sm.clone(),
+            )))
+            .add_service(
+                es_proto::eventstore::migration_server::MigrationServer::new(
+                    es_server::migration_service::MigrationService::new(route_table, sm),
+                ),
+            )
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await;
     });
@@ -346,21 +360,12 @@ async fn watch_exits_after_catchup() {
         &["append", "s/watch", "--event-type", "W2", "--data", "b"],
     );
 
-    let out = esctl(&addr, &["watch", "s/watch", "--once", "--from-start"]);
+    let out = esctl(&addr, &["watch", "--stream", "s/watch", "--once"]);
     assert!(out.status.success(), "watch 失败: {}", stderr(&out));
     let text = stdout(&out);
     assert!(text.contains("[W1]"), "{text}");
     assert!(text.contains("[W2]"), "{text}");
     assert!(text.contains("已追平"), "{text}");
-
-    // 增量订阅：from-exclusive=0（不含）→ 只给版本 1（第二条）
-    let out = esctl(
-        &addr,
-        &["watch", "s/watch", "--once", "--from-exclusive", "0"],
-    );
-    let text = stdout(&out);
-    assert!(text.contains("[W2]"), "{text}");
-    assert!(!text.contains("[W1]"), "增量订阅不应重复历史: {text}");
 
     handle.abort();
 }
@@ -446,6 +451,7 @@ async fn https_self_signed_cert() {
         node: NodeConfig {
             id: 1,
             listen_addr: "127.0.0.1:0".to_string(),
+            internal_listen_addr: None,
             peers: vec![],
         },
         storage: StorageConfig {
@@ -618,6 +624,7 @@ async fn start_two_nodes() -> (
             node: NodeConfig {
                 id,
                 listen_addr: "127.0.0.1:0".to_string(),
+                internal_listen_addr: None,
                 peers: vec![],
             },
             storage: StorageConfig {
@@ -863,8 +870,8 @@ async fn watch_all_subscribe() {
         &["append", "s/all", "--event-type", "T", "--data", "x"],
     );
 
-    // $all 订阅（默认分片 0）：追平后退出
-    let out = esctl(&addr, &["watch", "--all", "--once", "--from-start"]);
+    // `$all` 聚合集群全部 stream：追平后退出。
+    let out = esctl(&addr, &["watch", "--all", "--once"]);
     assert!(out.status.success(), "watch --all 失败: {}", stderr(&out));
     assert!(stdout(&out).contains("已追平"), "{}", stdout(&out));
 
@@ -908,7 +915,15 @@ async fn readall_skewed_paging_no_duplicates() {
             None => esctl(&addr, &["-w", "json", "readall", "--max-count", "3"]),
             Some(c) => esctl(
                 &addr,
-                &["-w", "json", "readall", "--max-count", "3", "--from-positions", c],
+                &[
+                    "-w",
+                    "json",
+                    "readall",
+                    "--max-count",
+                    "3",
+                    "--from-positions",
+                    c,
+                ],
             ),
         };
         assert!(out.status.success(), "{}", stderr(&out));
@@ -990,45 +1005,34 @@ async fn readall_backward_defaults_to_latest() {
     handle.abort();
 }
 
-/// 发现 14：watch --all --shard N 订阅指定分片的 $all（旧缺陷：参数被静默忽略，
-/// 服务端硬编码分片 0）
+/// `$all` 聚合订阅必须包含不同内部 shard 上的 stream，且不暴露 shard 选择。
 #[tokio::test(flavor = "multi_thread")]
-async fn watch_all_per_shard() {
+async fn watch_all_aggregates_streams() {
     let (addr, handle, _server, _dir) = start_server().await;
 
     // 显式分配（最少流）：先写一个流占 shard 0，目标流必落在 shard 1
     let filler = "watch/filler";
-    let out = esctl(&addr, &["append", filler, "--event-type", "T", "--data", "x"]);
+    let out = esctl(
+        &addr,
+        &["append", filler, "--event-type", "T", "--data", "x"],
+    );
     assert!(out.status.success(), "{}", stderr(&out));
     let s1 = "watch/shard1/target";
     let out = esctl(&addr, &["append", &s1, "--event-type", "T", "--data", "x"]);
     assert!(out.status.success(), "{}", stderr(&out));
 
-    // 指定 --shard 1：收到分片 1 的事件（json 模式，simple 行不含流名）
-    let out = esctl(
-        &addr,
-        &["-w", "json", "watch", "--all", "--shard", "1", "--once", "--from-start"],
-    );
-    assert!(
-        out.status.success(),
-        "watch --shard 1 失败: {}",
-        stderr(&out)
-    );
+    // 公共 `$all` 订阅应同时收到两个 stream。
+    let out = esctl(&addr, &["-w", "json", "watch", "--all", "--once"]);
+    assert!(out.status.success(), "watch --all 失败: {}", stderr(&out));
     assert!(
         stdout(&out).contains(&s1),
-        "应收到分片 1 的事件: {}",
+        "应收到目标 stream 的事件: {}",
         stdout(&out)
     );
-
-    // 默认 shard 0：收不到分片 1 的事件
-    let out = esctl(
-        &addr,
-        &["-w", "json", "watch", "--all", "--once", "--from-start"],
-    );
-    assert!(out.status.success(), "watch 默认失败: {}", stderr(&out));
     assert!(
-        !stdout(&out).contains(&s1),
-        "默认订阅 shard 0 不应收到分片 1 事件"
+        stdout(&out).contains(filler),
+        "应收到另一个 stream 的事件: {}",
+        stdout(&out)
     );
     handle.abort();
 }
@@ -1141,7 +1145,11 @@ async fn member_cas_stale_snapshot_rejected() {
         .await
         .expect_err("陈旧快照应被拒绝");
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-    assert!(err.message().contains("成员集合已变更"), "{}", err.message());
+    assert!(
+        err.message().contains("成员集合已变更"),
+        "{}",
+        err.message()
+    );
 
     handle.abort();
 }
@@ -1155,7 +1163,14 @@ async fn migrate_single_stream_roundtrip() {
     for i in 0..3 {
         let out = esctl(
             &addr,
-            &["append", "mig/s1", "--event-type", "T", "--data", &i.to_string()],
+            &[
+                "append",
+                "mig/s1",
+                "--event-type",
+                "T",
+                "--data",
+                &i.to_string(),
+            ],
         );
         assert!(out.status.success(), "{}", stderr(&out));
     }
@@ -1167,17 +1182,32 @@ async fn migrate_single_stream_roundtrip() {
     // 路由表指向 shard 1；读 3 条（经路由表）；meta 版本 2
     let out = esctl(&addr, &["route"]);
     let text = stdout(&out);
-    assert!(text.contains("mig/s1 -> shard 1"), "路由应指向新分片: {text}");
+    assert!(
+        text.contains("mig/s1 -> shard 1"),
+        "路由应指向新分片: {text}"
+    );
 
     let out = esctl(&addr, &["read", "mig/s1"]);
     assert!(out.status.success(), "{}", stderr(&out));
-    assert_eq!(stdout(&out).matches("[T]").count(), 3, "应读到 3 条: {}", stdout(&out));
+    assert_eq!(
+        stdout(&out).matches("[T]").count(),
+        3,
+        "应读到 3 条: {}",
+        stdout(&out)
+    );
 
     let out = esctl(&addr, &["meta", "mig/s1"]);
-    assert!(stdout(&out).contains("current_version: 2"), "{}", stdout(&out));
+    assert!(
+        stdout(&out).contains("current_version: 2"),
+        "{}",
+        stdout(&out)
+    );
 
     // 迁移后仍可追加（目标分片继续写入）
-    let out = esctl(&addr, &["append", "mig/s1", "--event-type", "T", "--data", "x"]);
+    let out = esctl(
+        &addr,
+        &["append", "mig/s1", "--event-type", "T", "--data", "x"],
+    );
     assert!(out.status.success(), "迁移后追加失败: {}", stderr(&out));
     handle.abort();
 }
@@ -1189,7 +1219,17 @@ async fn migrate_with_live_producer() {
 
     // 预写 2 条建立流
     for i in 0..2 {
-        let out = esctl(&addr, &["append", "mig/live", "--event-type", "T", "--data", &i.to_string()]);
+        let out = esctl(
+            &addr,
+            &[
+                "append",
+                "mig/live",
+                "--event-type",
+                "T",
+                "--data",
+                &i.to_string(),
+            ],
+        );
         assert!(out.status.success(), "{}", stderr(&out));
     }
 
@@ -1201,7 +1241,19 @@ async fn migrate_with_live_producer() {
         for i in 2..30 {
             let out = tokio::task::spawn_blocking({
                 let addr = producer_addr.clone();
-                move || esctl(&addr, &["append", "mig/live", "--event-type", "T", "--data", &i.to_string()])
+                move || {
+                    esctl(
+                        &addr,
+                        &[
+                            "append",
+                            "mig/live",
+                            "--event-type",
+                            "T",
+                            "--data",
+                            &i.to_string(),
+                        ],
+                    )
+                }
             })
             .await
             .expect("阻塞任务 join");
@@ -1218,7 +1270,12 @@ async fn migrate_with_live_producer() {
     // 全部 30 条在目标（路由已切，读即目标）
     let out = esctl(&addr, &["read", "mig/live"]);
     assert!(out.status.success(), "{}", stderr(&out));
-    assert_eq!(stdout(&out).matches("[T]").count(), 30, "全部事件应在目标: {}", stdout(&out));
+    assert_eq!(
+        stdout(&out).matches("[T]").count(),
+        30,
+        "全部事件应在目标: {}",
+        stdout(&out)
+    );
     handle.abort();
 }
 
@@ -1226,16 +1283,30 @@ async fn migrate_with_live_producer() {
 #[tokio::test(flavor = "multi_thread")]
 async fn migrate_dry_run_noop() {
     let (addr, handle, _server, _dir) = start_server().await;
-    let out = esctl(&addr, &["append", "mig/dry", "--event-type", "T", "--data", "x"]);
+    let out = esctl(
+        &addr,
+        &["append", "mig/dry", "--event-type", "T", "--data", "x"],
+    );
     assert!(out.status.success(), "{}", stderr(&out));
 
-    let out = esctl(&addr, &["migrate", "--stream", "mig/dry", "--to", "1", "--dry-run"]);
+    let out = esctl(
+        &addr,
+        &["migrate", "--stream", "mig/dry", "--to", "1", "--dry-run"],
+    );
     assert!(out.status.success(), "dry-run 失败: {}", stderr(&out));
-    assert!(stdout(&out).contains("dry-run"), "应报告 dry-run: {}", stdout(&out));
+    assert!(
+        stdout(&out).contains("dry-run"),
+        "应报告 dry-run: {}",
+        stdout(&out)
+    );
 
     // 路由未变
     let out = esctl(&addr, &["route"]);
-    assert!(stdout(&out).contains("mig/dry -> shard 0"), "路由不应变化: {}", stdout(&out));
+    assert!(
+        stdout(&out).contains("mig/dry -> shard 0"),
+        "路由不应变化: {}",
+        stdout(&out)
+    );
     handle.abort();
 }
 
@@ -1257,7 +1328,10 @@ async fn migrate_shard_batch() {
     // 所有流路由到 shard 1（3 个流全在 shard 0/1 中，批量迁移后应全部指向 1）
     let out = esctl(&addr, &["route"]);
     let text = stdout(&out);
-    assert!(!text.contains("-> shard 0"), "不应再有流指向 shard 0: {text}");
+    assert!(
+        !text.contains("-> shard 0"),
+        "不应再有流指向 shard 0: {text}"
+    );
     assert!(text.contains("mig/b1 -> shard 1"), "b1 应迁到 1: {text}");
     handle.abort();
 }
@@ -1267,7 +1341,10 @@ async fn migrate_shard_batch() {
 async fn migrate_rerun_is_idempotent() {
     let (addr, handle, _server, _dir) = start_server().await;
 
-    let out = esctl(&addr, &["append", "mig/rerun", "--event-type", "T", "--data", "x"]);
+    let out = esctl(
+        &addr,
+        &["append", "mig/rerun", "--event-type", "T", "--data", "x"],
+    );
     assert!(out.status.success(), "{}", stderr(&out));
 
     let out = esctl(&addr, &["migrate", "--stream", "mig/rerun", "--to", "1"]);
@@ -1336,16 +1413,27 @@ async fn migrate_switch_then_interrupt_resumes() {
 
     // 写 3 条（shard 0）
     for i in 0..3 {
-        let out = esctl(&addr, &["append", "mig/interrupt", "--event-type", "T", "--data", &i.to_string()]);
+        let out = esctl(
+            &addr,
+            &[
+                "append",
+                "mig/interrupt",
+                "--event-type",
+                "T",
+                "--data",
+                &i.to_string(),
+            ],
+        );
         assert!(out.status.success(), "{}", stderr(&out));
     }
 
     // 模拟「切换已完成但排水未跑」（工具崩溃）：直接调 SetStreamShard
     // 把路由切到 shard 1，源 shard 0 数据仍在
     {
-        let mut client = es_proto::eventstore::migration_client::MigrationClient::connect(addr.clone())
-            .await
-            .expect("连接");
+        let mut client =
+            es_proto::eventstore::migration_client::MigrationClient::connect(addr.clone())
+                .await
+                .expect("连接");
         client
             .set_stream_shard(es_proto::eventstore::SetStreamShardRequest {
                 stream_id: "mig/interrupt".to_string(),
@@ -1356,7 +1444,10 @@ async fn migrate_switch_then_interrupt_resumes() {
     }
 
     // 重跑 migrate：路由已指向目标 → 自愈（发现残留源 → 排水收尾）
-    let out = esctl(&addr, &["migrate", "--stream", "mig/interrupt", "--to", "1"]);
+    let out = esctl(
+        &addr,
+        &["migrate", "--stream", "mig/interrupt", "--to", "1"],
+    );
     assert!(out.status.success(), "重跑应自愈收尾: {}", stderr(&out));
     assert!(
         stderr(&out).contains("仍有该流数据"),
@@ -1367,6 +1458,11 @@ async fn migrate_switch_then_interrupt_resumes() {
     // 数据完整：3 条全部在目标（路由已指向 shard 1，读即目标）
     let out = esctl(&addr, &["read", "mig/interrupt"]);
     assert!(out.status.success(), "{}", stderr(&out));
-    assert_eq!(stdout(&out).matches("[T]").count(), 3, "数据应完整: {}", stdout(&out));
+    assert_eq!(
+        stdout(&out).matches("[T]").count(),
+        3,
+        "数据应完整: {}",
+        stdout(&out)
+    );
     handle.abort();
 }

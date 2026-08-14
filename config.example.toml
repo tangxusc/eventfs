@@ -3,6 +3,8 @@
 [node]
 id = 1
 listen_addr = "127.0.0.1:50051"
+# 内部订阅 RPC 专用监听端口；必须仅向集群节点网段开放，不能暴露给客户端。
+internal_listen_addr = "127.0.0.1:51051"
 
 # 集群节点列表（3 节点示例）。非空即触发启动时自动组建集群（etcd 静态引导语义）：
 # - 必须包含本节点，且所有节点配置完全一致（不一致可能形成双集群）
@@ -11,14 +13,17 @@ listen_addr = "127.0.0.1:50051"
 [[node.peers]]
 id = 1
 addr = "https://127.0.0.1:50051"
+internal_addr = "https://127.0.0.1:51051"
 
 [[node.peers]]
 id = 2
 addr = "https://127.0.0.1:50052"
+internal_addr = "https://127.0.0.1:51052"
 
 [[node.peers]]
 id = 3
 addr = "https://127.0.0.1:50053"
+internal_addr = "https://127.0.0.1:51053"
 
 # TLS 配置（可选）。配置即启用 TLS 监听（listen_addr 变为 https 服务）：
 # - cert_file / key_file 必须成对提供（PEM 格式）

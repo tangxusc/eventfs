@@ -13,7 +13,7 @@
 - **幂等写入**：按 `event_id` 建索引，客户端重试（网络超时但实际已提交）不会产生重复事件
 - **单事务原子提交**：事件、流元数据、position 指针、幂等索引、已应用状态在同一 surrealkv 事务内提交，崩溃不留下版本回退
 - **混合逻辑时钟（HLC）**：leader 提交前分配并随日志下发，各副本 apply 出相同时间戳，为日后的近似全序预留基础
-- **流订阅**：先补齐历史（catch-up）再转为实时推送（broadcast），追平边界不丢事件，落后时退回扫描补齐
+- **跨分片流订阅**：客户端按一个或多个 stream、或 `$all` 订阅；服务端内部路由和聚合，追平边界不丢事件，公开事件不暴露 shard
 - **跨分片 ReadAll**：按 HLC 做 k 路归并（保分片内 position 序），服务端按归并消费水位
   驱动逐分片续读游标（`next_positions`，客户端原样透传翻页），支持反向；
   反向读到分片最早事件后游标带 `ended` 读尽标记，**空页即终止**（正反两向一致）
@@ -26,7 +26,7 @@
 
 ## 架构
 
-单个进程在**一个端口**上同时提供四个 gRPC 服务：
+单个进程在公共 `listen_addr` 端口提供四个 gRPC 服务：
 
 | 服务 | 用途 | 方法 |
 |---|---|---|
@@ -34,6 +34,9 @@
 | `RaftRpc` | 节点间复制与选举 | `AppendEntries` / `Vote` / `InstallSnapshot` |
 | `RaftAdmin` | 集群管理 | `Initialize` / `AddLearner` / `ChangeMembership` / `GetRaftState` / `ListShards` |
 | `Migration` | 路由表同步 + 在线迁移原语（节点间） | `GetRouteTable` / `PushRouteTable` / `SetStreamShard` / `RecountStreams` / `AppendMigrated` / `DeleteStreamFromShard` / `ReadStreamFromShard` / `GetStreamMetaFromShard` / `ListStreams` |
+
+跨节点聚合订阅使用的 `InternalSubscription` 只在可选的
+`internal_listen_addr` 专用端口提供，内部端口必须由网络策略限制为仅集群节点可访问。
 
 crate 依赖自上而下单向：
 
@@ -86,18 +89,22 @@ cargo build --bin eventstored
 分片由 `[placement]` 显式定义。**2 节点 rf=1 示例**（每 shard 一个投票成员，无副本）：
 
 ```toml
-# node1.toml（node2.toml 除 id、listen_addr、data_dir 外相同）
+# node1.toml（node2.toml 除 id、listen_addr、internal_listen_addr、data_dir 外相同）
 [node]
 id = 1
 listen_addr = "127.0.0.1:50051"
+# 仅节点间内部订阅 RPC；必须由网络策略限制为集群节点可访问。
+internal_listen_addr = "127.0.0.1:51051"
 
 # 必须包含本节点，且所有节点配置完全一致（不一致可能形成双集群）
 [[node.peers]]
 id = 1
 addr = "127.0.0.1:50051"
+internal_addr = "127.0.0.1:51051"
 [[node.peers]]
 id = 2
 addr = "127.0.0.1:50052"
+internal_addr = "127.0.0.1:51052"
 
 [storage]
 data_dir = "./data/node1"
@@ -235,8 +242,8 @@ esctl readall --max-count 100          # 取满时输出下一页续读游标（
 esctl meta orders/1
 
 # 订阅：先追平历史再实时推送；--once 追平即退出（脚本/测试用）
-esctl watch orders/1 --from-start
-esctl watch --all --shard 1 --from-start   # $all 订阅分片 1（一次一个分片）
+esctl watch --stream orders/1 --stream payments/1
+esctl watch --all
 
 # 流路由表：查看 / 校准计数 / 孤儿流检测
 esctl route                    # 展示 stream -> shard 归属与表版本
@@ -336,7 +343,7 @@ cargo bench -p es-storage
 - [x] 运行期动态扩容（配置热更新 + 动态创建 shards，不重启）
 - [x] 在线迁移（`esctl migrate`：单流/批量/断点续传/孤儿流修复，取代离线 reshard）
 - [ ] 磁盘故障注入测试
-- [ ] 跨分片 `$all` 聚合订阅（当前 `--all` 按 `--shard` 单分片订阅，多分片需各自发起）
+- [x] 跨分片 stream 聚合订阅（`--stream` 可重复或 `--all`，服务端内部路由）
 - [ ] 自动再平衡（按流量而非仅按流数触发迁移）
 
 **可观测性与基准**
@@ -373,8 +380,7 @@ cargo bench -p es-storage
   `esctl route check` 检测、`esctl migrate` 合并修复。
 - **`esctl member remove` 无法移除 learner**：RaftAdmin 无 remove_learner RPC；
   `member list` 不含地址列与 learner 行（GetRaftState 不暴露成员地址）。
-- **`esctl watch --all` 单分片订阅**：`--shard <N>` 指定分片（默认 0），多分片 $all
-  需各自发起订阅；跨分片聚合订阅尚未实现。
+- **订阅恢复**：跨 stream 聚合订阅暂不提供消费进度或续订 token；断点恢复属于后续持久化订阅能力。
 - **快照为全量**：每次 `build_snapshot` 序列化整个分片状态机，大状态机耗时明显
   （支持 zstd/lz4 压缩与多快照保留，见 docs/snapshot.md）。
 - **install 单事务内存 ≈ 快照未压缩体积**：surrealkv 事务写入全内存缓冲，超大快照

@@ -413,24 +413,13 @@ pub struct MigrateArgs {
 
 #[derive(Args, Debug)]
 pub struct WatchArgs {
-    /// 订阅单个流（按 version 定位）
-    pub stream: Option<String>,
+    /// 订阅一个或多个流（可重复指定）
+    #[arg(long, conflicts_with = "all", required_unless_present = "all")]
+    pub stream: Vec<String>,
 
-    /// 订阅全部分片 $all（当前服务端仅支持分片 0，见 --shard）
+    /// 订阅当前集群全部流
     #[arg(long, conflicts_with = "stream")]
     pub all: bool,
-
-    /// --all 时的目标分片（服务端限制：目前仅分片 0 有 $all 数据）
-    #[arg(long, default_value_t = 0)]
-    pub shard: u64,
-
-    /// 起始位置（不含）：订阅流时按 version，订阅 all 时按 position
-    #[arg(long, default_value_t = 0)]
-    pub from_exclusive: u64,
-
-    /// 从头开始（忽略 --from-exclusive）
-    #[arg(long)]
-    pub from_start: bool,
 
     /// 追平历史（收到 caught_up 信号）后立即退出，退出码 0（脚本/测试用）
     #[arg(long)]

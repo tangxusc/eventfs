@@ -4,22 +4,19 @@
 //! integration test 无法引用；放在 crate 内部则可直接构造 Args 与 Ctx。
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use es_proto::eventstore::event_store_server::EventStoreServer;
 use es_proto::eventstore::*;
-use es_server::config::{Config, NodeConfig, PlacementConfig, PlacementNode, StorageConfig};
 use es_server::Server;
-use openraft::storage::RaftStateMachine;
-use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+use es_server::config::{Config, NodeConfig, PlacementConfig, PlacementNode, StorageConfig};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 use crate::cli::*;
 use crate::client::ClusterClient;
-use crate::commands::{Ctx, append, init, member, meta, read, status, watch};
+use crate::commands::{Ctx, append, init, member, meta, migrate, read, route, status, watch};
 
 /// 启动单节点测试集群（2 分片，raft 已初始化，gRPC 已监听）。
 /// 返回 (gRPC 地址, Server, TempDir)。
@@ -29,6 +26,7 @@ async fn start_server() -> (String, Server, tempfile::TempDir) {
         node: NodeConfig {
             id: 1,
             listen_addr: "127.0.0.1:0".into(),
+            internal_listen_addr: None,
             peers: vec![],
         },
         storage: StorageConfig {
@@ -79,11 +77,18 @@ async fn start_server() -> (String, Server, tempfile::TempDir) {
     .expect("创建服务");
     let admin = es_raft::admin_service::RaftAdminService::new(server.shard_manager().clone());
     let raft = es_raft::rpc_service::RaftRpcService::new(server.shard_manager().clone());
+    let migration = es_server::migration_service::MigrationService::new(
+        server.route_table().clone(),
+        server.shard_manager().clone(),
+    );
     tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
             .add_service(EventStoreServer::new(service))
-            .add_service(es_proto::eventstore::raft_rpc_server::RaftRpcServer::new(raft))
+            .add_service(es_proto::eventstore::raft_rpc_server::RaftRpcServer::new(
+                raft,
+            ))
             .add_service(es_proto::eventstore::raft_admin_server::RaftAdminServer::new(admin))
+            .add_service(es_proto::eventstore::migration_server::MigrationServer::new(migration))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await;
     });
@@ -133,6 +138,36 @@ fn ev_any() -> Option<ExpectedVersion> {
     })
 }
 
+fn route_args(check: bool, recount: bool) -> RouteArgs {
+    RouteArgs {
+        show: false,
+        recount,
+        check,
+    }
+}
+
+fn migrate_args(stream: Option<&str>, to: u64, dry_run: bool) -> MigrateArgs {
+    MigrateArgs {
+        stream: stream.map(str::to_string),
+        shard: None,
+        to,
+        dry_run,
+        drain_quiet_rounds: 1,
+        drain_timeout_secs: 1,
+    }
+}
+
+fn migrate_shard_args(shard: u64, to: u64) -> MigrateArgs {
+    MigrateArgs {
+        stream: None,
+        shard: Some(shard),
+        to,
+        dry_run: false,
+        drain_quiet_rounds: 1,
+        drain_timeout_secs: 1,
+    }
+}
+
 // ---------- append ----------
 
 #[tokio::test]
@@ -159,8 +194,261 @@ async fn append_three_formats_and_read_back() {
             max_count: 0,
             backward: true, // 覆盖 u64::MAX 哨兵分支
         };
-        read::run(&read_ctx, &bargs).await.expect("backward read 成功");
+        read::run(&read_ctx, &bargs)
+            .await
+            .expect("backward read 成功");
     }
+}
+
+// ---------- route：展示、校准与跨分片一致性检查 ----------
+
+#[tokio::test]
+async fn route_commands_report_consistent_orphan_and_phantom_streams() {
+    let (addr, server, _dir) = start_server().await;
+    let stream = "route-check-stream";
+    append::run(
+        &ctx_with(addr.clone(), Format::Simple),
+        &append_args(stream, "Created", Some("payload".into())),
+    )
+    .await
+    .expect("追加测试流");
+
+    let owner = server
+        .route_table()
+        .lookup(stream)
+        .await
+        .expect("追加后应记录流路由");
+
+    // 三种展示格式都应经由真实 Migration RPC 获取路由表。
+    for format in [Format::Simple, Format::Table, Format::Json] {
+        route::run(&ctx_with(addr.clone(), format), &route_args(false, false))
+            .await
+            .expect("展示路由表");
+    }
+    route::run(
+        &ctx_with(addr.clone(), Format::Simple),
+        &route_args(false, true),
+    )
+    .await
+    .expect("校准路由表计数");
+
+    // 正常路由：实际存储与路由表归属一致。
+    route::run(
+        &ctx_with(addr.clone(), Format::Simple),
+        &route_args(true, false),
+    )
+    .await
+    .expect("一致性检查应成功");
+
+    // 用版本更高的本地表模拟路由文件回退，已落盘事件成为孤儿流。
+    let mut without_stream = es_core::route::RouteTable::new();
+    without_stream.version = server.route_table().snapshot().await.version + 1;
+    let routes_path = es_server::route_table::routes_path(&server.config().storage.data_dir);
+    std::fs::write(
+        &routes_path,
+        serde_json::to_vec(&without_stream).expect("序列化孤儿路由表"),
+    )
+    .expect("写入孤儿路由表");
+    server.route_table().reload().await;
+    assert_eq!(server.route_table().lookup(stream).await, None);
+    route::run(
+        &ctx_with(addr.clone(), Format::Simple),
+        &route_args(true, false),
+    )
+    .await
+    .expect("孤儿流检查应成功");
+
+    // 将同一流切到另一 shard，模拟迁移切换未同步时的虚挂路由。
+    let other_shard = owner ^ 1;
+    server
+        .route_table()
+        .set_stream_shard(stream, other_shard)
+        .await
+        .expect("设置虚挂路由");
+    for format in [Format::Table, Format::Json] {
+        route::run(&ctx_with(addr.clone(), format), &route_args(true, false))
+            .await
+            .expect("虚挂流检查应成功");
+    }
+}
+
+// ---------- migrate：真实状态机的早期退出与校验路径 ----------
+
+#[tokio::test]
+async fn migrate_handles_noop_invalid_and_missing_source_states() {
+    let (addr, server, _dir) = start_server().await;
+    let stream = "migrate-state-stream";
+    append::run(
+        &ctx_with(addr.clone(), Format::Simple),
+        &append_args(stream, "Created", Some("payload".into())),
+    )
+    .await
+    .expect("创建迁移测试流");
+    let owner = server
+        .route_table()
+        .lookup(stream)
+        .await
+        .expect("流应有路由");
+    let other = owner ^ 1;
+
+    // 同一 shard 且无残留源数据：迁移应幂等返回，无需复制或删除。
+    migrate::run(
+        &ctx_with(addr.clone(), Format::Simple),
+        &migrate_args(Some(stream), owner, false),
+    )
+    .await
+    .expect("同 shard 无操作应成功");
+
+    // 目标未出现在放置表时必须在复制前拒绝。
+    let err = migrate::run(
+        &ctx_with(addr.clone(), Format::Simple),
+        &migrate_args(Some(stream), 99, false),
+    )
+    .await
+    .expect_err("不存在的目标分片应失败");
+    assert!(err.to_string().contains("不存在"), "{err}");
+
+    // 路由表与存储中均不存在的流不能被静默创建为迁移目标。
+    let err = migrate::run(
+        &ctx_with(addr.clone(), Format::Simple),
+        &migrate_args(Some("absent-migration-stream"), other, false),
+    )
+    .await
+    .expect_err("不存在的源流应失败");
+    assert!(err.to_string().contains("未创建"), "{err}");
+
+    // 手工路由存在但源数据已被清理：状态机应幂等成功并保留可重跑语义。
+    server
+        .route_table()
+        .set_stream_shard("empty-migration-stream", owner)
+        .await
+        .expect("写入空流路由");
+    migrate::run(
+        &ctx_with(addr.clone(), Format::Table),
+        &migrate_args(Some("empty-migration-stream"), other, false),
+    )
+    .await
+    .expect("源数据缺失的幂等迁移应成功");
+
+    // dry-run 只计算版本差，不切换路由或写入目标分片。
+    migrate::run(
+        &ctx_with(addr, Format::Json),
+        &migrate_args(Some(stream), other, true),
+    )
+    .await
+    .expect("dry-run 应成功");
+    assert_eq!(server.route_table().lookup(stream).await, Some(owner));
+}
+
+#[tokio::test]
+async fn migrate_stream_copies_data_switches_route_and_cleans_source() {
+    let (addr, server, _dir) = start_server().await;
+    let ctx = ctx_with(addr.clone(), Format::Simple);
+    let stream = "migrate-complete-stream";
+    append::run(&ctx, &append_args(stream, "Created", Some("first".into())))
+        .await
+        .expect("写入首个迁移事件");
+    append::run(&ctx, &append_args(stream, "Updated", Some("second".into())))
+        .await
+        .expect("写入第二个迁移事件");
+    let source = server
+        .route_table()
+        .lookup(stream)
+        .await
+        .expect("读取源路由");
+    let target = source ^ 1;
+
+    migrate::run(&ctx, &migrate_args(Some(stream), target, false))
+        .await
+        .expect("完整迁移应成功");
+    assert_eq!(
+        server.route_table().lookup(stream).await,
+        Some(target),
+        "切换后路由必须指向目标分片"
+    );
+
+    let mut data_client = ctx
+        .cluster
+        .event_client(&addr)
+        .await
+        .expect("连接数据面服务");
+    let meta = data_client
+        .get_stream_meta(GetStreamMetaRequest {
+            stream_id: stream.into(),
+        })
+        .await
+        .expect("读取迁移后元数据")
+        .into_inner();
+    assert!(meta.exists, "迁移后目标流必须存在");
+    assert_eq!(meta.shard_id, target);
+    assert_eq!(meta.current_version, 1, "两个事件的版本必须保留");
+
+    let mut events = data_client
+        .read_stream(ReadStreamRequest {
+            stream_id: stream.into(),
+            from_version: 0,
+            max_count: 0,
+            direction: Direction::Forward as i32,
+        })
+        .await
+        .expect("读取迁移后数据")
+        .into_inner();
+    let mut data = Vec::new();
+    while let Some(page) = events.message().await.expect("读取迁移响应") {
+        data.extend(page.events.into_iter().map(|event| event.data));
+    }
+    assert_eq!(data, vec![b"first".to_vec(), b"second".to_vec()]);
+
+    let source_shard = server
+        .shard_manager()
+        .get_shard(source)
+        .await
+        .expect("读取源分片");
+    assert!(
+        source_shard
+            .storage
+            .read_stream_events(stream, 0, 0)
+            .expect("读取源数据")
+            .is_empty(),
+        "完成迁移后源分片必须清理旧数据"
+    );
+}
+
+#[tokio::test]
+async fn migrate_shard_handles_empty_and_partial_failure_without_hiding_errors() {
+    let (addr, _server, _dir) = start_server().await;
+    let ctx = ctx_with(addr.clone(), Format::Simple);
+
+    // 空源分片不是错误：批量迁移应明确完成，而不是尝试创建目标流。
+    migrate::run(&ctx, &migrate_shard_args(0, 1))
+        .await
+        .expect("空分片迁移应无操作成功");
+
+    let stream = "migrate-shard-failure";
+    append::run(
+        &ctx,
+        &append_args(stream, "Created", Some("payload".into())),
+    )
+    .await
+    .expect("创建批量迁移测试流");
+    let mut data_client = ctx
+        .cluster
+        .event_client(&addr)
+        .await
+        .expect("连接数据面服务");
+    let meta = data_client
+        .get_stream_meta(GetStreamMetaRequest {
+            stream_id: stream.into(),
+        })
+        .await
+        .expect("读取流元数据")
+        .into_inner();
+
+    // 目标不存在时逐流失败必须聚合为命令错误，不能静默吞掉部分失败。
+    let err = migrate::run(&ctx, &migrate_shard_args(meta.shard_id, 99))
+        .await
+        .expect_err("批量迁移的失败流必须返回错误");
+    assert!(err.to_string().contains("迁移失败"), "{err}");
 }
 
 #[tokio::test]
@@ -293,7 +581,9 @@ async fn readall_three_cursor_modes_and_backward() {
         backward: false,
         shard_ids: Some(ShardIds(vec![0, 1])),
     };
-    read::run_all(&ctx, &with_ids).await.expect("readall 分片列表");
+    read::run_all(&ctx, &with_ids)
+        .await
+        .expect("readall 分片列表");
     // 反向（u64::MAX 哨兵）
     let backward = ReadAllArgs {
         from_position: 0,
@@ -310,9 +600,14 @@ async fn meta_three_formats() {
     let (addr, _s, _dir) = start_server().await;
     for fmt in [Format::Simple, Format::Table, Format::Json] {
         let ctx = ctx_with(addr.clone(), fmt);
-        meta::run(&ctx, &MetaArgs { stream: "s-m".into() })
-            .await
-            .expect("meta 成功");
+        meta::run(
+            &ctx,
+            &MetaArgs {
+                stream: "s-m".into(),
+            },
+        )
+        .await
+        .expect("meta 成功");
     }
 }
 
@@ -459,7 +754,9 @@ async fn status_three_formats() {
     let (addr, _s, _dir) = start_server().await;
     for fmt in [Format::Simple, Format::Table, Format::Json] {
         let ctx = ctx_with(addr.clone(), fmt);
-        status::run(&ctx, &StatusArgs {}).await.expect("status 成功");
+        status::run(&ctx, &StatusArgs {})
+            .await
+            .expect("status 成功");
     }
 }
 
@@ -476,29 +773,20 @@ async fn watch_once_exits_after_catchup() {
 
     // 订阅单流 --once：收到 caught_up 后退出
     let stream_watch = WatchArgs {
-        stream: Some("s-w".into()),
+        stream: vec!["s-w".into()],
         all: false,
-        shard: 0,
-        from_exclusive: 0,
-        from_start: true,
         once: true,
     };
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        watch::run(&ctx, &stream_watch),
-    )
-    .await
-    .expect("watch 不应挂起")
-    .expect("watch once 成功");
+    tokio::time::timeout(Duration::from_secs(5), watch::run(&ctx, &stream_watch))
+        .await
+        .expect("watch 不应挂起")
+        .expect("watch once 成功");
 
     // 订阅 $all --once + Json 格式（覆盖 render_message 的 Json/table 分支）
     let jctx = ctx_with(addr.clone(), Format::Json);
     let all_watch = WatchArgs {
-        stream: None,
+        stream: vec![],
         all: true,
-        shard: 0,
-        from_exclusive: 0,
-        from_start: true,
         once: true,
     };
     tokio::time::timeout(Duration::from_secs(5), watch::run(&jctx, &all_watch))
@@ -508,11 +796,8 @@ async fn watch_once_exits_after_catchup() {
 
     // 参数错误：既无 stream 也无 --all
     let bad = WatchArgs {
-        stream: None,
+        stream: vec![],
         all: false,
-        shard: 0,
-        from_exclusive: 0,
-        from_start: false,
         once: true,
     };
     assert!(watch::run(&jctx, &bad).await.is_err(), "缺目标应报错");
@@ -595,7 +880,11 @@ struct FlakyStub {
     /// initialize 的预设响应（init 命令端点失败路径用）
     initialize_result: Arc<std::sync::Mutex<Result<(), Status>>>,
     /// subscribe 预设的事件（发送后立即关闭流，模拟服务端断流）
-    subscribe_events: Arc<std::sync::Mutex<Vec<Event>>>,
+    subscribe_events: Arc<std::sync::Mutex<Vec<SubscriptionEvent>>>,
+    /// 是否在断流前发送降级信号，用于验证 --once 的失败语义。
+    subscribe_degraded: Arc<std::sync::atomic::AtomicBool>,
+    /// 是否在断流前发送追平信号，用于验证非 --once 的正常关闭路径。
+    subscribe_caught_up: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FlakyStub {
@@ -607,6 +896,8 @@ impl FlakyStub {
             voter_ids: Arc::new(std::sync::Mutex::new(vec![1])),
             initialize_result: Arc::new(std::sync::Mutex::new(Ok(()))),
             subscribe_events: Arc::new(std::sync::Mutex::new(Vec::new())),
+            subscribe_degraded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            subscribe_caught_up: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -618,8 +909,18 @@ impl FlakyStub {
         *self.initialize_result.lock().unwrap() = r;
     }
 
-    fn set_subscribe_events(&self, events: Vec<Event>) {
+    fn set_subscribe_events(&self, events: Vec<SubscriptionEvent>) {
         *self.subscribe_events.lock().unwrap() = events;
+    }
+
+    fn set_subscribe_degraded(&self) {
+        self.subscribe_degraded
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn set_subscribe_caught_up(&self) {
+        self.subscribe_caught_up
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn push_append(&self, r: Result<(), Status>) {
@@ -631,11 +932,7 @@ impl FlakyStub {
     }
 
     fn next_append(&self) -> Result<(), Status> {
-        self.queue
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or(Ok(()))
+        self.queue.lock().unwrap().pop_front().unwrap_or(Ok(()))
     }
 
     fn next_raft_state(&self) -> Result<bool, Status> {
@@ -657,7 +954,8 @@ impl event_store_server::EventStore for FlakyStub {
         &self,
         _request: Request<AppendRequest>,
     ) -> Result<Response<AppendResponse>, Status> {
-        self.append_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.append_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.next_append().map(|()| {
             Response::new(AppendResponse {
                 next_expected_version: 1,
@@ -668,8 +966,9 @@ impl event_store_server::EventStore for FlakyStub {
         })
     }
 
-    type ReadStreamStream =
-        std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<ReadEventsResponse, Status>> + Send>>;
+    type ReadStreamStream = std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<ReadEventsResponse, Status>> + Send>,
+    >;
     async fn read_stream(
         &self,
         _request: Request<ReadStreamRequest>,
@@ -677,8 +976,9 @@ impl event_store_server::EventStore for FlakyStub {
         Err(Status::unimplemented("stub"))
     }
 
-    type ReadAllStream =
-        std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<ReadEventsResponse, Status>> + Send>>;
+    type ReadAllStream = std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<ReadEventsResponse, Status>> + Send>,
+    >;
     async fn read_all(
         &self,
         _request: Request<ReadAllRequest>,
@@ -686,8 +986,9 @@ impl event_store_server::EventStore for FlakyStub {
         Err(Status::unimplemented("stub"))
     }
 
-    type SubscribeStream =
-        std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<SubscribeResponse, Status>> + Send>>;
+    type SubscribeStream = std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<SubscribeResponse, Status>> + Send>,
+    >;
     async fn subscribe(
         &self,
         _request: Request<SubscribeRequest>,
@@ -699,6 +1000,26 @@ impl event_store_server::EventStore for FlakyStub {
             let _ = tx
                 .send(Ok(SubscribeResponse {
                     payload: Some(subscribe_response::Payload::Event(ev)),
+                }))
+                .await;
+        }
+        if self
+            .subscribe_degraded
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let _ = tx
+                .send(Ok(SubscribeResponse {
+                    payload: Some(subscribe_response::Payload::Degraded(Empty {})),
+                }))
+                .await;
+        }
+        if self
+            .subscribe_caught_up
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let _ = tx
+                .send(Ok(SubscribeResponse {
+                    payload: Some(subscribe_response::Payload::CaughtUp(Empty {})),
                 }))
                 .await;
         }
@@ -795,7 +1116,9 @@ async fn start_flaky(stub: FlakyStub) -> String {
 }
 
 async fn simple_append(
-    client: &mut es_proto::eventstore::event_store_client::EventStoreClient<tonic::transport::Channel>,
+    client: &mut es_proto::eventstore::event_store_client::EventStoreClient<
+        tonic::transport::Channel,
+    >,
 ) -> Result<AppendResponse, Status> {
     client
         .append(AppendRequest {
@@ -825,7 +1148,10 @@ async fn with_leader_redirect_to_leader_addr() {
     )
     .expect("客户端");
     cluster
-        .with_leader(0, |mut client| async move { simple_append(&mut client).await })
+        .with_leader(
+            0,
+            |mut client| async move { simple_append(&mut client).await },
+        )
         .await
         .expect("重定向后应成功");
     assert_eq!(stub_b.append_count(), 1, "重定向目标应被调用");
@@ -834,7 +1160,9 @@ async fn with_leader_redirect_to_leader_addr() {
 #[tokio::test]
 async fn with_leader_retries_after_election() {
     let stub = FlakyStub::new();
-    stub.push_append(Err(Status::unavailable("not leader; leader unknown, retry later")));
+    stub.push_append(Err(Status::unavailable(
+        "not leader; leader unknown, retry later",
+    )));
     let addr = start_flaky(stub).await;
 
     let cluster = ClusterClient::new(
@@ -845,7 +1173,10 @@ async fn with_leader_retries_after_election() {
     )
     .expect("客户端");
     cluster
-        .with_leader(0, |mut client| async move { simple_append(&mut client).await })
+        .with_leader(
+            0,
+            |mut client| async move { simple_append(&mut client).await },
+        )
         .await
         .expect("重试后应成功");
 }
@@ -865,7 +1196,10 @@ async fn with_leader_skips_unreachable_endpoint() {
     )
     .expect("客户端");
     cluster
-        .with_leader(0, |mut client| async move { simple_append(&mut client).await })
+        .with_leader(
+            0,
+            |mut client| async move { simple_append(&mut client).await },
+        )
         .await
         .expect("跳过坏端点后应成功");
 }
@@ -873,7 +1207,9 @@ async fn with_leader_skips_unreachable_endpoint() {
 #[tokio::test]
 async fn with_leader_failed_precondition_raised() {
     let stub = FlakyStub::new();
-    stub.push_append(Err(Status::failed_precondition("optimistic conflict: actual_version=3")));
+    stub.push_append(Err(Status::failed_precondition(
+        "optimistic conflict: actual_version=3",
+    )));
     let addr = start_flaky(stub).await;
     let cluster = ClusterClient::new(
         &[addr],
@@ -883,7 +1219,10 @@ async fn with_leader_failed_precondition_raised() {
     )
     .expect("客户端");
     let err = cluster
-        .with_leader(0, |mut client| async move { simple_append(&mut client).await })
+        .with_leader(
+            0,
+            |mut client| async move { simple_append(&mut client).await },
+        )
         .await
         .expect_err("FailedPrecondition 应上抛");
     assert!(err.to_string().contains("optimistic conflict"), "{err}");
@@ -985,10 +1324,7 @@ async fn find_leader_two_error_paths() {
         Duration::from_secs(5),
     )
     .expect("客户端");
-    let err = cluster
-        .find_leader(0)
-        .await
-        .expect_err("未初始化应报错");
+    let err = cluster.find_leader(0).await.expect_err("未初始化应报错");
     assert!(err.to_string().contains("未初始化"), "{err}");
 
     // 非 leader 且初始化过 → 无 leader 错误
@@ -1002,10 +1338,7 @@ async fn find_leader_two_error_paths() {
         Duration::from_secs(5),
     )
     .expect("客户端");
-    let err = cluster2
-        .find_leader(0)
-        .await
-        .expect_err("无 leader 应报错");
+    let err = cluster2.find_leader(0).await.expect_err("无 leader 应报错");
     assert!(err.to_string().contains("无 leader"), "{err}");
 }
 
@@ -1015,7 +1348,7 @@ async fn find_leader_two_error_paths() {
 async fn watch_closed_before_catchup_once_and_not() {
     let stub = FlakyStub::new();
     // 预设 1 条事件后断流：覆盖事件渲染（非 caught_up）与未追平退出路径
-    stub.set_subscribe_events(vec![Event {
+    stub.set_subscribe_events(vec![SubscriptionEvent {
         stream_id: "s".into(),
         version: 0,
         event_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
@@ -1023,34 +1356,66 @@ async fn watch_closed_before_catchup_once_and_not() {
         data: b"d".to_vec(),
         metadata: vec![],
         hlc: None,
-        position: 0,
-        shard_id: 0,
     }]);
     let addr = start_flaky(stub).await;
     let ctx = ctx_with(addr, Format::Simple);
 
     // 非 --once：流关闭且未追平 → 告警后 Ok
     let w = WatchArgs {
-        stream: Some("s".into()),
+        stream: vec!["s".into()],
         all: false,
-        shard: 0,
-        from_exclusive: 0,
-        from_start: false,
         once: false,
     };
     watch::run(&ctx, &w).await.expect("非 once 断流返回 Ok");
 
     // --once 未追平 → 报错（依赖退出码的脚本必须能感知）
     let w = WatchArgs {
-        stream: Some("s".into()),
+        stream: vec!["s".into()],
         all: false,
-        shard: 0,
-        from_exclusive: 0,
-        from_start: false,
         once: true,
     };
     let err = watch::run(&ctx, &w).await.expect_err("once 未追平应报错");
     assert!(err.to_string().contains("caught_up"), "{err}");
+}
+
+#[tokio::test]
+async fn watch_once_fails_immediately_when_subscription_is_degraded() {
+    let stub = FlakyStub::new();
+    stub.set_subscribe_degraded();
+    let addr = start_flaky(stub).await;
+    let ctx = ctx_with(addr, Format::Json);
+    let err = watch::run(
+        &ctx,
+        &WatchArgs {
+            stream: vec![],
+            all: true,
+            once: true,
+        },
+    )
+    .await
+    .expect_err("--once 收到降级必须失败");
+    assert!(
+        err.to_string().contains("降级"),
+        "错误应说明订阅降级: {err}"
+    );
+}
+
+#[tokio::test]
+async fn watch_without_once_accepts_caught_up_before_normal_close() {
+    let stub = FlakyStub::new();
+    stub.set_subscribe_caught_up();
+    let addr = start_flaky(stub).await;
+    let ctx = ctx_with(addr, Format::Table);
+    watch::run(
+        &ctx,
+        &WatchArgs {
+            stream: vec!["s".into()],
+            all: false,
+            once: false,
+        },
+    )
+    .await
+    .expect("追平后正常关闭应成功");
 }
 
 #[tokio::test]
@@ -1131,7 +1496,10 @@ async fn with_leader_other_error_raised() {
     )
     .expect("客户端");
     let err = cluster
-        .with_leader(0, |mut client| async move { simple_append(&mut client).await })
+        .with_leader(
+            0,
+            |mut client| async move { simple_append(&mut client).await },
+        )
         .await
         .expect_err("非 Unavailable 错误应上抛");
     assert!(err.to_string().contains("内部错误"), "{err}");
@@ -1142,7 +1510,9 @@ async fn with_leader_budget_exhausted_no_leader() {
     // 单端点持续返回「选举中」：tried 集合允许重入队重试，预算耗尽后报无 leader
     let stub = FlakyStub::new();
     for _ in 0..8 {
-        stub.push_append(Err(Status::unavailable("not leader; leader unknown, retry later")));
+        stub.push_append(Err(Status::unavailable(
+            "not leader; leader unknown, retry later",
+        )));
     }
     let addr = start_flaky(stub).await;
     let cluster = ClusterClient::new(
@@ -1153,7 +1523,10 @@ async fn with_leader_budget_exhausted_no_leader() {
     )
     .expect("客户端");
     let err = cluster
-        .with_leader(0, |mut client| async move { simple_append(&mut client).await })
+        .with_leader(
+            0,
+            |mut client| async move { simple_append(&mut client).await },
+        )
         .await
         .expect_err("预算耗尽应报错");
     assert!(err.to_string().contains("未找到分片 0 的 leader"), "{err}");
@@ -1196,10 +1569,7 @@ async fn try_find_leader_mixed_errors_collected() {
         Duration::from_secs(5),
     )
     .expect("客户端");
-    let err = cluster
-        .find_leader(0)
-        .await
-        .expect_err("无 leader 应报错");
+    let err = cluster.find_leader(0).await.expect_err("无 leader 应报错");
     assert!(err.to_string().contains("无 leader"), "{err}");
     assert!(err.to_string().contains("boom"), "应收集错误详情: {err}");
 }
@@ -1274,9 +1644,7 @@ async fn main_run_command_dispatch() {
     let (addr, _s, _dir) = start_server().await;
     let cli = Cli {
         global: global(Format::Simple, vec![addr], None),
-        command: Command::Meta(MetaArgs {
-            stream: "s".into(),
-        }),
+        command: Command::Meta(MetaArgs { stream: "s".into() }),
     };
     crate::run(cli).await.expect("命令分发成功");
 
@@ -1293,9 +1661,7 @@ async fn main_run_command_dispatch() {
             write_out: Format::Simple,
             shards: None,
         },
-        command: Command::Meta(MetaArgs {
-            stream: "s".into(),
-        }),
+        command: Command::Meta(MetaArgs { stream: "s".into() }),
     };
     let err = crate::run(cli).await.expect_err("CA 文件不存在应报错");
     assert!(err.to_string().contains("读取 CA 文件"), "{err}");
@@ -1313,11 +1679,8 @@ async fn watch_empty_message_skipped() {
     // 预设事件+关闭已覆盖事件分支，空消息分支通过下方 stub 专用测试补。
     let ctx = ctx_with(addr, Format::Simple);
     let w = WatchArgs {
-        stream: None,
+        stream: vec![],
         all: true,
-        shard: 0,
-        from_exclusive: 0,
-        from_start: false,
         once: false,
     };
     // stub 无 caught_up：非 once 返回 Ok（已覆盖 74-78 告警路径）

@@ -73,15 +73,19 @@ esctl meta <STREAM>
 ### 订阅
 
 ```
-esctl watch <STREAM> [--from-exclusive <N>] [--from-start] [--once]
-esctl watch --all [--shard <N=0>] [--from-exclusive <N>] [--from-start] [--once]
+esctl watch --stream <STREAM> [--stream <STREAM>...] [--once]
+esctl watch --all [--once]
 ```
 
 先补齐历史（catch-up），追平后显示「已追平，进入实时推送」并转为实时推送。
 `--once` 追平即退出（退出码 0），供脚本与测试使用；不带 `--once` 持续运行，Ctrl-C 终止。
-`--all` 订阅 $all 时用 `--shard <N>` 指定分片（默认 0）：一次订阅一个分片的 $all，
-多分片需各自发起订阅。`--once` 在收到 caught_up 前流被关闭（如订阅者落后被服务端断开）
-时以退出码 1 报错——退出码 0 只代表「已追平」。
+客户端订阅只面向 stream：可重复 `--stream` 建立多流聚合订阅，或用 `--all` 订阅
+当前集群全部 stream；二者互斥。分片路由、跨节点转发和聚合均由服务端处理，订阅输出
+不含 shard 或分片 position。`--all` 会自动纳入订阅建立后在既有 shard 上新建并写入的
+stream。跨 stream 不承诺顺序，但每个 stream 内 version 严格有序。
+
+服务端任一内部来源不可用或中断时会输出 `degraded` 状态，仍继续转发健康来源；`--once`
+在发生降级时以退出码 1 结束，避免把不完整的 catch-up 误判为成功。
 
 ### 管理面
 

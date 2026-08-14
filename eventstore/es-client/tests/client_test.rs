@@ -32,6 +32,8 @@ struct StubState {
     /// read_all 收到的全部请求（断言翻页透传）
     read_all_requests: Vec<ReadAllRequest>,
     subscribe_calls: usize,
+    /// 建立订阅流时返回的错误（None = 正常建立）。
+    subscribe_error: Option<Status>,
     /// subscribe 预设流内容（None = 空流）
     subscribe_stream: Option<Vec<Result<SubscribeResponse, Status>>>,
     get_stream_meta_calls: usize,
@@ -80,8 +82,7 @@ impl EventStore for StubServer {
         ok_append()
     }
 
-    type ReadStreamStream =
-        Pin<Box<dyn Stream<Item = Result<ReadEventsResponse, Status>> + Send>>;
+    type ReadStreamStream = Pin<Box<dyn Stream<Item = Result<ReadEventsResponse, Status>> + Send>>;
     async fn read_stream(
         &self,
         _request: Request<ReadStreamRequest>,
@@ -98,8 +99,7 @@ impl EventStore for StubServer {
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
-    type ReadAllStream =
-        Pin<Box<dyn Stream<Item = Result<ReadEventsResponse, Status>> + Send>>;
+    type ReadAllStream = Pin<Box<dyn Stream<Item = Result<ReadEventsResponse, Status>> + Send>>;
     async fn read_all(
         &self,
         request: Request<ReadAllRequest>,
@@ -118,14 +118,16 @@ impl EventStore for StubServer {
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
-    type SubscribeStream =
-        Pin<Box<dyn Stream<Item = Result<SubscribeResponse, Status>> + Send>>;
+    type SubscribeStream = Pin<Box<dyn Stream<Item = Result<SubscribeResponse, Status>> + Send>>;
     async fn subscribe(
         &self,
         _request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
         let mut state = self.state.lock().expect("stub 锁");
         state.subscribe_calls += 1;
+        if let Some(status) = &state.subscribe_error {
+            return Err(status.clone());
+        }
         let items = state.subscribe_stream.clone().unwrap_or_default();
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         for item in items {
@@ -189,7 +191,10 @@ fn sample_event(version: u64) -> Event {
         event_type: "T".to_string(),
         data: vec![],
         metadata: vec![],
-        hlc: Some(Hlc { wall: 1, logical: 2 }),
+        hlc: Some(Hlc {
+            wall: 1,
+            logical: 2,
+        }),
         position: version,
         shard_id: 0,
     }
@@ -303,9 +308,13 @@ async fn append_redirects_to_leader_addr() {
 async fn append_retries_election_unknown() {
     // 选举中（无 leader 提示）：退避后重试同一节点，最终成功
     let (addr, state) = start_stub_server().await;
-    state.lock().expect("stub 锁").append_queue.push_back(Err(
-        Status::unavailable("not leader; leader unknown, retry later"),
-    ));
+    state
+        .lock()
+        .expect("stub 锁")
+        .append_queue
+        .push_back(Err(Status::unavailable(
+            "not leader; leader unknown, retry later",
+        )));
 
     let mut client = es_client::EventStoreClient::connect(vec![addr])
         .await
@@ -332,9 +341,13 @@ async fn append_budget_exhausted_returns_not_leader() {
     // 单节点预算 = 1×2+2 = 4：一直处于选举中（无提示）→ 预算耗尽报 NotLeader
     let (addr, state) = start_stub_server().await;
     for _ in 0..4 {
-        state.lock().expect("stub 锁").append_queue.push_back(Err(
-            Status::unavailable("not leader; leader unknown, retry later"),
-        ));
+        state
+            .lock()
+            .expect("stub 锁")
+            .append_queue
+            .push_back(Err(Status::unavailable(
+                "not leader; leader unknown, retry later",
+            )));
     }
 
     let mut client = es_client::EventStoreClient::connect(vec![addr])
@@ -396,10 +409,7 @@ async fn read_stream_failover_to_healthy_node() {
     // 节点 A 建立流失败 → 轮换到节点 B 成功
     let (addr_b, state_b) = start_stub_server().await;
     let (addr_a, state_a) = start_stub_server().await;
-    state_a
-        .lock()
-        .expect("stub 锁")
-        .read_stream_error = Some(Status::internal("节点 A 存储故障"));
+    state_a.lock().expect("stub 锁").read_stream_error = Some(Status::internal("节点 A 存储故障"));
 
     let mut client = es_client::EventStoreClient::connect(vec![addr_a, addr_b])
         .await
@@ -422,24 +432,28 @@ async fn read_stream_failover_to_healthy_node() {
 async fn read_all_merges_pages_and_exposes_next_positions() {
     // 单节点两页：事件合并、next_positions 取最后一页非空值
     let (addr, state) = start_stub_server().await;
-    state.lock().expect("stub 锁").read_all_queue.push_back(vec![
-        ReadEventsResponse {
-            events: vec![sample_event(1)],
-            next_positions: vec![ShardPosition {
-                shard_id: 0,
-                from_position: 5,
-                ended: false,
-            }],
-        },
-        ReadEventsResponse {
-            events: vec![sample_event(2)],
-            next_positions: vec![ShardPosition {
-                shard_id: 0,
-                from_position: 10,
-                ended: false,
-            }],
-        },
-    ]);
+    state
+        .lock()
+        .expect("stub 锁")
+        .read_all_queue
+        .push_back(vec![
+            ReadEventsResponse {
+                events: vec![sample_event(1)],
+                next_positions: vec![ShardPosition {
+                    shard_id: 0,
+                    from_position: 5,
+                    ended: false,
+                }],
+            },
+            ReadEventsResponse {
+                events: vec![sample_event(2)],
+                next_positions: vec![ShardPosition {
+                    shard_id: 0,
+                    from_position: 10,
+                    ended: false,
+                }],
+            },
+        ]);
 
     let mut client = es_client::EventStoreClient::connect(vec![addr])
         .await
@@ -475,7 +489,13 @@ async fn read_all_passes_through_from_positions() {
         ended: false,
     }];
     let (_events, _next) = client
-        .read_all(vec![], 0, 10, es_client::Direction::Forward, page_cursor.clone())
+        .read_all(
+            vec![],
+            0,
+            10,
+            es_client::Direction::Forward,
+            page_cursor.clone(),
+        )
         .await
         .expect("read_all 成功");
 
@@ -517,10 +537,9 @@ async fn read_all_permanent_error_not_rotated() {
     // 永久错误（InvalidArgument 等）不轮换节点：换节点结果相同，直接上抛
     let (addr_b, state_b) = start_stub_server().await;
     let (addr_a, state_a) = start_stub_server().await;
-    state_a
-        .lock()
-        .expect("stub 锁")
-        .read_all_error = Some(Status::invalid_argument("shard_ids 与 from_positions 不能同时为空"));
+    state_a.lock().expect("stub 锁").read_all_error = Some(Status::invalid_argument(
+        "shard_ids 与 from_positions 不能同时为空",
+    ));
 
     let mut client = es_client::EventStoreClient::connect(vec![addr_a, addr_b])
         .await
@@ -601,7 +620,15 @@ async fn subscribe_delivers_events_and_caught_up() {
     let (addr, state) = start_stub_server().await;
     state.lock().expect("stub 锁").subscribe_stream = Some(vec![
         Ok(SubscribeResponse {
-            payload: Some(subscribe_response::Payload::Event(sample_event(1))),
+            payload: Some(subscribe_response::Payload::Event(SubscriptionEvent {
+                stream_id: "s".into(),
+                version: 1,
+                event_id: vec![],
+                event_type: "T".into(),
+                data: vec![],
+                metadata: vec![],
+                hlc: None,
+            })),
         }),
         Ok(SubscribeResponse {
             payload: Some(subscribe_response::Payload::CaughtUp(Empty {})),
@@ -612,7 +639,7 @@ async fn subscribe_delivers_events_and_caught_up() {
         .await
         .expect("连接 stub");
     let mut stream = client
-        .subscribe(es_client::SubscribeTarget::Stream("s1".to_string()), 0, false)
+        .subscribe(es_client::SubscribeTarget::Streams(vec!["s1".to_string()]))
         .await
         .expect("订阅成功");
 
@@ -623,7 +650,10 @@ async fn subscribe_delivers_events_and_caught_up() {
     );
     let second = stream.next().await.expect("第二个响应").expect("无错误");
     assert!(
-        matches!(second.payload, Some(subscribe_response::Payload::CaughtUp(_))),
+        matches!(
+            second.payload,
+            Some(subscribe_response::Payload::CaughtUp(_))
+        ),
         "再收到 caught_up 分界信号"
     );
     assert!(stream.next().await.is_none(), "流结束");
@@ -633,19 +663,22 @@ async fn subscribe_delivers_events_and_caught_up() {
 async fn subscribe_stream_error_raised_without_resubscribe() {
     // 流内错误上抛，且订阅只发起一次（不自动重订阅）
     let (addr, state) = start_stub_server().await;
-    state.lock().expect("stub 锁").subscribe_stream = Some(vec![Err(Status::internal(
-        "订阅者落后，服务端关流",
-    ))]);
+    state.lock().expect("stub 锁").subscribe_stream =
+        Some(vec![Err(Status::internal("订阅者落后，服务端关流"))]);
 
     let mut client = es_client::EventStoreClient::connect(vec![addr])
         .await
         .expect("连接 stub");
     let mut stream = client
-        .subscribe(es_client::SubscribeTarget::All { shard_id: 0 }, 0, false)
+        .subscribe(es_client::SubscribeTarget::All)
         .await
         .expect("订阅建立成功");
 
-    let err = stream.next().await.expect("流内错误").expect_err("错误应上抛");
+    let err = stream
+        .next()
+        .await
+        .expect("流内错误")
+        .expect_err("错误应上抛");
     assert!(
         matches!(
             err,
@@ -664,14 +697,47 @@ async fn subscribe_stream_error_raised_without_resubscribe() {
 }
 
 #[tokio::test]
+async fn subscribe_establishment_fails_over_to_healthy_node() {
+    let (addr_b, state_b) = start_stub_server().await;
+    state_b.lock().expect("stub 锁").subscribe_stream = Some(vec![Ok(SubscribeResponse {
+        payload: Some(subscribe_response::Payload::CaughtUp(Empty {})),
+    })]);
+    let (addr_a, state_a) = start_stub_server().await;
+    state_a.lock().expect("stub 锁").subscribe_error = Some(Status::unavailable("节点 A 下线"));
+
+    let mut client = es_client::EventStoreClient::connect(vec![addr_a, addr_b])
+        .await
+        .expect("连接 stub");
+    let mut stream = client
+        .subscribe(es_client::SubscribeTarget::All)
+        .await
+        .expect("应轮换到健康节点");
+    assert!(matches!(
+        stream
+            .next()
+            .await
+            .expect("收到响应")
+            .expect("无流内错误")
+            .payload,
+        Some(subscribe_response::Payload::CaughtUp(_))
+    ));
+    assert_eq!(state_a.lock().expect("stub 锁").subscribe_calls, 1);
+    assert_eq!(state_b.lock().expect("stub 锁").subscribe_calls, 1);
+}
+
+#[tokio::test]
 async fn append_cluster_unreachable_distinguished() {
     // 节点 A 一直「leader unknown」（可达但选举中），节点 B 不可达（懒连接失败）：
     // 预算耗尽时带建连失败详情而非 NotLeader(None)——区分「集群不可达」与「选举中」
     let (addr_a, state_a) = start_stub_server().await;
     for _ in 0..3 {
-        state_a.lock().expect("stub 锁").append_queue.push_back(Err(
-            Status::unavailable("not leader; leader unknown, retry later"),
-        ));
+        state_a
+            .lock()
+            .expect("stub 锁")
+            .append_queue
+            .push_back(Err(Status::unavailable(
+                "not leader; leader unknown, retry later",
+            )));
     }
 
     let mut client = es_client::EventStoreClient::connect(vec![

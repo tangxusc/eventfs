@@ -106,7 +106,9 @@ impl TlsConfig {
             .map(|(name, _)| name)
             .collect();
         if !missing.is_empty() {
-            return Err(format!("[tls] cert_file/key_file 必须成对配置，缺少: {missing:?}"));
+            return Err(format!(
+                "[tls] cert_file/key_file 必须成对配置，缺少: {missing:?}"
+            ));
         }
         for (name, path) in [
             ("cert_file", self.cert_file.as_ref().unwrap()),
@@ -153,14 +155,17 @@ impl Config {
     /// - 每个 shard 的承载节点数（primary + replica 合计）恰等于 replication_factor
     pub fn validate(&self) -> Result<(), String> {
         if self.placement.nodes.is_empty() {
-            return Err("[placement] nodes 不能为空：必须显式列出每个节点承载的 shards".to_string());
+            return Err(
+                "[placement] nodes 不能为空：必须显式列出每个节点承载的 shards".to_string(),
+            );
         }
         if self.placement.replication_factor == 0 {
             return Err("[placement] replication_factor 必须 ≥ 1".to_string());
         }
 
         let mut node_ids = std::collections::HashSet::new();
-        let mut primary_owner: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+        let mut primary_owner: std::collections::HashMap<u64, u64> =
+            std::collections::HashMap::new();
         // shard -> 承载节点数（primary + replica 合计）
         let mut holders: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
 
@@ -237,6 +242,22 @@ impl Config {
                 es_core::limits::MAX_SNAPSHOT_CHUNK_BYTES
             ));
         }
+        if let Some(internal_addr) = &self.node.internal_listen_addr {
+            internal_addr
+                .parse::<std::net::SocketAddr>()
+                .map_err(|e| format!("[node] internal_listen_addr 非法（{internal_addr}）：{e}"))?;
+            if internal_addr == &self.node.listen_addr {
+                return Err("[node] internal_listen_addr 不能与 listen_addr 相同".to_string());
+            }
+        }
+        for peer in &self.node.peers {
+            if let Some(internal_addr) = &peer.internal_addr {
+                let uri = es_raft::normalize_endpoint(internal_addr);
+                tonic::transport::Endpoint::from_shared(uri.clone()).map_err(|e| {
+                    format!("node.peers 中节点 {} 内部地址 {uri} 非法：{e}", peer.id)
+                })?;
+            }
+        }
         if let Some(tls) = &self.tls {
             tls.validate()?;
         }
@@ -294,6 +315,13 @@ pub struct NodeConfig {
     /// gRPC 监听地址
     pub listen_addr: String,
 
+    /// 仅节点间内部订阅 RPC 的监听地址。
+    ///
+    /// 该端口必须由网络策略限制为集群节点可访问，避免将 shard 与 position
+    /// 等内部实现细节暴露给客户端。
+    #[serde(default)]
+    pub internal_listen_addr: Option<String>,
+
     /// Raft 集群节点列表 (node_id -> addr)。
     ///
     /// 可省略（单节点部署或手动组建路径）：缺省为空，不触发自动组建。
@@ -309,6 +337,10 @@ pub struct PeerConfig {
 
     /// gRPC 地址
     pub addr: String,
+
+    /// 对等节点内部订阅 RPC 地址。
+    #[serde(default)]
+    pub internal_addr: Option<String>,
 }
 
 /// 存储配置
@@ -379,6 +411,7 @@ impl Default for Config {
             node: NodeConfig {
                 id: 1,
                 listen_addr: "127.0.0.1:50051".to_string(),
+                internal_listen_addr: None,
                 peers: Vec::new(),
             },
             storage: StorageConfig {
@@ -449,10 +482,12 @@ mod tests {
             key_file: None,
             ca_file: Some(ca_path),
         };
-        assert!(matches!(
-            tls.client_trust(),
-            Ok(es_proto::tls::TlsClientConfig::Ca(ref pem)) if pem == b"ca-pem"
-        ));
+        match tls.client_trust().expect("读取 CA 信任策略") {
+            es_proto::tls::TlsClientConfig::Ca(pem) => assert_eq!(pem, b"ca-pem"),
+            es_proto::tls::TlsClientConfig::SkipVerify => {
+                panic!("配置 CA 后必须启用严格校验")
+            }
+        }
     }
 
     #[test]
@@ -505,14 +540,23 @@ mod tests {
         let dir = tempfile::tempdir().expect("临时目录");
         let cert = dir.path().join("cert.pem");
         let key = dir.path().join("key.pem");
+        let ca = dir.path().join("ca.pem");
         std::fs::write(&cert, b"c").expect("写 cert");
         std::fs::write(&key, b"k").expect("写 key");
-        let tls = TlsConfig {
-            cert_file: Some(cert),
-            key_file: Some(key),
+        let skip_verify = TlsConfig {
+            cert_file: Some(cert.clone()),
+            key_file: Some(key.clone()),
             ca_file: None,
         };
-        assert!(tls.validate().is_ok());
+        assert!(skip_verify.validate().is_ok());
+
+        std::fs::write(&ca, b"ca").expect("写 CA");
+        let strict = TlsConfig {
+            cert_file: Some(cert),
+            key_file: Some(key),
+            ca_file: Some(ca),
+        };
+        assert!(strict.validate().is_ok());
     }
 
     /// 构造一个合法放置表的配置（3 节点 rf=2 环形，6 个 shard 各由 2 节点承载）
@@ -521,10 +565,23 @@ mod tests {
             node: NodeConfig {
                 id: 1,
                 listen_addr: "127.0.0.1:50051".to_string(),
+                internal_listen_addr: None,
                 peers: vec![
-                    PeerConfig { id: 1, addr: "127.0.0.1:50051".into() },
-                    PeerConfig { id: 2, addr: "127.0.0.1:50052".into() },
-                    PeerConfig { id: 3, addr: "127.0.0.1:50053".into() },
+                    PeerConfig {
+                        id: 1,
+                        addr: "127.0.0.1:50051".into(),
+                        internal_addr: None,
+                    },
+                    PeerConfig {
+                        id: 2,
+                        addr: "127.0.0.1:50052".into(),
+                        internal_addr: None,
+                    },
+                    PeerConfig {
+                        id: 3,
+                        addr: "127.0.0.1:50053".into(),
+                        internal_addr: None,
+                    },
                 ],
             },
             storage: StorageConfig {
@@ -534,9 +591,21 @@ mod tests {
             placement: PlacementConfig {
                 replication_factor: 2,
                 nodes: vec![
-                    PlacementNode { id: 1, primary: vec![0, 1], replica: vec![2, 3] },
-                    PlacementNode { id: 2, primary: vec![2, 3], replica: vec![4, 5] },
-                    PlacementNode { id: 3, primary: vec![4, 5], replica: vec![0, 1] },
+                    PlacementNode {
+                        id: 1,
+                        primary: vec![0, 1],
+                        replica: vec![2, 3],
+                    },
+                    PlacementNode {
+                        id: 2,
+                        primary: vec![2, 3],
+                        replica: vec![4, 5],
+                    },
+                    PlacementNode {
+                        id: 3,
+                        primary: vec![4, 5],
+                        replica: vec![0, 1],
+                    },
                 ],
             },
             snapshot: Default::default(),
@@ -619,7 +688,10 @@ mod tests {
             let mut config = valid_config();
             config.storage.memtable_arena_bytes = bad;
             let err = config.validate().expect_err("arena 越界应报错");
-            assert!(err.contains("memtable_arena_bytes"), "错误应说明字段: {err}");
+            assert!(
+                err.contains("memtable_arena_bytes"),
+                "错误应说明字段: {err}"
+            );
         }
     }
 
@@ -690,7 +762,10 @@ mod tests {
             ..Default::default()
         };
         let err = config.validate().expect_err("max_event_bytes=0 应报错");
-        assert!(err.contains("max_event_bytes"), "错误应说明 max_event_bytes: {err}");
+        assert!(
+            err.contains("max_event_bytes"),
+            "错误应说明 max_event_bytes: {err}"
+        );
     }
 
     #[test]
@@ -798,6 +873,24 @@ mod tests {
     }
 
     #[test]
+    fn internal_listen_addr_must_be_distinct_and_valid() {
+        let mut config = valid_config();
+        config.node.internal_listen_addr = Some(config.node.listen_addr.clone());
+        let err = config.validate().expect_err("内部与公共端口相同必须拒绝");
+        assert!(
+            err.contains("internal_listen_addr"),
+            "错误应说明字段: {err}"
+        );
+
+        config.node.internal_listen_addr = Some("not-an-address".into());
+        let err = config.validate().expect_err("非法内部监听地址必须拒绝");
+        assert!(
+            err.contains("internal_listen_addr"),
+            "错误应说明字段: {err}"
+        );
+    }
+
+    #[test]
     fn limits_section_deserializes_defaults() {
         // [limits] 段整体缺省时使用默认值(1MiB / 7MiB)
         let config: Config = toml::from_str(
@@ -885,9 +978,6 @@ dir = "./snapshots"
             es_storage::snapshot::Compression::Lz4
         );
         assert_eq!(config.snapshot.keep, 5);
-        assert_eq!(
-            config.snapshot.dir,
-            Some(PathBuf::from("./snapshots"))
-        );
+        assert_eq!(config.snapshot.dir, Some(PathBuf::from("./snapshots")));
     }
 }

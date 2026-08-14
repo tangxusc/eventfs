@@ -80,10 +80,7 @@ impl EventStore for MockEventStore {
     type ReadAllStream = ReceiverStream<Result<ReadEventsResponse, Status>>;
     type SubscribeStream = ReceiverStream<Result<SubscribeResponse, Status>>;
 
-    async fn append(
-        &self,
-        _r: Request<AppendRequest>,
-    ) -> Result<Response<AppendResponse>, Status> {
+    async fn append(&self, _r: Request<AppendRequest>) -> Result<Response<AppendResponse>, Status> {
         // 剩余 unknown 次数 > 0 时消耗一次并返回 unknown；耗尽后（计数保持 0）成功
         let was_unknown = self
             .unknown_appends
@@ -91,7 +88,9 @@ impl EventStore for MockEventStore {
             .is_ok();
         if was_unknown {
             // 服务端选举中的真实提示（es-server service.rs client_write_to_status）
-            return Err(Status::unavailable("not leader; leader unknown, retry later"));
+            return Err(Status::unavailable(
+                "not leader; leader unknown, retry later",
+            ));
         }
         Ok(Response::new(AppendResponse {
             next_expected_version: 1,
@@ -178,7 +177,11 @@ impl RaftAdmin for MockAdmin {
         let leader = self.no_leader_rounds.fetch_sub(1, Ordering::SeqCst) == 0;
         Ok(Response::new(GetRaftStateResponse {
             node_id: 1,
-            server_state: if leader { "Leader".into() } else { "Follower".into() },
+            server_state: if leader {
+                "Leader".into()
+            } else {
+                "Follower".into()
+            },
             is_leader: leader,
             has_leader: leader,
             current_leader: if leader { 1 } else { 0 },
@@ -262,7 +265,19 @@ async fn with_leader_unknown_backoff_retry_ok() {
     let live = serve_event_store(mock.clone()).await;
 
     // append 走 with_leader；--shards 1 跳过分片探测（mock 无管理面）
-    let (code, out, err) = esctl(&live, &["--shards", "1", "append", "s/x", "--event-type", "T", "--data", "d"]);
+    let (code, out, err) = esctl(
+        &live,
+        &[
+            "--shards",
+            "1",
+            "append",
+            "s/x",
+            "--event-type",
+            "T",
+            "--data",
+            "d",
+        ],
+    );
     assert_eq!(code, Some(0), "leader-unknown 重试后应成功：{err} {out}");
     assert_eq!(
         mock.unknown_appends.load(Ordering::SeqCst),
@@ -302,7 +317,7 @@ async fn with_admin_leader_probe_fail_retry_ok() {
 async fn watch_once_not_caught_up_exit_code_1() {
     let live = serve_event_store(MockEventStore::default()).await;
 
-    let (code, _out, err) = esctl(&live, &["watch", "s", "--once", "--from-start"]);
+    let (code, _out, err) = esctl(&live, &["watch", "--stream", "s", "--once"]);
     assert_eq!(code, Some(1), "未追平必须退出码 1：{err}");
     assert!(err.contains("caught_up"), "错误应说明未收到追平信号：{err}");
 }

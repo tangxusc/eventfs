@@ -101,7 +101,15 @@ async fn migrate_stream(
                         dry_run: true,
                     });
                 }
-                return complete_migration(ctx, stream, residual, dst_shard, drain_quiet_rounds, drain_timeout).await;
+                return complete_migration(
+                    ctx,
+                    stream,
+                    residual,
+                    dst_shard,
+                    drain_quiet_rounds,
+                    drain_timeout,
+                )
+                .await;
             }
             None => {
                 eprintln!("流 {stream} 已在分片 {dst_shard}，无残留数据，无需迁移");
@@ -192,7 +200,15 @@ async fn migrate_stream(
     eprintln!("已切换路由：{stream} → shard {dst_shard}");
 
     // ---- Draining / Verifying / Finalizing ----
-    complete_migration(ctx, stream, src_shard, dst_shard, drain_quiet_rounds, drain_timeout).await
+    complete_migration(
+        ctx,
+        stream,
+        src_shard,
+        dst_shard,
+        drain_quiet_rounds,
+        drain_timeout,
+    )
+    .await
 }
 
 /// 迁移收尾（Drain → Verify → Finalize）。切换后与「重跑自愈」共用。
@@ -226,9 +242,7 @@ async fn complete_migration(
             copy_range(ctx, stream, src_shard, dst_shard, from, s, true).await?;
         }
         if std::time::Instant::now() >= deadline {
-            bail!(
-                "排水超时（源仍在产生数据或广播未收敛）：可重跑本命令完成排水（数据无害）"
-            );
+            bail!("排水超时（源仍在产生数据或广播未收敛）：可重跑本命令完成排水（数据无害）");
         }
         tokio::time::sleep(DRAIN_POLL).await;
     }
@@ -254,7 +268,16 @@ async fn complete_migration(
         .map(|m| m.current_version)
         .unwrap_or(0);
     if s_after > d_after {
-        copy_range(ctx, stream, src_shard, dst_shard, d_after + 1, s_after, true).await?;
+        copy_range(
+            ctx,
+            stream,
+            src_shard,
+            dst_shard,
+            d_after + 1,
+            s_after,
+            true,
+        )
+        .await?;
     }
     delete_from_shard(ctx, src_shard, stream).await?;
 
@@ -450,7 +473,10 @@ async fn delete_from_shard(ctx: &Ctx, shard: u64, stream: &str) -> Result<()> {
 
 /// 切换路由（任意节点执行，版本仲裁收敛）
 async fn set_stream_shard(ctx: &Ctx, stream: &str, shard: u64) -> Result<()> {
-    let mut client = ctx.cluster.migration_client(&ctx.cluster.pick_endpoint()).await?;
+    let mut client = ctx
+        .cluster
+        .migration_client(&ctx.cluster.pick_endpoint())
+        .await?;
     client
         .set_stream_shard(SetStreamShardRequest {
             stream_id: stream.to_string(),
@@ -521,11 +547,7 @@ async fn find_stream_shard(ctx: &Ctx, stream: &str) -> Result<Option<u64>> {
 }
 
 /// 枚举分片查找流所在 shard，排除指定 shard
-async fn find_stream_shard_excluding(
-    ctx: &Ctx,
-    stream: &str,
-    exclude: u64,
-) -> Result<Option<u64>> {
+async fn find_stream_shard_excluding(ctx: &Ctx, stream: &str, exclude: u64) -> Result<Option<u64>> {
     let scope = ctx.shards().await?;
     for shard in scope.all_ids() {
         if shard == exclude {
@@ -583,7 +605,11 @@ pub(crate) fn render_report(r: &MigrateReport, format: Format) -> String {
                 r.src_shard.to_string(),
                 r.dst_shard.to_string(),
                 r.copied.to_string(),
-                if r.dry_run { "dry-run".into() } else { "done".into() },
+                if r.dry_run {
+                    "dry-run".into()
+                } else {
+                    "done".into()
+                },
             ]];
             output::render_table(&["STREAM", "FROM", "TO", "EVENTS", "STATUS"], &rows)
         }
@@ -615,7 +641,15 @@ async fn migrate_shard(
     let mut reports = Vec::new();
     let mut failed = 0;
     for s in &streams {
-        match migrate_stream(ctx, s, dst_shard, dry_run, drain_quiet_rounds, drain_timeout).await
+        match migrate_stream(
+            ctx,
+            s,
+            dst_shard,
+            dry_run,
+            drain_quiet_rounds,
+            drain_timeout,
+        )
+        .await
         {
             Ok(r) => reports.push(r),
             Err(e) => {
@@ -635,15 +669,17 @@ pub async fn run(ctx: &Ctx, args: &MigrateArgs) -> Result<()> {
 
     let reports = match (&args.stream, args.shard) {
         (Some(stream), _) => {
-            vec![migrate_stream(
-                ctx,
-                stream,
-                args.to,
-                args.dry_run,
-                args.drain_quiet_rounds,
-                drain_timeout,
-            )
-            .await?]
+            vec![
+                migrate_stream(
+                    ctx,
+                    stream,
+                    args.to,
+                    args.dry_run,
+                    args.drain_quiet_rounds,
+                    drain_timeout,
+                )
+                .await?,
+            ]
         }
         (None, Some(shard)) => {
             if shard == args.to {
@@ -674,3 +710,94 @@ pub async fn run(ctx: &Ctx, args: &MigrateArgs) -> Result<()> {
 // 以下类型只用于对齐 proto 导入（rustfmt 友好）
 #[allow(unused)]
 fn _type_alignment(_: TlsClientConfig) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::GlobalArgs;
+    use crate::client::ClusterClient;
+
+    fn report(dry_run: bool) -> MigrateReport {
+        MigrateReport {
+            stream: "orders-1".into(),
+            src_shard: 2,
+            dst_shard: 5,
+            copied: 3,
+            dry_run,
+        }
+    }
+
+    fn context() -> Ctx {
+        let endpoint = "http://127.0.0.1:1".to_string();
+        let cluster = ClusterClient::new(
+            std::slice::from_ref(&endpoint),
+            None,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .expect("构造惰性客户端");
+        Ctx::new(
+            cluster,
+            GlobalArgs {
+                endpoints: vec![endpoint],
+                dial_timeout: 1,
+                timeout: 1,
+                cacert: None,
+                insecure_skip_tls_verify: false,
+                write_out: Format::Simple,
+                shards: None,
+            },
+        )
+    }
+
+    #[test]
+    fn expected_versions_cover_new_and_existing_streams() {
+        assert!(matches!(
+            expected_version_of(0).kind,
+            Some(expected_version::Kind::NoStream(_))
+        ));
+        assert!(matches!(
+            expected_version_of(7).kind,
+            Some(expected_version::Kind::Exact(6))
+        ));
+    }
+
+    #[test]
+    fn report_rendering_preserves_dry_run_state_in_all_formats() {
+        let dry = report(true);
+        let completed = report(false);
+        assert!(render_report(&dry, Format::Simple).contains("dry-run"));
+        assert!(render_report(&completed, Format::Simple).contains("3 条事件"));
+        assert!(render_report(&dry, Format::Table).contains("dry-run"));
+        assert!(render_report(&completed, Format::Table).contains("done"));
+        assert!(render_report(&dry, Format::Json).contains("\"dry_run\":true"));
+    }
+
+    #[tokio::test]
+    async fn run_rejects_missing_or_identical_migration_scope() {
+        let ctx = context();
+        let missing = MigrateArgs {
+            stream: None,
+            shard: None,
+            to: 1,
+            dry_run: false,
+            drain_quiet_rounds: 1,
+            drain_timeout_secs: 1,
+        };
+        let err = run(&ctx, &missing).await.expect_err("缺少范围应失败");
+        assert!(err.to_string().contains("必须指定"), "{err}");
+
+        let same_shard = MigrateArgs {
+            stream: None,
+            shard: Some(1),
+            to: 1,
+            dry_run: false,
+            drain_quiet_rounds: 1,
+            drain_timeout_secs: 1,
+        };
+        let err = run(&ctx, &same_shard)
+            .await
+            .expect_err("相同源目标分片应失败");
+        assert!(err.to_string().contains("相同"), "{err}");
+    }
+}

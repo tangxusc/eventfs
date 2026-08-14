@@ -138,23 +138,56 @@ message ReadEventsResponse {
   repeated ShardPosition next_positions = 2;
 }
 
+// 公共订阅目标：客户端只面向 stream，不感知内部 shard。
+message SubscribeStreams {
+  repeated string stream_ids = 1;
+}
+
 message SubscribeRequest {
   oneof target {
-    string stream_id = 1; // 订阅单个流
-    Empty all = 2;        // 订阅全部分片
+    SubscribeStreams streams = 1; // 订阅一个或多个 stream
+    Empty all = 2;               // 订阅当前集群全部 stream
   }
-  // 起始位置：订阅流时按 version，订阅 all 时按 position
-  uint64 from_exclusive = 3;
-  // true 表示从头开始，忽略 from_exclusive
-  bool from_start = 4;
-  // 仅 target=all 时有意义：订阅哪个分片的 $all，默认 0（与历史行为一致）
-  uint64 shard_id = 5;
+}
+
+// 订阅公开事件：不暴露内部 shard 或分片 position。
+message SubscriptionEvent {
+  string stream_id = 1;
+  uint64 version = 2;
+  bytes event_id = 3;
+  string event_type = 4;
+  bytes data = 5;
+  bytes metadata = 6;
+  Hlc hlc = 7;
 }
 
 message SubscribeResponse {
   oneof payload {
-    Event event = 1;
+    SubscriptionEvent event = 1;
     // catch-up 阶段结束、转入实时推送的分界信号
+    Empty caught_up = 2;
+    // 部分内部来源不可用；不包含 shard、节点或路由细节。
+    Empty degraded = 3;
+  }
+}
+
+// ============================================================================
+// InternalSubscription：节点间分片订阅转发，绝不作为客户端契约使用。
+// ============================================================================
+
+service InternalSubscription {
+  rpc SubscribeInternal(InternalSubscribeRequest) returns (stream InternalSubscribeResponse);
+}
+
+message InternalSubscribeRequest {
+  uint64 shard_id = 1;
+  // 空列表表示该 shard 内全部 stream；否则只推送列出的 stream。
+  repeated string stream_ids = 2;
+}
+
+message InternalSubscribeResponse {
+  oneof payload {
+    Event event = 1;
     Empty caught_up = 2;
   }
 }

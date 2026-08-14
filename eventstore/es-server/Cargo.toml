@@ -42,3 +42,4 @@ notify = "7"
 tempfile = { workspace = true }
 proptest = { workspace = true }
 rcgen = { workspace = true }
+libc = { workspace = true }

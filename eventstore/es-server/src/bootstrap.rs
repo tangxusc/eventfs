@@ -13,16 +13,16 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use openraft::error::{InitializeError, RaftError};
 use openraft::BasicNode;
+use openraft::error::{InitializeError, RaftError};
 use tokio::time::sleep;
 use tonic::transport::Channel;
 use uuid::Uuid;
 
-use es_proto::eventstore::raft_admin_client::RaftAdminClient;
 use es_proto::eventstore::GetRaftStateRequest;
-use es_proto::tls::{apply_endpoint_tls, TlsClientConfig};
-use es_raft::{normalize_endpoint, Shard, ShardManager};
+use es_proto::eventstore::raft_admin_client::RaftAdminClient;
+use es_proto::tls::{TlsClientConfig, apply_endpoint_tls};
+use es_raft::{Shard, ShardManager, normalize_endpoint};
 
 use crate::config::Config;
 
@@ -206,7 +206,8 @@ pub(crate) async fn bootstrap_shard(
     clients: Arc<BTreeMap<u64, RaftAdminClient<Channel>>>,
     self_id: u64,
     sm: Arc<ShardManager>,
-) {    let shard = match sm.get_shard(shard_id).await {
+) {
+    let shard = match sm.get_shard(shard_id).await {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(shard_id, "取分片失败：{e}");
@@ -304,7 +305,11 @@ async fn probe(
     self_id: u64,
     shard_id: u64,
 ) -> ProbeOutcome {
-    let peers: Vec<u64> = members.keys().copied().filter(|&id| id != self_id).collect();
+    let peers: Vec<u64> = members
+        .keys()
+        .copied()
+        .filter(|&id| id != self_id)
+        .collect();
 
     let mut unreachable_peers = Vec::new();
     for _ in 0..PROBE_ATTEMPTS {
@@ -315,11 +320,17 @@ async fn probe(
                 Some(c) => c.clone(), // Channel 是 Arc，克隆廉价
                 None => continue,
             };
-            match client.get_raft_state(GetRaftStateRequest { shard_id }).await {
+            match client
+                .get_raft_state(GetRaftStateRequest { shard_id })
+                .await
+            {
                 Ok(resp) => {
                     let r = resp.into_inner();
                     if (r.has_last_log_index && r.last_log_index > 0) || !r.voter_ids.is_empty() {
-                        return ProbeOutcome::ClusterExists { at: pid, voters: r.voter_ids };
+                        return ProbeOutcome::ClusterExists {
+                            at: pid,
+                            voters: r.voter_ids,
+                        };
                     }
                     // 该 peer 未初始化，继续看下一个
                 }
@@ -437,11 +448,13 @@ mod tests {
             node: crate::config::NodeConfig {
                 id: 1,
                 listen_addr: "127.0.0.1:50051".to_string(),
+                internal_listen_addr: None,
                 peers: peers
                     .into_iter()
                     .map(|(id, addr)| crate::config::PeerConfig {
                         id,
                         addr: addr.to_string(),
+                        internal_addr: None,
                     })
                     .collect(),
             },
@@ -471,9 +484,24 @@ mod tests {
             (3, "127.0.0.1:50053"),
         ]);
         let all: BTreeMap<u64, BasicNode> = BTreeMap::from([
-            (1u64, BasicNode { addr: "http://127.0.0.1:50051".into() }),
-            (2u64, BasicNode { addr: "http://127.0.0.1:50052".into() }),
-            (3u64, BasicNode { addr: "http://127.0.0.1:50053".into() }),
+            (
+                1u64,
+                BasicNode {
+                    addr: "http://127.0.0.1:50051".into(),
+                },
+            ),
+            (
+                2u64,
+                BasicNode {
+                    addr: "http://127.0.0.1:50052".into(),
+                },
+            ),
+            (
+                3u64,
+                BasicNode {
+                    addr: "http://127.0.0.1:50053".into(),
+                },
+            ),
         ]);
         // 放置表只承载 shard 0（node1）：members 子集只含 node1
         let m = shard_members_map(&all, &cfg, 0);
@@ -510,10 +538,7 @@ mod tests {
 
     #[test]
     fn self_in_peers_bootstrap_with_normalized_addr() {
-        let cfg = config_with_peers(vec![
-            (1, "127.0.0.1:50051"),
-            (2, "http://127.0.0.1:50052"),
-        ]);
+        let cfg = config_with_peers(vec![(1, "127.0.0.1:50051"), (2, "http://127.0.0.1:50052")]);
         match decide_mode(&cfg) {
             Ok(BootstrapMode::Bootstrap(members)) => {
                 assert_eq!(members.len(), 2);
@@ -525,18 +550,82 @@ mod tests {
         }
     }
 
+    #[test]
+    fn voter_ids_must_match_configured_members() {
+        let members = BTreeMap::from([
+            (
+                1u64,
+                BasicNode {
+                    addr: "http://127.0.0.1:1".into(),
+                },
+            ),
+            (
+                2u64,
+                BasicNode {
+                    addr: "http://127.0.0.1:2".into(),
+                },
+            ),
+        ]);
+        assert!(same_ids(&[2, 1], members.keys()));
+        assert!(!same_ids(&[1, 3], members.keys()));
+    }
+
+    #[tokio::test]
+    async fn peer_readiness_distinguishes_reachable_and_timed_out_endpoints() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定可达端口");
+        let reachable = format!("http://{}", listener.local_addr().expect("取端口"));
+        assert!(
+            wait_peers_ready(&[reachable], Duration::from_secs(1)).await,
+            "监听中的端口应被判定为就绪"
+        );
+        drop(listener);
+
+        let unavailable = "127.0.0.1:1".to_string();
+        assert!(
+            !wait_peers_ready(&[unavailable], Duration::ZERO).await,
+            "无监听端口在零超时时应判定为未就绪"
+        );
+    }
+
+    #[test]
+    fn build_clients_rejects_invalid_member_endpoint() {
+        let members = BTreeMap::from([(
+            1u64,
+            BasicNode {
+                addr: "http://[::1".into(),
+            },
+        )]);
+        let err = build_clients(&members, None).expect_err("非法 URI 不应构造客户端");
+        assert!(err.contains("地址"), "错误应标明地址问题：{err}");
+    }
+
     #[tokio::test]
     async fn build_clients_bad_ca_non_blocking() {
-        let members = BTreeMap::from([(1u64, BasicNode { addr: "https://127.0.0.1:1".into() })]);
+        let members = BTreeMap::from([(
+            1u64,
+            BasicNode {
+                addr: "https://127.0.0.1:1".into(),
+            },
+        )]);
         // tonic 的 Certificate::from_pem 构造时不解析，CA 解析延迟到握手时
         // （TlsConnector::new）——构建阶段不报错；握手失败由 es-proto tls 测试覆盖
         let tls = TlsClientConfig::Ca(vec![b'x'; 8]);
-        assert!(build_clients(&members, Some(&tls)).is_ok(), "坏 CA 应延迟到握手报错");
+        assert!(
+            build_clients(&members, Some(&tls)).is_ok(),
+            "坏 CA 应延迟到握手报错"
+        );
     }
 
     #[tokio::test]
     async fn build_clients_https_no_policy_skip_verify() {
-        let members = BTreeMap::from([(1u64, BasicNode { addr: "https://127.0.0.1:1".into() })]);
+        let members = BTreeMap::from([(
+            1u64,
+            BasicNode {
+                addr: "https://127.0.0.1:1".into(),
+            },
+        )]);
         // 无信任策略：https 端点默认跳过校验，构建成功（connect_lazy 无 I/O）
         let clients = build_clients(&members, None).expect("应成功");
         assert_eq!(clients.len(), 1);
@@ -554,5 +643,42 @@ mod tests {
         let sm = Arc::new(ShardManager::new(1, 1));
         // 不 panic 即通过；ca 读取失败绝不静默降级为跳过校验
         crate::bootstrap::run(&cfg, sm).await;
+    }
+
+    #[tokio::test]
+    async fn run_accepts_ready_https_peer_without_tls() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定就绪 peer 端口");
+        let addr = format!("https://{}", listener.local_addr().expect("读取 peer 地址"));
+        let mut cfg = config_with_peers(vec![(1, &addr)]);
+        // 空承载集合让本测试只验证连接策略，不触发实际 shard 自举。
+        cfg.placement.nodes[0].primary.clear();
+
+        run(&cfg, Arc::new(ShardManager::new(1, 1))).await;
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn run_skips_disabled_wait_only_and_invalid_configurations() {
+        let disabled = config_with_peers(vec![]);
+        run(&disabled, Arc::new(ShardManager::new(1, 1))).await;
+
+        let wait_only = config_with_peers(vec![(2, "127.0.0.1:50052")]);
+        run(&wait_only, Arc::new(ShardManager::new(1, 1))).await;
+
+        let invalid = config_with_peers(vec![(1, "127.0.0.1:50051"), (1, "127.0.0.1:50052")]);
+        run(&invalid, Arc::new(ShardManager::new(1, 1))).await;
+    }
+
+    #[tokio::test]
+    async fn dynamic_bootstrap_skips_unassigned_or_missing_local_shard() {
+        let config = config_with_peers(vec![]);
+        let manager = Arc::new(ShardManager::new(1, 1));
+
+        // 未配置 peers 时成员集为空，动态 shard 不应尝试网络自举。
+        bootstrap_new_shard(&config, manager.clone(), 0).await;
+        // 创建尚未完成时收到重复事件，取不到 shard 必须安全返回。
+        bootstrap_shard(0, BTreeMap::new(), Arc::new(BTreeMap::new()), 1, manager).await;
     }
 }

@@ -7,6 +7,8 @@
 use std::collections::HashMap;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 /// 测试集群：3 个节点、1 个分片（手动组建路径）
 struct TestCluster {
@@ -65,6 +67,26 @@ fn spawn_node(config_path: &std::path::Path) -> Child {
         .expect("启动节点进程（先 cargo build --bin eventstored）")
 }
 
+/// 优雅回收节点进程，保证覆盖率运行时子进程能写出 profile。
+fn terminate_node_process(process: &mut Child) {
+    #[cfg(unix)]
+    {
+        // SIGTERM 会触发服务端 flush WAL 与 LLVM profile；超时后才强制回收。
+        let _ = unsafe { libc::kill(process.id() as libc::pid_t, libc::SIGTERM) };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match process.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(_) => break,
+            }
+        }
+    }
+
+    let _ = process.kill();
+    let _ = process.wait();
+}
+
 /// 轮询端口可连（进程真正就绪）
 async fn wait_for_port(port: u16, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -82,8 +104,7 @@ async fn wait_for_port(port: u16, timeout: Duration) -> bool {
 impl Drop for TestCluster {
     fn drop(&mut self) {
         for node in self.nodes.values_mut() {
-            let _ = node.process.kill();
-            let _ = node.process.wait();
+            terminate_node_process(&mut node.process);
         }
     }
 }
@@ -171,6 +192,21 @@ fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
+/// 等待指定节点读到已提交事件，避免异步复制尚未 apply 时产生竞态失败。
+async fn wait_for_replicated_read(cluster: &TestCluster, node_id: u64, stream: &str) -> Output {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let out = esctl(&cluster.addr_of(node_id), &["read", stream]);
+        if out.status.success() {
+            return out;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("等待 node{node_id} 复制流 {stream} 超时: {}", err(&out));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "需启动多个真实进程，耗时较长"]
 async fn three_node_bootstrap_replicate_membership() {
@@ -231,8 +267,11 @@ async fn three_node_bootstrap_replicate_membership() {
     );
     assert!(out.status.success(), "append 失败: {}", err(&out));
 
-    let out = esctl(&cluster.addr_of(3), &["read", "orders/1"]);
-    assert!(out.status.success(), "从 node3 读失败: {}", err(&out));
+    // 手动组建配置不含 peers，路由表不会自动广播；为 node3 建立相同路由后
+    // 才能验证它读取的是复制数据，而不是因本地路由缺失失败。
+    let out = esctl(&cluster.addr_of(3), &["create-stream", "orders/1"]);
+    assert!(out.status.success(), "为 node3 建流失败: {}", err(&out));
+    let out = wait_for_replicated_read(&cluster, 3, "orders/1").await;
     assert!(stdout(&out).contains("[OrderPlaced]"), "{}", stdout(&out));
 
     // 5. member remove node3：voters 变 [1,2]

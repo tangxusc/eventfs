@@ -1,14 +1,14 @@
 //! 服务器主结构。
 
-use std::sync::Arc;
 use anyhow::Result;
+use std::sync::Arc;
 
-use es_raft::{ShardManager, Shard};
 use crate::config::Config;
 use crate::factory;
 use crate::migration_service::MigrationService;
 use crate::route_table::{RouteTableManager, routes_path};
 use crate::service::EsService;
+use es_raft::{Shard, ShardManager};
 
 /// EventStore 服务器
 pub struct Server {
@@ -29,10 +29,7 @@ impl Server {
         // register_shard 的上界校验据此保持有效。
         let shard_count = config.shard_count();
 
-        let shard_manager = Arc::new(ShardManager::new(
-            config.node.id,
-            shard_count,
-        ));
+        let shard_manager = Arc::new(ShardManager::new(config.node.id, shard_count));
 
         // 路由表：{data_dir}/routes.json（专门文件 + 热更新）
         let route_table = Arc::new(
@@ -129,7 +126,8 @@ impl Server {
 
     /// 启动 gRPC 服务器。
     ///
-    /// 三个服务共用一个端口：客户端 API、Raft 节点间 RPC、集群管理 API。
+    /// 公共端口提供客户端 API、Raft 节点间 RPC 与集群管理 API；内部订阅 RPC
+    /// 仅在 `node.internal_listen_addr` 配置的专用端口监听。
     /// 配置 [tls] 时以 TLS（https）监听，否则明文。
     pub async fn serve(&self) -> Result<()> {
         let addr: std::net::SocketAddr = self.config.node.listen_addr.parse()?;
@@ -142,22 +140,27 @@ impl Server {
         .map_err(anyhow::Error::msg)?;
         let raft_service = es_raft::RaftRpcService::new(self.shard_manager.clone());
         let admin_service = es_raft::RaftAdminService::new(self.shard_manager.clone());
-        let migration_service = MigrationService::new(self.route_table.clone(), self.shard_manager.clone());
+        let migration_service =
+            MigrationService::new(self.route_table.clone(), self.shard_manager.clone());
 
-        let mut server = tonic::transport::Server::builder();
+        let mut public_server = tonic::transport::Server::builder();
         // tls_config 必须在 add_service 之前
         if let Some(tls) = &self.config.tls {
             let cert = std::fs::read(tls.cert_file.as_ref().unwrap())?;
             let key = std::fs::read(tls.key_file.as_ref().unwrap())?;
             let identity = tonic::transport::Identity::from_pem(cert, key);
-            server = server
+            public_server = public_server
                 .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))?;
         }
 
         tracing::info!(
             "gRPC 服务监听 {}（TLS: {}）",
             addr,
-            if self.config.tls.is_some() { "https" } else { "http" }
+            if self.config.tls.is_some() {
+                "https"
+            } else {
+                "http"
+            }
         );
 
         // 系统级 8MB 消息契约（es_proto::limits::MAX_GRPC_MESSAGE_SIZE）：
@@ -168,32 +171,59 @@ impl Server {
         //   PayloadTooLarge 拆小重试（可自愈），无需依赖这里的上限兜底。
         // tonic 0.14 中该限制在服务级配置；编码方向同样显式设置，
         // 与客户端解码上限对齐。
-        let event_store = es_proto::eventstore::event_store_server::EventStoreServer::new(
-            es_service,
-        )
-        .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
-        .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE);
+        let event_store =
+            es_proto::eventstore::event_store_server::EventStoreServer::new(es_service.clone())
+                .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
+                .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE);
         let raft_rpc = es_proto::eventstore::raft_rpc_server::RaftRpcServer::new(raft_service)
             .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
             .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE);
-        let raft_admin = es_proto::eventstore::raft_admin_server::RaftAdminServer::new(
-            admin_service,
-        )
-        .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
-        .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE);
-        let migration = es_proto::eventstore::migration_server::MigrationServer::new(
-            migration_service,
-        )
-        .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
-        .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE);
-
-        server
+        let raft_admin =
+            es_proto::eventstore::raft_admin_server::RaftAdminServer::new(admin_service)
+                .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
+                .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE);
+        let migration =
+            es_proto::eventstore::migration_server::MigrationServer::new(migration_service)
+                .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
+                .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE);
+        let public_server = public_server
             .add_service(event_store)
             .add_service(raft_rpc)
             .add_service(raft_admin)
-            .add_service(migration)
-            .serve(addr)
-            .await?;
+            .add_service(migration);
+
+        match &self.config.node.internal_listen_addr {
+            Some(internal_addr) => {
+                let internal_addr: std::net::SocketAddr = internal_addr.parse()?;
+                let internal_subscription = es_proto::eventstore::internal_subscription_server::InternalSubscriptionServer::new(es_service)
+                    .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
+                    .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE);
+                let mut internal_server = tonic::transport::Server::builder();
+                if let Some(tls) = &self.config.tls {
+                    let cert = std::fs::read(tls.cert_file.as_ref().unwrap())?;
+                    let key = std::fs::read(tls.key_file.as_ref().unwrap())?;
+                    let identity = tonic::transport::Identity::from_pem(cert, key);
+                    internal_server = internal_server
+                        .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))?;
+                }
+                tracing::info!(
+                    "内部订阅服务监听 {}（TLS: {}）",
+                    internal_addr,
+                    if self.config.tls.is_some() {
+                        "https"
+                    } else {
+                        "http"
+                    }
+                );
+                tokio::try_join!(
+                    public_server.serve(addr),
+                    internal_server
+                        .add_service(internal_subscription)
+                        .serve(internal_addr),
+                )?;
+            }
+            None => public_server.serve(addr).await?,
+        }
 
         Ok(())
     }

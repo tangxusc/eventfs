@@ -81,6 +81,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # ---- 测试 ----
 tempfile = "3.14"
 proptest = "1.5"
+libc = "0.2"
 
 # 磁盘空间有限：只保留行号表，backtrace 仍能定位到文件与行号，
 # 体积远小于完整调试信息。profile.test 继承 dev。
