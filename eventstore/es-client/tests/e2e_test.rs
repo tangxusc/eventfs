@@ -94,7 +94,14 @@ async fn start_test_server_with_limits(
     .expect("创建服务");
     let handle = tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
-            .add_service(es_proto::eventstore::event_store_server::EventStoreServer::new(service))
+            .add_service(es_proto::eventstore::event_store_server::EventStoreServer::new(
+                service.clone(),
+            ))
+            .add_service(
+                es_proto::eventstore::persistent_subscriptions_server::PersistentSubscriptionsServer::new(
+                    service,
+                ),
+            )
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await;
     });
@@ -103,6 +110,103 @@ async fn start_test_server_with_limits(
     wait_server_ready(&addr, Duration::from_secs(10)).await;
 
     (addr, handle, server, dir)
+}
+
+#[tokio::test]
+async fn persistent_subscription_sdk_fetch_and_ack() {
+    use es_proto::eventstore::persistent_subscription_target::Target;
+    use es_proto::eventstore::*;
+
+    let (addr, _handle, _server, _dir) = start_test_server().await;
+    let mut events = EventStoreClient::connect(vec![addr.clone()])
+        .await
+        .expect("连接事件服务");
+    append_one(&mut events, "sdk-persistent", 7).await;
+
+    let mut subscriptions = es_client::PersistentSubscriptionsClient::connect(vec![addr])
+        .await
+        .expect("连接持久化订阅服务");
+    let created = subscriptions
+        .create(CreatePersistentSubscriptionRequest {
+            name: "sdk-workers".into(),
+            target: Some(PersistentSubscriptionTarget {
+                target: Some(Target::Streams(SubscribeStreams {
+                    stream_ids: vec!["sdk-persistent".into()],
+                })),
+            }),
+            start: None,
+            settings: None,
+        })
+        .await
+        .expect("SDK 创建组");
+    assert_eq!(subscriptions.get("sdk-workers").await.unwrap(), created);
+    assert_eq!(subscriptions.list().await.unwrap(), vec![created.clone()]);
+    let updated = subscriptions
+        .update(UpdatePersistentSubscriptionRequest {
+            name: "sdk-workers".into(),
+            expected_revision: created.revision,
+            target: None,
+            settings: Some(PersistentSubscriptionSettings {
+                max_unacked_per_consumer: 2,
+                max_unacked_per_group: 2,
+                ack_timeout_ms: 1_000,
+                max_retries: 1,
+                retry_min_ms: 1,
+                retry_max_ms: 1,
+            }),
+            resets: vec![],
+        })
+        .await
+        .expect("SDK 更新组");
+    assert_eq!(updated.revision, created.revision + 1);
+    let fetched = subscriptions
+        .fetch(FetchPersistentSubscriptionRequest {
+            name: "sdk-workers".into(),
+            consumer_id: "sdk-consumer".into(),
+            max_events: 1,
+            max_bytes: 1024,
+            wait_ms: 1,
+        })
+        .await
+        .expect("SDK 拉取");
+    assert_eq!(fetched.deliveries.len(), 1);
+    let delivery = &fetched.deliveries[0];
+    let settled = subscriptions
+        .settle(SettlePersistentSubscriptionRequest {
+            name: "sdk-workers".into(),
+            consumer_id: "sdk-consumer".into(),
+            group_epoch: delivery.group_epoch,
+            settlements: vec![PersistentSettlement {
+                delivery_id: delivery.delivery_id.clone(),
+                action: PersistentSettlementAction::PersistentSettlementPark as i32,
+                reason: "sdk park".into(),
+            }],
+        })
+        .await
+        .expect("SDK 确认");
+    assert_eq!(
+        settled.results[0].status,
+        PersistentSettlementStatus::PersistentSettlementApplied as i32
+    );
+    let parked = subscriptions
+        .list_parked(ListParkedPersistentSubscriptionRequest {
+            name: "sdk-workers".into(),
+            offset: 0,
+            limit: 10,
+        })
+        .await
+        .expect("SDK 查询 parked");
+    assert_eq!(parked.events.len(), 1);
+    assert_eq!(subscriptions.replay_parked("sdk-workers").await.unwrap(), 1);
+    let revision = subscriptions.get("sdk-workers").await.unwrap().revision;
+    subscriptions
+        .delete(DeletePersistentSubscriptionRequest {
+            name: "sdk-workers".into(),
+            expected_revision: revision,
+        })
+        .await
+        .expect("SDK 删除组");
+    assert!(subscriptions.list().await.unwrap().is_empty());
 }
 
 /// 轮询建连直到 gRPC 服务器就绪或超时。

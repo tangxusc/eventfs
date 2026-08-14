@@ -67,6 +67,7 @@ async fn run(cli: Cli) -> Result<()> {
                 commands::snapshot::run_restore(ctx.format, &args).await
             }
         },
+        Command::Persistent(a) => commands::persistent::run(&ctx, &a.action).await,
     }
 }
 

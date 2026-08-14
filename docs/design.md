@@ -502,6 +502,35 @@ peer 时对比其 voter_ids 与本节点配置，不一致即告警，且要求�
 发送一次 `caught_up`。来源广播落后、连接失败或关闭时，聚合器发送不含内部细节的
 `degraded` 状态并继续健康来源；`--once` 场景以退出码 1 报错。
 
+#### 7.4.1 持久化拉取订阅
+
+`PersistentSubscriptions` 是独立公共 service。组目标可以是显式 Stream 集合或 `$all`；
+客户端只看到 `(stream_id, version)` 事件与 opaque delivery ID，不看到 shard/position。
+control Shard leader 通过 Raft 串行提交 Create/Replace/Delete、Claim、Settle、Expire 和
+ReplayParked，状态机以每组一个 key 原子持久化 checkpoint、Stream lease、未确认
+delivery、退避重试与 parked 引用。事件 payload 仍只保存在数据 Shard。
+
+消费采用 unary long-poll：`Fetch(max_events,max_bytes,wait_ms)` 先按单消费者/组未确认
+额度收窄请求，再从本地或 `InternalSubscription.ReadPersistentBatch` 读取候选，Raft Claim
+成功后才返回。一个 Stream 的有效 lease 只属于一个 consumer，同一 consumer 可在确认
+部分批次后继续补满额度。`Settle` 逐条执行 Ack/Retry/Park/Skip；乱序确认记录 gap，只有
+连续前缀闭合才推进 `next_version`，交付语义为 at-least-once。
+
+默认值：每消费者/组未确认 128/4096，ack timeout 10s，重试 5 次，退避 100ms~5s；
+Fetch 默认/最大为 100/1000 条、4/7MiB、15/30s。parked 视为主 checkpoint 已解决，
+重放可晚于新版本并带 `replayed=true`，确认重放不会回退 checkpoint。`$all` 在 Fetch 时
+对账路由表并从 version 0 纳入新 Stream。配置 epoch 变化时，保留且未 reset Stream 的
+活动 delivery 转为立即可投递的 retry，避免乱序 Ack gap 永久跳过事件。
+
+在线迁移允许目标 Shard 重排 Stream version，因此 Fetch、parked 查询与重放会对账
+ownership generation。generation 单调上升时，仅清理受影响 Stream 的 delivery、retry、
+parked 和扫描提示，并从 version 0 重扫；该保守策略允许重复但禁止漏投，其它 Stream 的
+checkpoint 不回退。候选读取与 generation 对账共享同一个路由快照，避免混用新 Shard 与
+旧 checkpoint。
+
+当前长轮询每 50ms 做一次无锁重检；当前每组单 key 保证恢复简单但会产生大组写放大。
+事件通知唤醒与状态拆 key 是保持公开协议不变的后续性能优化。
+
 ### 7.5 路由表同步与在线迁移 API（Migration 服务，节点间）
 
 承载路由表同步与在线迁移原语，不暴露给客户端：
@@ -528,7 +557,7 @@ peer 时对比其 voter_ids 与本节点配置，不一致即告警，且要求�
 ```toml
 [node]
 id = 1
-listen_addr = "127.0.0.1:50051"   # 四个 gRPC 服务共用一个端口
+listen_addr = "127.0.0.1:50051"   # 五个公共 gRPC 服务共用一个端口
 internal_listen_addr = "127.0.0.1:51051" # 节点间订阅与归属控制；多节点必填
 
 # 集群节点列表（3 节点示例；非空即触发启动时自动组建，见 7.3）
@@ -562,8 +591,8 @@ primary = [0, 1]
 replica = [2, 3]
 ```
 
-客户端、节点间、管理、迁移四类 gRPC 服务共用 `listen_addr` 单端口（`server.rs`
-同一 `Server` 注册四个 service）。`node.peers` 在启动时由 `bootstrap` 消费：
+客户端、持久化订阅、节点间、管理、迁移五类 gRPC 服务共用 `listen_addr` 单端口
+（`server.rs` 同一 `Server` 注册五个 service）。`node.peers` 在启动时由 `bootstrap` 消费：
 地址 normalize（补 `http://`）后随 `initialize` 写入 membership 的 `BasicNode.addr`，
 与网络层回连规则同源（`es_raft::normalize_endpoint`）。流路由表持久化为
 `{data_dir}/routes.json`（§6），由 watcher 热更新；配置文件本身同样被 watcher
@@ -578,7 +607,7 @@ replica = [2, 3]
 | 单元测试 | key 编码与排序性质、归属命令的幂等/冲突/非法输入、归属 interface 错误映射、HLC 单调性、`ExpectedVersion` 校验矩阵 |
 | 存储层测试 | RaftLogStorage 语义、归属 catalog 持久化、缺失/过期 generation fencing、apply 幂等性、快照往返 |
 | 端到端测试 | 3 节点真实集群：并发首次归属、控制 Shard 无 quorum 拒写与恢复、读写一致性、leader 故障、订阅、在线迁移 |
-| 模糊测试 | 归属 Ensure 序列唯一性与投影计数；随机 Append/DeleteStream 序列的版本连续、per-stream 严格有序不变量 |
+| 模糊测试 | 归属 Ensure 序列唯一性与投影计数；随机 Append/DeleteStream 序列的版本连续；持久化订阅随机 Ack 顺序下 checkpoint 单调不回退 |
 
 key 编码的排序性质测试是重点：第 2.1 节的大端约束若被破坏，
 错误表现为范围扫描静默返回错误数据，而非崩溃，只有排序性质断言能捕获。

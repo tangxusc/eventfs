@@ -87,6 +87,31 @@ stream。跨 stream 不承诺顺序，但每个 stream 内 version 严格有序�
 服务端任一内部来源不可用或中断时会输出 `degraded` 状态，仍继续转发健康来源；`--once`
 在发生降级时以退出码 1 结束，避免把不完整的 catch-up 误判为成功。
 
+### 持久化拉取订阅
+
+```bash
+esctl persistent create <GROUP> (--stream <STREAM>... | --all) [--now]
+       [--next <STREAM=VERSION>] [--max-unacked-per-consumer <N>]
+esctl persistent update <GROUP> --expected-revision <REV>
+       [--stream <STREAM>... | --all] [--reset <STREAM=beginning|now|VERSION>]
+esctl persistent get <GROUP>
+esctl persistent list
+esctl persistent delete <GROUP> --expected-revision <REV>
+
+esctl persistent fetch <GROUP> --consumer <ID>
+       [--max-events <N=100>] [--max-bytes <N=4194304>] [--wait-ms <N=15000>]
+esctl persistent settle <GROUP> --consumer <ID> --epoch <EPOCH>
+       --delivery <UUID> --action <ack|retry|park|skip> [--reason <TEXT>]
+esctl persistent parked <GROUP> [--offset <N>] [--limit <N=100>]
+esctl persistent replay <GROUP>
+```
+
+`fetch` 是 unary long-poll，不在 CLI 中后台预取。响应中的 `delivery` 与 `epoch` 必须原样
+用于 `settle`；服务端同时按请求条数/字节预算、单 consumer 未确认额度和全组未确认额度
+施加背压。未确认 delivery 在 ack timeout 后退避重投，超过重试次数进入 parked。
+`retry` 保留 checkpoint，`park`/`skip`/`ack` 解决主队列位置；parked 重放可能晚于更新事件，
+响应以 `replayed=true` 标识。组更新和删除使用 revision CAS，reset 必须逐 Stream 显式给起点。
+
 ### 管理面
 
 ```

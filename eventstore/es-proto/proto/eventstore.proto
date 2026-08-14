@@ -18,6 +18,21 @@ service EventStore {
   rpc CreateStream(CreateStreamRequest) returns (CreateStreamResponse);
 }
 
+// 持久化拉取订阅：服务端保存竞争消费者组、checkpoint、租约与失败状态。
+service PersistentSubscriptions {
+  rpc CreatePersistentSubscription(CreatePersistentSubscriptionRequest) returns (PersistentSubscriptionInfo);
+  rpc UpdatePersistentSubscription(UpdatePersistentSubscriptionRequest) returns (PersistentSubscriptionInfo);
+  rpc DeletePersistentSubscription(DeletePersistentSubscriptionRequest) returns (Empty);
+  rpc GetPersistentSubscription(GetPersistentSubscriptionRequest) returns (PersistentSubscriptionInfo);
+  rpc ListPersistentSubscriptions(ListPersistentSubscriptionsRequest) returns (ListPersistentSubscriptionsResponse);
+  // unary 长轮询；消费者用条数、字节与等待时间主动施加背压。
+  rpc FetchPersistentSubscription(FetchPersistentSubscriptionRequest) returns (FetchPersistentSubscriptionResponse);
+  // 一次结算多个 delivery，每条独立返回结果。
+  rpc SettlePersistentSubscription(SettlePersistentSubscriptionRequest) returns (SettlePersistentSubscriptionResponse);
+  rpc ListParkedPersistentSubscription(ListParkedPersistentSubscriptionRequest) returns (ListParkedPersistentSubscriptionResponse);
+  rpc ReplayParkedPersistentSubscription(ReplayParkedPersistentSubscriptionRequest) returns (ReplayParkedPersistentSubscriptionResponse);
+}
+
 // 创建流请求
 message CreateStreamRequest {
   string stream_id = 1;
@@ -171,12 +186,175 @@ message SubscribeResponse {
   }
 }
 
+// 持久化订阅目标；与临时 Subscribe 一样不向客户端暴露 shard。
+message PersistentSubscriptionTarget {
+  oneof target {
+    SubscribeStreams streams = 1;
+    Empty all = 2;
+  }
+}
+
+enum PersistentStartDefault {
+  PERSISTENT_START_BEGINNING = 0;
+  PERSISTENT_START_NOW = 1;
+}
+
+// 创建起点：默认策略 + 逐 Stream inclusive next_version 覆盖。
+message PersistentStartSpec {
+  PersistentStartDefault default = 1;
+  map<string, uint64> next_versions = 2;
+}
+
+message PersistentSubscriptionSettings {
+  // 0 使用服务端默认值。
+  uint32 max_unacked_per_consumer = 1;
+  uint32 max_unacked_per_group = 2;
+  uint64 ack_timeout_ms = 3;
+  uint32 max_retries = 4;
+  uint64 retry_min_ms = 5;
+  uint64 retry_max_ms = 6;
+}
+
+message CreatePersistentSubscriptionRequest {
+  string name = 1;
+  PersistentSubscriptionTarget target = 2;
+  PersistentStartSpec start = 3;
+  PersistentSubscriptionSettings settings = 4;
+}
+
+message PersistentStreamReset {
+  string stream_id = 1;
+  oneof start {
+    Empty beginning = 2;
+    Empty now = 3;
+    uint64 next_version = 4;
+  }
+}
+
+message UpdatePersistentSubscriptionRequest {
+  string name = 1;
+  uint64 expected_revision = 2;
+  // 缺失表示不修改。
+  PersistentSubscriptionTarget target = 3;
+  // 缺失表示不修改。
+  PersistentSubscriptionSettings settings = 4;
+  repeated PersistentStreamReset resets = 5;
+}
+
+message DeletePersistentSubscriptionRequest {
+  string name = 1;
+  uint64 expected_revision = 2;
+}
+
+message GetPersistentSubscriptionRequest { string name = 1; }
+message ListPersistentSubscriptionsRequest {}
+
+message PersistentSubscriptionInfo {
+  string name = 1;
+  uint64 revision = 2;
+  uint64 epoch = 3;
+  PersistentSubscriptionTarget target = 4;
+  PersistentSubscriptionSettings settings = 5;
+  uint64 stream_count = 6;
+  uint64 active_delivery_count = 7;
+  uint64 parked_count = 8;
+}
+
+message ListPersistentSubscriptionsResponse {
+  repeated PersistentSubscriptionInfo subscriptions = 1;
+}
+
+message FetchPersistentSubscriptionRequest {
+  string name = 1;
+  string consumer_id = 2;
+  // 0 使用默认值；服务端分别限制为 1000 条、7 MiB、30 秒。
+  uint32 max_events = 3;
+  uint64 max_bytes = 4;
+  uint64 wait_ms = 5;
+}
+
+message PersistentDelivery {
+  bytes delivery_id = 1;
+  SubscriptionEvent event = 2;
+  uint32 attempt = 3;
+  uint64 lease_deadline_ms = 4;
+  uint64 group_epoch = 5;
+  bool replayed = 6;
+}
+
+message FetchPersistentSubscriptionResponse {
+  repeated PersistentDelivery deliveries = 1;
+  bool caught_up = 2;
+  bool throttled = 3;
+  uint64 retry_after_ms = 4;
+}
+
+enum PersistentSettlementAction {
+  PERSISTENT_SETTLEMENT_ACK = 0;
+  PERSISTENT_SETTLEMENT_RETRY = 1;
+  PERSISTENT_SETTLEMENT_PARK = 2;
+  PERSISTENT_SETTLEMENT_SKIP = 3;
+}
+
+message PersistentSettlement {
+  bytes delivery_id = 1;
+  PersistentSettlementAction action = 2;
+  string reason = 3;
+}
+
+message SettlePersistentSubscriptionRequest {
+  string name = 1;
+  string consumer_id = 2;
+  uint64 group_epoch = 3;
+  repeated PersistentSettlement settlements = 4;
+}
+
+enum PersistentSettlementStatus {
+  PERSISTENT_SETTLEMENT_APPLIED = 0;
+  PERSISTENT_SETTLEMENT_ALREADY_SETTLED = 1;
+  PERSISTENT_SETTLEMENT_STALE_LEASE = 2;
+  PERSISTENT_SETTLEMENT_WRONG_CONSUMER = 3;
+}
+
+message PersistentSettlementResult {
+  bytes delivery_id = 1;
+  PersistentSettlementStatus status = 2;
+}
+
+message SettlePersistentSubscriptionResponse {
+  repeated PersistentSettlementResult results = 1;
+}
+
+message ListParkedPersistentSubscriptionRequest {
+  string name = 1;
+  uint32 offset = 2;
+  uint32 limit = 3; // 0 使用默认 100，上限 1000
+}
+
+message ParkedPersistentEvent {
+  bytes parked_id = 1;
+  SubscriptionEvent event = 2;
+  uint32 attempts = 3;
+  string reason = 4;
+  uint64 parked_at_ms = 5;
+}
+
+message ListParkedPersistentSubscriptionResponse {
+  repeated ParkedPersistentEvent events = 1;
+  uint32 next_offset = 2;
+}
+
+message ReplayParkedPersistentSubscriptionRequest { string name = 1; }
+message ReplayParkedPersistentSubscriptionResponse { uint64 replayed_count = 1; }
+
 // ============================================================================
 // InternalSubscription：节点间分片订阅转发，绝不作为客户端契约使用。
 // ============================================================================
 
 service InternalSubscription {
   rpc SubscribeInternal(InternalSubscribeRequest) returns (stream InternalSubscribeResponse);
+  // 控制 Shard 协调器按 Stream checkpoint 批量读取远程数据 Shard。
+  rpc ReadPersistentBatch(InternalPersistentReadRequest) returns (InternalPersistentReadResponse);
 }
 
 // 归属共识与 fencing 的节点间协议，只能注册到内部监听端口。
@@ -196,6 +374,30 @@ message InternalSubscribeResponse {
     Event event = 1;
     Empty caught_up = 2;
   }
+}
+
+message InternalPersistentCursor {
+  string stream_id = 1;
+  uint64 from_version = 2;
+  uint32 max_count = 3;
+}
+
+message InternalPersistentReadRequest {
+  uint64 shard_id = 1;
+  repeated InternalPersistentCursor cursors = 2;
+  uint32 max_events = 3;
+  uint64 max_bytes = 4;
+}
+
+message InternalPersistentReadResponse {
+  repeated Event events = 1;
+  repeated InternalPersistentHead heads = 2;
+}
+
+message InternalPersistentHead {
+  string stream_id = 1;
+  bool exists = 2;
+  uint64 current_version = 3;
 }
 
 message GetStreamMetaRequest {

@@ -3,25 +3,26 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future::Future;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context};
+use anyhow::{Context, anyhow, bail};
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Status};
 
 use es_core::route::RouteTable;
-use es_core::{parse_leader_hint, LeaderRetryPlan};
+use es_core::{LeaderRetryPlan, parse_leader_hint};
 use es_proto::endpoint::normalize_endpoint;
 use es_proto::eventstore::event_store_client::EventStoreClient;
 use es_proto::eventstore::migration_client::MigrationClient;
+use es_proto::eventstore::persistent_subscriptions_client::PersistentSubscriptionsClient;
 use es_proto::eventstore::raft_admin_client::RaftAdminClient;
 use es_proto::eventstore::{
     CreateStreamRequest, CreateStreamResponse, GetRaftStateRequest, GetRaftStateResponse,
     GetRouteTableRequest, ListShardsRequest, ListShardsResponse, RecountStreamsRequest,
 };
-use es_proto::tls::{apply_endpoint_tls, TlsClientConfig};
+use es_proto::tls::{TlsClientConfig, apply_endpoint_tls};
 
 /// 集群客户端。
 ///
@@ -154,6 +155,58 @@ impl ClusterClient {
         Ok(MigrationClient::new(self.channel_for(endpoint).await?)
             .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
             .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE))
+    }
+
+    /// 持久化订阅服务客户端。
+    pub async fn persistent_client(
+        &self,
+        endpoint: &str,
+    ) -> Result<PersistentSubscriptionsClient<Channel>, anyhow::Error> {
+        Ok(
+            PersistentSubscriptionsClient::new(self.channel_for(endpoint).await?)
+                .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
+                .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE),
+        )
+    }
+
+    /// 在 control Shard leader 上执行持久化订阅 RPC。
+    pub async fn with_persistent_leader<T, F, Fut>(&self, f: F) -> Result<T, anyhow::Error>
+    where
+        F: Fn(PersistentSubscriptionsClient<Channel>) -> Fut,
+        Fut: Future<Output = Result<T, Status>>,
+    {
+        let mut plan = LeaderRetryPlan::new(self.rotated_endpoints());
+        let mut errors = Vec::new();
+        while let Some(target) = plan.next() {
+            let client = match self.persistent_client(&target).await {
+                Ok(client) => client,
+                Err(error) => {
+                    errors.push(format!("{target}: {error:#}"));
+                    continue;
+                }
+            };
+            match f(client).await {
+                Ok(value) => return Ok(value),
+                Err(status) if status.code() == Code::Unavailable => {
+                    if let Some(address) = parse_leader_hint(status.message()) {
+                        plan.redirect_to(normalize_endpoint(&address));
+                    } else {
+                        plan.retry_later(target);
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                }
+                Err(status) => return Err(anyhow!(status.message().to_string())),
+            }
+        }
+        Err(anyhow!(
+            "未找到持久化订阅 control leader（端点: {}{}）",
+            self.endpoints.join(", "),
+            if errors.is_empty() {
+                String::new()
+            } else {
+                format!("；详情: {}", errors.join("；"))
+            }
+        ))
     }
 
     /// Migration 操作：在任一可达端点执行（语义同 with_any_endpoint）。

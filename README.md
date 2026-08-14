@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)
 
-基于 Rust + [openraft](https://github.com/datafuselabs/openraft) + [surrealkv](https://github.com/surrealdb/surrealkv) 的分布式事件存储中间件。分片由**显式放置表**（`[placement]`）定义，每个分片是一个独立的 Raft group + 独立的 surrealkv LSM tree；stream → shard 归属由控制 Shard 的 Raft 状态机强一致提交，`routes.json` 保留为兼容投影。支持运行期动态扩容与在线迁移。提供事件溯源语义：乐观并发、幂等写入、流订阅（catch-up → live）。
+基于 Rust + [openraft](https://github.com/datafuselabs/openraft) + [surrealkv](https://github.com/surrealdb/surrealkv) 的分布式事件存储中间件。分片由**显式放置表**（`[placement]`）定义，每个分片是一个独立的 Raft group + 独立的 surrealkv LSM tree；stream → shard 归属由控制 Shard 的 Raft 状态机强一致提交，`routes.json` 保留为兼容投影。支持运行期动态扩容与在线迁移。提供事件溯源语义：乐观并发、幂等写入、临时订阅和持久化拉取订阅。
 
 ## 特性
 
@@ -14,6 +14,7 @@
 - **单事务原子提交**：事件、流元数据、position 指针、幂等索引、已应用状态在同一 surrealkv 事务内提交，崩溃不留下版本回退
 - **混合逻辑时钟（HLC）**：leader 提交前分配并随日志下发，各副本 apply 出相同时间戳，为日后的近似全序预留基础
 - **跨分片流订阅**：客户端按一个或多个 stream、或 `$all` 订阅；服务端内部路由和聚合，追平边界不丢事件，公开事件不暴露 shard
+- **持久化拉取订阅**：命名竞争消费者组，control Shard 持久化 checkpoint、Stream lease、重试与 parked；`Fetch` 受条数、字节数和未确认额度背压，`Settle` 支持 Ack/Retry/Park/Skip；迁移 generation 变化时受影响 Stream 从 0 重扫，允许重复但不漏投
 - **跨分片 ReadAll**：按 HLC 做 k 路归并（保分片内 position 序），服务端按归并消费水位
   驱动逐分片续读游标（`next_positions`，客户端原样透传翻页），支持反向；
   反向读到分片最早事件后游标带 `ended` 读尽标记，**空页即终止**（正反两向一致）
@@ -26,11 +27,12 @@
 
 ## 架构
 
-单个进程在公共 `listen_addr` 端口提供四个 gRPC 服务：
+单个进程在公共 `listen_addr` 端口提供五个 gRPC 服务：
 
 | 服务 | 用途 | 方法 |
 |---|---|---|
 | `EventStore` | 客户端 API | `Append` / `ReadStream` / `ReadAll` / `Subscribe` / `GetStreamMeta` / `CreateStream` |
+| `PersistentSubscriptions` | 持久化拉取订阅 | CRUD / `Fetch` / `Settle` / parked 查询与重放 |
 | `RaftRpc` | 节点间复制与选举 | `AppendEntries` / `Vote` / `InstallSnapshot` |
 | `RaftAdmin` | 集群管理 | `Initialize` / `AddLearner` / `ChangeMembership` / `GetRaftState` / `ListShards` |
 | `Migration` | 归属投影通知 + 在线迁移原语 | `GetRouteTable` / `PushRouteTable` / `SetStreamShard` / `RecountStreams` / `AppendMigrated` / `DeleteStreamFromShard` / `ReadStreamFromShard` / `GetStreamMetaFromShard` / `ListStreams` |
@@ -245,6 +247,12 @@ esctl meta orders/1
 esctl watch --stream orders/1 --stream payments/1
 esctl watch --all
 
+# 持久化订阅：创建组、拉取一批、显式确认
+esctl persistent create workers --stream orders/1
+esctl persistent fetch workers --consumer worker-1 --max-events 100 --wait-ms 15000
+esctl persistent settle workers --consumer worker-1 --epoch 1 \
+  --delivery 00000000-0000-0000-0000-000000000001 --action ack
+
 # 流路由表：查看 / 校准计数 / 孤儿流检测
 esctl route                    # 展示 stream -> shard 归属与表版本
 esctl route --recount          # 校准 per-shard 流计数（迁移后建议执行）
@@ -358,7 +366,7 @@ cargo bench -p es-storage
 
 **功能**
 - [ ] Projection 机制
-- [ ] 持久化订阅
+- [x] 持久化拉取订阅（竞争消费者组、额度背压、租约、重试/parked、SDK 与 esctl）
 
 ## 已知限制
 
@@ -380,7 +388,8 @@ cargo bench -p es-storage
   数据，无损坏），窗口通常 <1s；广播失败由下次变更全表重发自愈。
 - **`esctl member remove` 无法移除 learner**：RaftAdmin 无 remove_learner RPC；
   `member list` 不含地址列与 learner 行（GetRaftState 不暴露成员地址）。
-- **订阅恢复**：跨 stream 聚合订阅暂不提供消费进度或续订 token；断点恢复属于后续持久化订阅能力。
+- **临时订阅恢复**：`Subscribe` 本身不提供续订 token；需要断点恢复时使用命名持久化订阅。
+- **持久化订阅大组写放大**：当前每组状态使用一个原子 key，组内 Stream/delivery 很多时 Settle 会重写整组；后续可拆分状态 key。
 - **快照为全量**：每次 `build_snapshot` 序列化整个分片状态机，大状态机耗时明显
   （支持 zstd/lz4 压缩与多快照保留，见 docs/snapshot.md）。
 - **install 单事务内存 ≈ 快照未压缩体积**：surrealkv 事务写入全内存缓冲，超大快照

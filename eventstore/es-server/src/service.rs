@@ -14,7 +14,7 @@ use es_raft::ShardManager;
 
 use crate::config::Config;
 use crate::ownership::{AppendTarget, StreamOwnership};
-use crate::route_table::{routes_path, RouteTableManager};
+use crate::route_table::{RouteTableManager, routes_path};
 
 /// 远程 shard 的 leader 探测器。
 ///
@@ -80,7 +80,7 @@ impl RemoteShards {
     ///
     /// 轮询所有 peers（跳过自己）调 GetRaftState；未承载该 shard 的节点
     /// 返回 NotFound，直接跳过。全部不可达或尚无 leader → None。
-    async fn find_leader(&self, shard_id: u64) -> Option<(u64, String)> {
+    pub(crate) async fn find_leader(&self, shard_id: u64) -> Option<(u64, String)> {
         for (&id, client) in &self.clients {
             if id == self.self_id {
                 continue;
@@ -104,7 +104,7 @@ impl RemoteShards {
     }
 
     /// 目标 shard 不在本节点时的标准重定向提示（与本地 ForwardToLeader 同格式）。
-    async fn leader_hint_status(&self, shard_id: u64) -> Status {
+    pub(crate) async fn leader_hint_status(&self, shard_id: u64) -> Status {
         match self.find_leader(shard_id).await {
             Some((id, addr)) => {
                 Status::unavailable(format!("not leader; leader_id={id} leader_addr={addr}"))
@@ -114,7 +114,7 @@ impl RemoteShards {
     }
 
     /// 连接远程 shard leader 的内部订阅服务。
-    async fn internal_client(
+    pub(crate) async fn internal_client(
         &self,
         shard_id: u64,
     ) -> Result<InternalSubscriptionClient<tonic::transport::Channel>, Status> {
@@ -320,15 +320,15 @@ pub(crate) fn proto_to_expected_version(ev: ExpectedVersion) -> es_core::Expecte
 /// EventStore gRPC 服务
 #[derive(Clone)]
 pub struct EsService {
-    shard_manager: Arc<ShardManager>,
+    pub(crate) shard_manager: Arc<ShardManager>,
     /// 请求大小限制（append 权威校验）
     limits: crate::config::LimitsSection,
     /// 流路由表（stream → shard 归属；写路径权威）
-    route_table: Arc<RouteTableManager>,
+    pub(crate) route_table: Arc<RouteTableManager>,
     /// 强一致归属；Append 只能通过它取得带 generation 的目标。
-    ownership: Arc<StreamOwnership>,
+    pub(crate) ownership: Arc<StreamOwnership>,
     /// 远程 shard 定位（本节点不承载的目标分片）
-    remote: RemoteShards,
+    pub(crate) remote: RemoteShards,
     /// 建立 `$all` 聚合订阅时的 shard 快照；公共接口不暴露这些内部 ID。
     all_shards: Vec<u64>,
 }
@@ -427,7 +427,7 @@ impl EsService {
 }
 
 /// 将内部事件投影为公开订阅事件，避免向客户端泄露分片位置与 shard ID。
-fn public_subscription_event(event: Event) -> SubscriptionEvent {
+pub(crate) fn public_subscription_event(event: Event) -> SubscriptionEvent {
     SubscriptionEvent {
         stream_id: event.stream_id,
         version: event.version,
@@ -587,6 +587,78 @@ async fn run_local_subscription(
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         }
     }
+}
+
+/// 在一个数据 Shard 上按多个 Stream checkpoint 读取候选事件。
+///
+/// 返回顺序与 cursor 顺序一致，每个 Stream 内按 version 递增；`max_events=0`
+/// 时只读取 head，供 FromNow 初始化使用。
+pub(crate) fn read_persistent_local(
+    shard_id: u64,
+    storage: &es_storage::EsStorage,
+    cursors: &[InternalPersistentCursor],
+    max_events: u32,
+    max_bytes: u64,
+) -> Result<InternalPersistentReadResponse, Status> {
+    use prost::Message as _;
+
+    let mut heads = Vec::with_capacity(cursors.len());
+    let mut events = Vec::new();
+    let mut used_bytes = 0u64;
+    for cursor in cursors {
+        let meta = storage
+            .read_stream_meta(&cursor.stream_id)
+            .map_err(|error| Status::internal(format!("读取持久化订阅 head 失败: {error}")))?;
+        heads.push(InternalPersistentHead {
+            stream_id: cursor.stream_id.clone(),
+            exists: meta.is_some(),
+            current_version: meta.as_ref().map(|item| item.current_version).unwrap_or(0),
+        });
+        if max_events == 0 || meta.is_none() {
+            continue;
+        }
+        let remaining = max_events.saturating_sub(events.len() as u32);
+        if remaining == 0 {
+            break;
+        }
+        let per_stream = if cursor.max_count == 0 {
+            remaining
+        } else {
+            cursor.max_count.min(remaining)
+        };
+        let read = storage
+            .read_stream_events(&cursor.stream_id, cursor.from_version, per_stream as u64)
+            .map_err(|error| Status::internal(format!("读取持久化订阅事件失败: {error}")))?;
+        for event in read {
+            let event = Event {
+                stream_id: event.stream_id,
+                version: event.version,
+                event_id: event.event_id.as_bytes().to_vec(),
+                event_type: event.event_type,
+                data: event.data,
+                metadata: event.metadata,
+                hlc: Some(Hlc {
+                    wall: event.hlc.wall,
+                    logical: event.hlc.logical,
+                }),
+                position: event.position,
+                shard_id,
+            };
+            let event_bytes = event.encoded_len() as u64;
+            if !events.is_empty()
+                && max_bytes != 0
+                && used_bytes.saturating_add(event_bytes) > max_bytes
+            {
+                return Ok(InternalPersistentReadResponse { events, heads });
+            }
+            used_bytes = used_bytes.saturating_add(event_bytes);
+            events.push(event);
+            if events.len() as u32 >= max_events {
+                return Ok(InternalPersistentReadResponse { events, heads });
+            }
+        }
+    }
+    Ok(InternalPersistentReadResponse { events, heads })
 }
 
 #[tonic::async_trait]
@@ -1146,6 +1218,33 @@ impl InternalSubscription for EsService {
         ));
         Ok(Response::new(ReceiverStream::new(rx)))
     }
+
+    async fn read_persistent_batch(
+        &self,
+        request: Request<InternalPersistentReadRequest>,
+    ) -> Result<Response<InternalPersistentReadResponse>, Status> {
+        let request = request.into_inner();
+        let shard = self.resolve_read_shard(request.shard_id).await?;
+        if !shard.raft.metrics().borrow().state.is_leader() {
+            return Err(Status::unavailable(
+                "persistent subscription source is not leader",
+            ));
+        }
+        if request.max_events > es_core::persistent::MAX_FETCH_EVENTS {
+            return Err(Status::invalid_argument("max_events exceeds 1000"));
+        }
+        if request.max_bytes > es_core::persistent::MAX_FETCH_BYTES {
+            return Err(Status::invalid_argument("max_bytes exceeds 7 MiB"));
+        }
+        let response = read_persistent_local(
+            request.shard_id,
+            &shard.storage,
+            &request.cursors,
+            request.max_events,
+            request.max_bytes,
+        )?;
+        Ok(Response::new(response))
+    }
 }
 
 #[cfg(test)]
@@ -1280,13 +1379,15 @@ mod tests {
             Some(subscribe_response::Payload::Event(event))
                 if event.stream_id == "s3" && event.version == 4
         ));
-        assert!(aggregate_source_message(
-            SourceMessage::CaughtUp(3),
-            &mut pending,
-            &mut caught_up,
-            &mut degraded,
-        )
-        .is_none());
+        assert!(
+            aggregate_source_message(
+                SourceMessage::CaughtUp(3),
+                &mut pending,
+                &mut caught_up,
+                &mut degraded,
+            )
+            .is_none()
+        );
         assert!(matches!(
             aggregate_source_message(
                 SourceMessage::CaughtUp(7),
@@ -1297,13 +1398,15 @@ mod tests {
             .and_then(|response| response.payload),
             Some(subscribe_response::Payload::CaughtUp(_))
         ));
-        assert!(aggregate_source_message(
-            SourceMessage::CaughtUp(7),
-            &mut pending,
-            &mut caught_up,
-            &mut degraded,
-        )
-        .is_none());
+        assert!(
+            aggregate_source_message(
+                SourceMessage::CaughtUp(7),
+                &mut pending,
+                &mut caught_up,
+                &mut degraded,
+            )
+            .is_none()
+        );
         assert!(matches!(
             aggregate_source_message(
                 SourceMessage::Degraded(3),
@@ -1314,13 +1417,15 @@ mod tests {
             .and_then(|response| response.payload),
             Some(subscribe_response::Payload::Degraded(_))
         ));
-        assert!(aggregate_source_message(
-            SourceMessage::Degraded(7),
-            &mut pending,
-            &mut caught_up,
-            &mut degraded,
-        )
-        .is_none());
+        assert!(
+            aggregate_source_message(
+                SourceMessage::Degraded(7),
+                &mut pending,
+                &mut caught_up,
+                &mut degraded,
+            )
+            .is_none()
+        );
     }
 
     #[tokio::test]

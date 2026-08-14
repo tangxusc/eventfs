@@ -7,7 +7,7 @@ use crate::config::Config;
 use crate::factory;
 use crate::migration_service::MigrationService;
 use crate::ownership::StreamOwnership;
-use crate::route_table::{routes_path, RouteTableManager};
+use crate::route_table::{RouteTableManager, routes_path};
 use crate::service::EsService;
 use es_raft::{Shard, ShardManager};
 
@@ -192,6 +192,9 @@ impl Server {
             es_proto::eventstore::event_store_server::EventStoreServer::new(es_service.clone())
                 .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
                 .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE);
+        let persistent_subscriptions = es_proto::eventstore::persistent_subscriptions_server::PersistentSubscriptionsServer::new(es_service.clone())
+            .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
+            .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE);
         let raft_rpc = es_proto::eventstore::raft_rpc_server::RaftRpcServer::new(raft_service)
             .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
             .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE);
@@ -205,6 +208,7 @@ impl Server {
                 .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE);
         let public_server = public_server
             .add_service(event_store)
+            .add_service(persistent_subscriptions)
             .add_service(raft_rpc)
             .add_service(raft_admin)
             .add_service(migration);

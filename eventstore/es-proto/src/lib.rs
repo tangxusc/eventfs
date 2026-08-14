@@ -29,15 +29,22 @@ pub use tls::{TlsClientConfig, apply_endpoint_tls};
 mod tests {
     use super::*;
 
-    /// 固化生成代码的对外契约：四个服务类型必须存在。
+    /// 固化生成代码的对外契约：公共持久化订阅类型必须存在。
     /// proto 改名或 package 变动会在此处编译失败，而非在下游 crate 里才暴露。
     #[test]
-    fn generated_code_has_four_service_types() {
+    fn generated_code_has_public_and_internal_service_types() {
         fn types_exist<T>() {}
-        types_exist::<eventstore::event_store_client::EventStoreClient<tonic::transport::Channel>>();
+        types_exist::<eventstore::event_store_client::EventStoreClient<tonic::transport::Channel>>(
+        );
+        types_exist::<
+            eventstore::persistent_subscriptions_client::PersistentSubscriptionsClient<
+                tonic::transport::Channel,
+            >,
+        >();
         types_exist::<raft::raft_internal_client::RaftInternalClient<tonic::transport::Channel>>();
         // server 侧为泛型包装，仅断言模块路径可达
         let _ = std::any::type_name::<eventstore::AppendRequest>();
+        let _ = std::any::type_name::<eventstore::FetchPersistentSubscriptionRequest>();
         let _ = std::any::type_name::<raft::RaftRequest>();
     }
 

@@ -29,6 +29,7 @@ const SM_IDEMPOTENCY: u8 = 0x05;
 const SM_NEXT_POSITION: u8 = 0x06;
 const SM_OWNERSHIP_CATALOG: u8 = 0x07;
 const SM_OWNERSHIP_FENCE: u8 = 0x08;
+const SM_PERSISTENT_GROUP: u8 = 0x09;
 
 /// 快照子类别
 const SNAPSHOT_CURRENT: u8 = 0x01;
@@ -182,6 +183,34 @@ pub fn sm_ownership_fence(shard_id: u64, stream_id: &str) -> Vec<u8> {
     key.extend_from_slice(&(stream_bytes.len() as u64).to_be_bytes());
     key.extend_from_slice(stream_bytes);
     key
+}
+
+/// 持久化订阅组 key：`[SM][shard][group-tag][len:BE8][group]`。
+pub fn sm_persistent_group(shard_id: u64, group: &str) -> Vec<u8> {
+    let bytes = group.as_bytes();
+    let mut key = sm_sub_prefix(shard_id, SM_PERSISTENT_GROUP);
+    key.extend_from_slice(&encode_u64_be(bytes.len() as u64));
+    key.extend_from_slice(bytes);
+    key
+}
+
+/// 持久化订阅组扫描前缀。
+pub fn sm_persistent_group_prefix(shard_id: u64) -> Vec<u8> {
+    sm_sub_prefix(shard_id, SM_PERSISTENT_GROUP)
+}
+
+/// 从持久化订阅组 key 解出组名。
+pub fn decode_persistent_group_key(key: &[u8]) -> Option<String> {
+    const HEAD: usize = 10;
+    if key.len() < HEAD + 8 {
+        return None;
+    }
+    let len = decode_u64_be(&key[HEAD..HEAD + 8]).ok()? as usize;
+    let start = HEAD + 8;
+    if key.len() != start + len {
+        return None;
+    }
+    String::from_utf8(key[start..].to_vec()).ok()
 }
 
 /// 快照 key: [0x03][shard:BE8][0x01]

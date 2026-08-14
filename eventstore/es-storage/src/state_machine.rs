@@ -352,9 +352,197 @@ struct ApplyBatch {
     ownership_catalog: Option<es_core::OwnershipCatalog>,
     /// 本批已读取或写入的 Stream fencing 代次。
     ownership_fences: std::collections::HashMap<String, u64>,
+    /// 本批已读取或修改的持久化订阅组；None 表示已删除或不存在。
+    persistent_groups: std::collections::BTreeMap<String, Option<es_core::PersistentGroup>>,
 }
 
 impl EsStorage {
+    /// 读取持久化订阅组；仅控制 Shard 上的数据有权威意义。
+    pub fn read_persistent_group(
+        &self,
+        name: &str,
+    ) -> es_core::Result<Option<es_core::PersistentGroup>> {
+        let key = key::sm_persistent_group(self.shard_id(), name);
+        self.get(&key)?
+            .map(|bytes| {
+                crate::encode::decode(&bytes).map_err(|error| {
+                    es_core::Error::Serde(format!("持久化订阅组反序列化失败: {error}"))
+                })
+            })
+            .transpose()
+    }
+
+    /// 枚举全部持久化订阅组，按组名排序。
+    pub fn list_persistent_groups(&self) -> es_core::Result<Vec<es_core::PersistentGroup>> {
+        let prefix = key::sm_persistent_group_prefix(self.shard_id());
+        let end = key::successor(&prefix)
+            .ok_or_else(|| es_core::Error::Internal("持久化订阅 key 前缀无后继".into()))?;
+        self.scan_kv(prefix, end)?
+            .into_iter()
+            .map(|(key_bytes, value)| {
+                key::decode_persistent_group_key(&key_bytes).ok_or_else(|| {
+                    es_core::Error::Serde(format!("持久化订阅 key 损坏: {key_bytes:?}"))
+                })?;
+                crate::encode::decode(&value).map_err(|error| {
+                    es_core::Error::Serde(format!("持久化订阅组反序列化失败: {error}"))
+                })
+            })
+            .collect()
+    }
+
+    fn batch_persistent_group(
+        &self,
+        batch: &mut ApplyBatch,
+        name: &str,
+    ) -> es_core::Result<Option<es_core::PersistentGroup>> {
+        if let Some(group) = batch.persistent_groups.get(name) {
+            return Ok(group.clone());
+        }
+        let group = self.read_persistent_group(name)?;
+        batch
+            .persistent_groups
+            .insert(name.to_string(), group.clone());
+        Ok(group)
+    }
+
+    fn persist_group(
+        &self,
+        batch: &mut ApplyBatch,
+        name: &str,
+        group: Option<es_core::PersistentGroup>,
+    ) -> es_core::Result<()> {
+        let key = key::sm_persistent_group(self.shard_id(), name);
+        batch.ops.retain(|op| match op {
+            ApplyOp::Put(existing, _) | ApplyOp::Delete(existing) => *existing != key,
+        });
+        match &group {
+            Some(group) => {
+                let bytes = crate::encode::encode(group).map_err(|error| {
+                    es_core::Error::Serde(format!("持久化订阅组序列化失败: {error}"))
+                })?;
+                batch.ops.push(ApplyOp::Put(key, bytes));
+            }
+            None => batch.ops.push(ApplyOp::Delete(key)),
+        }
+        batch.persistent_groups.insert(name.to_string(), group);
+        Ok(())
+    }
+
+    fn apply_persistent_subscription(
+        &self,
+        batch: &mut ApplyBatch,
+        command: crate::PersistentSubscriptionCommand,
+    ) -> es_core::Result<EsResponse> {
+        use crate::{
+            PersistentSubscriptionCommand as Command, PersistentSubscriptionResponse as R,
+        };
+
+        let response = match command {
+            Command::Create { group } => {
+                if let Some(existing) = self.batch_persistent_group(batch, &group.name)? {
+                    R::Conflict {
+                        actual_revision: existing.revision,
+                    }
+                } else {
+                    let name = group.name.clone();
+                    self.persist_group(batch, &name, Some(group.clone()))?;
+                    R::Group(group)
+                }
+            }
+            Command::Replace {
+                name,
+                expected_revision,
+                group,
+            } => match self.batch_persistent_group(batch, &name)? {
+                None => R::NotFound,
+                Some(existing) if existing.revision != expected_revision => R::Conflict {
+                    actual_revision: existing.revision,
+                },
+                Some(_) if group.name != name => R::Invalid {
+                    reason: "更新后的组名必须保持不变".into(),
+                },
+                Some(_) => {
+                    self.persist_group(batch, &name, Some(group.clone()))?;
+                    R::Group(group)
+                }
+            },
+            Command::Delete {
+                name,
+                expected_revision,
+            } => match self.batch_persistent_group(batch, &name)? {
+                None => R::NotFound,
+                Some(existing) if existing.revision != expected_revision => R::Conflict {
+                    actual_revision: existing.revision,
+                },
+                Some(_) => {
+                    self.persist_group(batch, &name, None)?;
+                    R::Deleted
+                }
+            },
+            Command::EnsureStreams { name, streams } => {
+                let Some(mut group) = self.batch_persistent_group(batch, &name)? else {
+                    return Ok(EsResponse::PersistentSubscription(R::NotFound));
+                };
+                group.ensure_streams(streams);
+                self.persist_group(batch, &name, Some(group.clone()))?;
+                R::Group(group)
+            }
+            Command::Claim {
+                name,
+                consumer_id,
+                now_ms,
+                deadline_ms,
+                candidates,
+            } => {
+                let Some(mut group) = self.batch_persistent_group(batch, &name)? else {
+                    return Ok(EsResponse::PersistentSubscription(R::NotFound));
+                };
+                let claimed = group.claim(&consumer_id, now_ms, deadline_ms, candidates);
+                self.persist_group(batch, &name, Some(group))?;
+                R::Claimed(claimed)
+            }
+            Command::Settle {
+                name,
+                consumer_id,
+                group_epoch,
+                now_ms,
+                settlements,
+            } => {
+                let Some(mut group) = self.batch_persistent_group(batch, &name)? else {
+                    return Ok(EsResponse::PersistentSubscription(R::NotFound));
+                };
+                let settled = group.settle(&consumer_id, group_epoch, now_ms, &settlements);
+                self.persist_group(batch, &name, Some(group))?;
+                R::Settled(settled)
+            }
+            Command::Expire { name, now_ms } => {
+                let Some(mut group) = self.batch_persistent_group(batch, &name)? else {
+                    return Ok(EsResponse::PersistentSubscription(R::NotFound));
+                };
+                let count = group.expire(now_ms) as u64;
+                self.persist_group(batch, &name, Some(group))?;
+                R::Count(count)
+            }
+            Command::ReplayParked { name, now_ms } => {
+                let Some(mut group) = self.batch_persistent_group(batch, &name)? else {
+                    return Ok(EsResponse::PersistentSubscription(R::NotFound));
+                };
+                let count = group.replay_parked(now_ms) as u64;
+                self.persist_group(batch, &name, Some(group))?;
+                R::Count(count)
+            }
+            Command::ReconcileOwnership { name, generations } => {
+                let Some(mut group) = self.batch_persistent_group(batch, &name)? else {
+                    return Ok(EsResponse::PersistentSubscription(R::NotFound));
+                };
+                group.reconcile_ownership(generations);
+                self.persist_group(batch, &name, Some(group.clone()))?;
+                R::Group(group)
+            }
+        };
+        Ok(EsResponse::PersistentSubscription(response))
+    }
+
     /// 取某流在本批次内的当前版本，优先用批内累积值
     fn batch_stream_version(
         &self,
@@ -791,6 +979,7 @@ impl RaftStateMachine<TypeConfig> for EsStorage {
             new_events: Vec::new(),
             ownership_catalog: None,
             ownership_fences: std::collections::HashMap::new(),
+            persistent_groups: std::collections::BTreeMap::new(),
         };
 
         let mut responses = Vec::new();
@@ -865,6 +1054,12 @@ impl RaftStateMachine<TypeConfig> for EsStorage {
                     } => {
                         let resp = self
                             .apply_ownership_fence(&mut batch, stream_id, *generation)
+                            .map_err(sm_write_err)?;
+                        responses.push(resp);
+                    }
+                    EsRequest::PersistentSubscription { command } => {
+                        let resp = self
+                            .apply_persistent_subscription(&mut batch, command.clone())
                             .map_err(sm_write_err)?;
                         responses.push(resp);
                     }

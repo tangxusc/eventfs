@@ -5,6 +5,7 @@ pub mod hlc;
 pub mod limits;
 pub mod model;
 pub mod ownership;
+pub mod persistent;
 pub mod redirect;
 pub mod route;
 pub mod routing;
@@ -15,6 +16,11 @@ pub use limits::{MAX_APPEND_BATCH_BYTES, MAX_EVENT_PAYLOAD_BYTES, MAX_SNAPSHOT_C
 pub use model::{Event, ExpectedVersion, NewEvent, StreamMeta};
 pub use ownership::{
     Owner, OwnerMatch, OwnershipApply, OwnershipCatalog, OwnershipCommand, OwnershipOutcome,
+};
+pub use persistent::{
+    DeliveryCandidate, ParkedEvent, PendingRetry, PersistentDelivery, PersistentGroup,
+    PersistentSettings, PersistentTarget, Settlement, SettlementAction, SettlementResult,
+    StreamLease, StreamProgress,
 };
 pub use redirect::{LeaderRetryPlan, parse_leader_hint};
 pub use routing::route;

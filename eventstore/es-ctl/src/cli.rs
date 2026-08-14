@@ -228,6 +228,188 @@ pub enum Command {
     Status(StatusArgs),
     /// 快照管理（离线操作数据目录）
     Snapshot(SnapshotArgs),
+    /// 管理和消费持久化拉取订阅。
+    Persistent(PersistentArgs),
+}
+
+/// `stream=version` 起点参数。
+#[derive(Clone, Debug, PartialEq)]
+pub struct StreamVersionArg {
+    pub stream: String,
+    pub version: u64,
+}
+
+impl FromStr for StreamVersionArg {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (stream, version) = value
+            .split_once('=')
+            .ok_or_else(|| format!("非法起点 {value:?}：应为 STREAM=VERSION"))?;
+        if stream.is_empty() {
+            return Err("Stream 不能为空".into());
+        }
+        Ok(Self {
+            stream: stream.into(),
+            version: version
+                .parse()
+                .map_err(|_| format!("非法版本 {version:?}"))?,
+        })
+    }
+}
+
+/// `stream=beginning|now|version` reset 参数。
+#[derive(Clone, Debug, PartialEq)]
+pub struct PersistentResetArg {
+    pub stream: String,
+    pub start: String,
+}
+
+impl FromStr for PersistentResetArg {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (stream, start) = value
+            .split_once('=')
+            .ok_or_else(|| format!("非法 reset {value:?}：应为 STREAM=beginning|now|VERSION"))?;
+        if stream.is_empty()
+            || (start != "beginning" && start != "now" && start.parse::<u64>().is_err())
+        {
+            return Err(format!("非法 reset {value:?}"));
+        }
+        Ok(Self {
+            stream: stream.into(),
+            start: start.into(),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum PersistentActionArg {
+    Ack,
+    Retry,
+    Park,
+    Skip,
+}
+
+#[derive(Args, Debug)]
+pub struct PersistentArgs {
+    #[command(subcommand)]
+    pub action: PersistentAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PersistentAction {
+    Create(PersistentCreateArgs),
+    Update(PersistentUpdateArgs),
+    Delete(PersistentDeleteArgs),
+    Get(PersistentGetArgs),
+    List,
+    Fetch(PersistentFetchArgs),
+    Settle(PersistentSettleArgs),
+    Parked(PersistentParkedArgs),
+    Replay(PersistentReplayArgs),
+}
+
+#[derive(Args, Debug)]
+#[command(group(clap::ArgGroup::new("target").required(true).args(["stream", "all"])))]
+pub struct PersistentCreateArgs {
+    pub name: String,
+    #[arg(long, conflicts_with = "all")]
+    pub stream: Vec<String>,
+    #[arg(long, conflicts_with = "stream")]
+    pub all: bool,
+    #[arg(long)]
+    pub now: bool,
+    #[arg(long = "next", value_parser = StreamVersionArg::from_str)]
+    pub next_versions: Vec<StreamVersionArg>,
+    #[command(flatten)]
+    pub settings: PersistentSettingsArgs,
+}
+
+#[derive(Args, Debug, Clone, Default)]
+pub struct PersistentSettingsArgs {
+    #[arg(long)]
+    pub max_unacked_per_consumer: Option<u32>,
+    #[arg(long)]
+    pub max_unacked_per_group: Option<u32>,
+    #[arg(long)]
+    pub ack_timeout_ms: Option<u64>,
+    #[arg(long)]
+    pub max_retries: Option<u32>,
+    #[arg(long)]
+    pub retry_min_ms: Option<u64>,
+    #[arg(long)]
+    pub retry_max_ms: Option<u64>,
+}
+
+#[derive(Args, Debug)]
+pub struct PersistentUpdateArgs {
+    pub name: String,
+    #[arg(long)]
+    pub expected_revision: u64,
+    #[arg(long, conflicts_with = "all")]
+    pub stream: Vec<String>,
+    #[arg(long, conflicts_with = "stream")]
+    pub all: bool,
+    #[arg(long, value_parser = PersistentResetArg::from_str)]
+    pub reset: Vec<PersistentResetArg>,
+    #[command(flatten)]
+    pub settings: PersistentSettingsArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct PersistentDeleteArgs {
+    pub name: String,
+    #[arg(long)]
+    pub expected_revision: u64,
+}
+
+#[derive(Args, Debug)]
+pub struct PersistentGetArgs {
+    pub name: String,
+}
+
+#[derive(Args, Debug)]
+pub struct PersistentFetchArgs {
+    pub name: String,
+    #[arg(long)]
+    pub consumer: String,
+    #[arg(long, default_value_t = 100)]
+    pub max_events: u32,
+    #[arg(long, default_value_t = 4 * 1024 * 1024)]
+    pub max_bytes: u64,
+    #[arg(long, default_value_t = 15_000)]
+    pub wait_ms: u64,
+}
+
+#[derive(Args, Debug)]
+pub struct PersistentSettleArgs {
+    pub name: String,
+    #[arg(long)]
+    pub consumer: String,
+    #[arg(long)]
+    pub epoch: u64,
+    #[arg(long)]
+    pub delivery: String,
+    #[arg(long, value_enum)]
+    pub action: PersistentActionArg,
+    #[arg(long, default_value = "")]
+    pub reason: String,
+}
+
+#[derive(Args, Debug)]
+pub struct PersistentParkedArgs {
+    pub name: String,
+    #[arg(long, default_value_t = 0)]
+    pub offset: u32,
+    #[arg(long, default_value_t = 100)]
+    pub limit: u32,
+}
+
+#[derive(Args, Debug)]
+pub struct PersistentReplayArgs {
+    pub name: String,
 }
 
 /// 快照子命令（esctl snapshot <list|restore>）
@@ -569,5 +751,91 @@ mod tests {
         assert_eq!(parse_shard_ids("0,1,3"), Ok(vec![0, 1, 3]));
         assert_eq!(parse_shard_ids(""), Ok(vec![]));
         assert!(parse_shard_ids("0,x").is_err());
+    }
+
+    #[test]
+    fn persistent_stream_version_parse_validates_shape_and_version() {
+        assert_eq!(
+            StreamVersionArg::from_str("orders/1=7"),
+            Ok(StreamVersionArg {
+                stream: "orders/1".into(),
+                version: 7,
+            })
+        );
+        assert!(StreamVersionArg::from_str("orders/1").is_err(), "缺少等号");
+        assert!(StreamVersionArg::from_str("=7").is_err(), "Stream 为空");
+        assert!(
+            StreamVersionArg::from_str("orders/1=latest").is_err(),
+            "版本非数字"
+        );
+    }
+
+    #[test]
+    fn persistent_reset_parse_covers_named_numeric_and_invalid_starts() {
+        for (value, stream, start) in [
+            ("orders/1=beginning", "orders/1", "beginning"),
+            ("orders/1=now", "orders/1", "now"),
+            ("orders/1=42", "orders/1", "42"),
+        ] {
+            assert_eq!(
+                PersistentResetArg::from_str(value),
+                Ok(PersistentResetArg {
+                    stream: stream.into(),
+                    start: start.into(),
+                })
+            );
+        }
+        assert!(
+            PersistentResetArg::from_str("orders/1").is_err(),
+            "缺少等号"
+        );
+        assert!(PersistentResetArg::from_str("=now").is_err(), "Stream 为空");
+        assert!(
+            PersistentResetArg::from_str("orders/1=latest").is_err(),
+            "起点非法"
+        );
+    }
+
+    #[test]
+    fn persistent_create_and_settle_parse() {
+        let create = Cli::try_parse_from([
+            "esctl",
+            "persistent",
+            "create",
+            "workers",
+            "--stream",
+            "orders/1",
+            "--next",
+            "orders/1=7",
+        ])
+        .expect("解析 persistent create");
+        assert!(matches!(
+            create.command,
+            Command::Persistent(PersistentArgs {
+                action: PersistentAction::Create(PersistentCreateArgs { .. })
+            })
+        ));
+
+        let settle = Cli::try_parse_from([
+            "esctl",
+            "persistent",
+            "settle",
+            "workers",
+            "--consumer",
+            "c1",
+            "--epoch",
+            "2",
+            "--delivery",
+            "00000000-0000-0000-0000-000000000001",
+            "--action",
+            "ack",
+        ])
+        .expect("解析 persistent settle");
+        assert!(matches!(
+            settle.command,
+            Command::Persistent(PersistentArgs {
+                action: PersistentAction::Settle(PersistentSettleArgs { .. })
+            })
+        ));
     }
 }

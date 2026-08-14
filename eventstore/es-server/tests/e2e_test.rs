@@ -8,12 +8,14 @@ use es_proto::eventstore::internal_subscription_client::InternalSubscriptionClie
 use es_proto::eventstore::internal_subscription_server::InternalSubscriptionServer;
 use es_proto::eventstore::migration_server::MigrationServer;
 use es_proto::eventstore::ownership_internal_server::OwnershipInternalServer;
+use es_proto::eventstore::persistent_subscriptions_client::PersistentSubscriptionsClient;
+use es_proto::eventstore::persistent_subscriptions_server::PersistentSubscriptionsServer;
 use es_proto::eventstore::raft_admin_server::RaftAdminServer;
 use es_proto::eventstore::{event_store_client::EventStoreClient, *};
+use es_server::Server;
 use es_server::config::{
     Config, NodeConfig, PeerConfig, PlacementConfig, PlacementNode, StorageConfig,
 };
-use es_server::Server;
 
 async fn wait_shard_leader(server: &Server, shard_id: u64) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -88,6 +90,9 @@ async fn start_test_server() -> (
             .await
             .expect("初始化 raft");
     }
+    for shard_id in 0..2 {
+        wait_shard_leader(&server, shard_id).await;
+    }
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -104,7 +109,8 @@ async fn start_test_server() -> (
     .expect("创建服务");
     let handle = tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
-            .add_service(EventStoreServer::new(service))
+            .add_service(EventStoreServer::new(service.clone()))
+            .add_service(PersistentSubscriptionsServer::new(service))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await;
     });
@@ -279,6 +285,7 @@ async fn start_two_shard_servers() -> (
         let _ = tokio::try_join!(
             tonic::transport::Server::builder()
                 .add_service(EventStoreServer::new(first_service.clone()))
+                .add_service(PersistentSubscriptionsServer::new(first_service.clone()))
                 .add_service(RaftAdminServer::new(first_admin))
                 .add_service(MigrationServer::new(first_migration.clone()))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
@@ -296,6 +303,7 @@ async fn start_two_shard_servers() -> (
         let _ = tokio::try_join!(
             tonic::transport::Server::builder()
                 .add_service(EventStoreServer::new(second_service.clone()))
+                .add_service(PersistentSubscriptionsServer::new(second_service.clone()))
                 .add_service(RaftAdminServer::new(second_admin))
                 .add_service(MigrationServer::new(second_migration.clone()))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
@@ -425,6 +433,989 @@ async fn read_stream(
         out.extend(r.events);
     }
     out
+}
+
+fn persistent_stream_target(stream_id: &str) -> PersistentSubscriptionTarget {
+    persistent_streams_target(&[stream_id])
+}
+
+fn persistent_streams_target(stream_ids: &[&str]) -> PersistentSubscriptionTarget {
+    PersistentSubscriptionTarget {
+        target: Some(persistent_subscription_target::Target::Streams(
+            SubscribeStreams {
+                stream_ids: stream_ids.iter().map(|stream| (*stream).to_string()).collect(),
+            },
+        )),
+    }
+}
+
+fn persistent_all_target() -> PersistentSubscriptionTarget {
+    PersistentSubscriptionTarget {
+        target: Some(persistent_subscription_target::Target::All(Empty {})),
+    }
+}
+
+async fn settle_delivery(
+    client: &mut PersistentSubscriptionsClient<tonic::transport::Channel>,
+    group: &str,
+    consumer: &str,
+    delivery: &PersistentDelivery,
+    action: PersistentSettlementAction,
+) -> PersistentSettlementStatus {
+    let response = client
+        .settle_persistent_subscription(SettlePersistentSubscriptionRequest {
+            name: group.into(),
+            consumer_id: consumer.into(),
+            group_epoch: delivery.group_epoch,
+            settlements: vec![PersistentSettlement {
+                delivery_id: delivery.delivery_id.clone(),
+                action: action as i32,
+                reason: "e2e".into(),
+            }],
+        })
+        .await
+        .expect("结算 delivery")
+        .into_inner();
+    PersistentSettlementStatus::try_from(response.results[0].status).expect("合法结算状态")
+}
+
+async fn fetch_persistent_one(
+    client: &mut PersistentSubscriptionsClient<tonic::transport::Channel>,
+    group: &str,
+    consumer: &str,
+) -> PersistentDelivery {
+    let response = client
+        .fetch_persistent_subscription(FetchPersistentSubscriptionRequest {
+            name: group.into(),
+            consumer_id: consumer.into(),
+            max_events: 1,
+            max_bytes: 1024,
+            wait_ms: 1,
+        })
+        .await
+        .expect("拉取单条持久化订阅事件")
+        .into_inner();
+    assert_eq!(response.deliveries.len(), 1, "必须恰好拉取一条事件");
+    response.deliveries.into_iter().next().unwrap()
+}
+
+async fn wait_route_projection(server: &Server, stream: &str, expected_shard: u64) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        if server.route_table().lookup(stream).await == Some(expected_shard) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        server.route_table().lookup(stream).await,
+        Some(expected_shard),
+        "兼容路由投影未在时限内收敛: stream={stream}"
+    );
+}
+
+#[tokio::test]
+async fn persistent_subscription_pull_backpressure_retry_park_and_replay() {
+    let (addr, handle, server, _dir) = start_test_server().await;
+    let mut events = EventStoreClient::connect(addr.clone())
+        .await
+        .expect("连接事件服务");
+    for data in [b"zero".as_slice(), b"one".as_slice(), b"two".as_slice()] {
+        append_one(&mut events, "orders/persistent", data).await;
+    }
+    let mut client = PersistentSubscriptionsClient::connect(addr)
+        .await
+        .expect("连接持久化订阅服务");
+    let created = client
+        .create_persistent_subscription(CreatePersistentSubscriptionRequest {
+            name: "orders-workers".into(),
+            target: Some(persistent_stream_target("orders/persistent")),
+            start: Some(PersistentStartSpec {
+                default: PersistentStartDefault::PersistentStartBeginning as i32,
+                next_versions: Default::default(),
+            }),
+            settings: Some(PersistentSubscriptionSettings {
+                max_unacked_per_consumer: 2,
+                max_unacked_per_group: 2,
+                ack_timeout_ms: 1_000,
+                max_retries: 1,
+                retry_min_ms: 1,
+                retry_max_ms: 1,
+            }),
+        })
+        .await
+        .expect("创建持久化订阅")
+        .into_inner();
+    assert_eq!(created.revision, 1);
+
+    let first = client
+        .fetch_persistent_subscription(FetchPersistentSubscriptionRequest {
+            name: "orders-workers".into(),
+            consumer_id: "consumer-a".into(),
+            max_events: 10,
+            max_bytes: 1024,
+            wait_ms: 1,
+        })
+        .await
+        .expect("首次拉取")
+        .into_inner();
+    assert_eq!(first.deliveries.len(), 2, "单消费者额度必须限制投递数");
+    assert_eq!(first.deliveries[0].event.as_ref().unwrap().version, 0);
+    assert_eq!(first.deliveries[1].event.as_ref().unwrap().version, 1);
+
+    let competing = client
+        .fetch_persistent_subscription(FetchPersistentSubscriptionRequest {
+            name: "orders-workers".into(),
+            consumer_id: "consumer-b".into(),
+            max_events: 1,
+            max_bytes: 1024,
+            wait_ms: 1,
+        })
+        .await
+        .expect("竞争消费者拉取")
+        .into_inner();
+    assert!(competing.throttled, "组未确认额度耗尽时必须背压");
+    assert!(competing.deliveries.is_empty());
+
+    assert_eq!(
+        settle_delivery(
+            &mut client,
+            "orders-workers",
+            "consumer-a",
+            &first.deliveries[0],
+            PersistentSettlementAction::PersistentSettlementAck,
+        )
+        .await,
+        PersistentSettlementStatus::PersistentSettlementApplied
+    );
+    let leased = client
+        .fetch_persistent_subscription(FetchPersistentSubscriptionRequest {
+            name: "orders-workers".into(),
+            consumer_id: "consumer-b".into(),
+            max_events: 1,
+            max_bytes: 1024,
+            wait_ms: 1,
+        })
+        .await
+        .expect("租约竞争拉取")
+        .into_inner();
+    assert!(
+        leased.deliveries.is_empty(),
+        "同一 Stream 租约不能跨消费者并发"
+    );
+
+    let third = client
+        .fetch_persistent_subscription(FetchPersistentSubscriptionRequest {
+            name: "orders-workers".into(),
+            consumer_id: "consumer-a".into(),
+            max_events: 10,
+            max_bytes: 1024,
+            wait_ms: 1,
+        })
+        .await
+        .expect("同消费者续拉")
+        .into_inner();
+    assert_eq!(third.deliveries.len(), 1);
+    assert_eq!(third.deliveries[0].event.as_ref().unwrap().version, 2);
+
+    settle_delivery(
+        &mut client,
+        "orders-workers",
+        "consumer-a",
+        &first.deliveries[1],
+        PersistentSettlementAction::PersistentSettlementRetry,
+    )
+    .await;
+    settle_delivery(
+        &mut client,
+        "orders-workers",
+        "consumer-a",
+        &third.deliveries[0],
+        PersistentSettlementAction::PersistentSettlementAck,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    let retry = client
+        .fetch_persistent_subscription(FetchPersistentSubscriptionRequest {
+            name: "orders-workers".into(),
+            consumer_id: "consumer-a".into(),
+            max_events: 1,
+            max_bytes: 1024,
+            wait_ms: 1,
+        })
+        .await
+        .expect("重试拉取")
+        .into_inner();
+    assert_eq!(retry.deliveries.len(), 1);
+    assert_eq!(retry.deliveries[0].attempt, 1);
+    settle_delivery(
+        &mut client,
+        "orders-workers",
+        "consumer-a",
+        &retry.deliveries[0],
+        PersistentSettlementAction::PersistentSettlementRetry,
+    )
+    .await;
+
+    let parked = client
+        .list_parked_persistent_subscription(ListParkedPersistentSubscriptionRequest {
+            name: "orders-workers".into(),
+            offset: 0,
+            limit: 10,
+        })
+        .await
+        .expect("读取 parked")
+        .into_inner();
+    assert_eq!(parked.events.len(), 1);
+    assert_eq!(parked.events[0].event.as_ref().unwrap().version, 1);
+    assert_eq!(
+        client
+            .replay_parked_persistent_subscription(ReplayParkedPersistentSubscriptionRequest {
+                name: "orders-workers".into(),
+            })
+            .await
+            .expect("重放 parked")
+            .into_inner()
+            .replayed_count,
+        1
+    );
+    let replayed = client
+        .fetch_persistent_subscription(FetchPersistentSubscriptionRequest {
+            name: "orders-workers".into(),
+            consumer_id: "consumer-a".into(),
+            max_events: 1,
+            max_bytes: 1024,
+            wait_ms: 1,
+        })
+        .await
+        .expect("拉取重放事件")
+        .into_inner();
+    assert!(replayed.deliveries[0].replayed);
+    settle_delivery(
+        &mut client,
+        "orders-workers",
+        "consumer-a",
+        &replayed.deliveries[0],
+        PersistentSettlementAction::PersistentSettlementAck,
+    )
+    .await;
+
+    let info = client
+        .get_persistent_subscription(GetPersistentSubscriptionRequest {
+            name: "orders-workers".into(),
+        })
+        .await
+        .expect("读取组")
+        .into_inner();
+    assert_eq!(info.active_delivery_count, 0);
+    assert_eq!(info.parked_count, 0);
+    assert_eq!(
+        client
+            .list_persistent_subscriptions(ListPersistentSubscriptionsRequest {})
+            .await
+            .expect("枚举组")
+            .into_inner()
+            .subscriptions
+            .len(),
+        1
+    );
+    client
+        .delete_persistent_subscription(DeletePersistentSubscriptionRequest {
+            name: "orders-workers".into(),
+            expected_revision: info.revision,
+        })
+        .await
+        .expect("删除组");
+    assert_eq!(
+        client
+            .get_persistent_subscription(GetPersistentSubscriptionRequest {
+                name: "orders-workers".into(),
+            })
+            .await
+            .expect_err("删除后组不存在")
+            .code(),
+        tonic::Code::NotFound
+    );
+
+    handle.abort();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn persistent_subscription_ack_timeout_honors_retry_backoff() {
+    let (addr, handle, server, _dir) = start_test_server().await;
+    let mut events = EventStoreClient::connect(addr.clone())
+        .await
+        .expect("连接事件服务");
+    append_one(&mut events, "orders/retry-backoff", b"zero").await;
+    append_one(&mut events, "orders/retry-backoff", b"one").await;
+
+    let mut client = PersistentSubscriptionsClient::connect(addr)
+        .await
+        .expect("连接持久化订阅服务");
+    client
+        .create_persistent_subscription(CreatePersistentSubscriptionRequest {
+            name: "retry-backoff-workers".into(),
+            target: Some(persistent_stream_target("orders/retry-backoff")),
+            start: Some(PersistentStartSpec {
+                default: PersistentStartDefault::PersistentStartBeginning as i32,
+                next_versions: Default::default(),
+            }),
+            settings: Some(PersistentSubscriptionSettings {
+                max_unacked_per_consumer: 2,
+                max_unacked_per_group: 2,
+                ack_timeout_ms: 5,
+                max_retries: 2,
+                retry_min_ms: 200,
+                retry_max_ms: 200,
+            }),
+        })
+        .await
+        .expect("创建持久化订阅");
+
+    let first = client
+        .fetch_persistent_subscription(FetchPersistentSubscriptionRequest {
+            name: "retry-backoff-workers".into(),
+            consumer_id: "consumer-a".into(),
+            max_events: 1,
+            max_bytes: 1024,
+            wait_ms: 1,
+        })
+        .await
+        .expect("首次拉取")
+        .into_inner();
+    assert_eq!(first.deliveries.len(), 1);
+    assert_eq!(first.deliveries[0].event.as_ref().unwrap().version, 0);
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let backing_off = client
+        .fetch_persistent_subscription(FetchPersistentSubscriptionRequest {
+            name: "retry-backoff-workers".into(),
+            consumer_id: "consumer-a".into(),
+            max_events: 2,
+            max_bytes: 1024,
+            wait_ms: 1,
+        })
+        .await
+        .expect("过期后进入退避")
+        .into_inner();
+    assert!(backing_off.deliveries.is_empty());
+    assert!(!backing_off.caught_up, "尚有延迟重试时不能报告 caught up");
+    assert!(
+        backing_off.retry_after_ms > 0 && backing_off.retry_after_ms <= 200,
+        "必须返回剩余退避时间"
+    );
+
+    tokio::time::sleep(Duration::from_millis(210)).await;
+    let retried = client
+        .fetch_persistent_subscription(FetchPersistentSubscriptionRequest {
+            name: "retry-backoff-workers".into(),
+            consumer_id: "consumer-a".into(),
+            max_events: 2,
+            max_bytes: 1024,
+            wait_ms: 1,
+        })
+        .await
+        .expect("退避到期后重投")
+        .into_inner();
+    assert_eq!(
+        retried.deliveries.len(),
+        1,
+        "同一 Stream 先解决 checkpoint 缺口"
+    );
+    assert_eq!(retried.deliveries[0].event.as_ref().unwrap().version, 0);
+    assert_eq!(retried.deliveries[0].attempt, 1);
+    assert_eq!(
+        settle_delivery(
+            &mut client,
+            "retry-backoff-workers",
+            "consumer-a",
+            &retried.deliveries[0],
+            PersistentSettlementAction::PersistentSettlementAck,
+        )
+        .await,
+        PersistentSettlementStatus::PersistentSettlementApplied
+    );
+
+    let next = client
+        .fetch_persistent_subscription(FetchPersistentSubscriptionRequest {
+            name: "retry-backoff-workers".into(),
+            consumer_id: "consumer-a".into(),
+            max_events: 1,
+            max_bytes: 1024,
+            wait_ms: 1,
+        })
+        .await
+        .expect("缺口解决后继续拉取")
+        .into_inner();
+    assert_eq!(next.deliveries.len(), 1);
+    assert_eq!(next.deliveries[0].event.as_ref().unwrap().version, 1);
+
+    handle.abort();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn persistent_subscription_epoch_change_redelivers_unresolved_gap() {
+    let (addr, handle, server, _dir) = start_test_server().await;
+    let mut events = EventStoreClient::connect(addr.clone())
+        .await
+        .expect("连接事件服务");
+    append_one(&mut events, "epoch-a", b"a0").await;
+    append_one(&mut events, "epoch-a", b"a1").await;
+    append_one(&mut events, "epoch-b", b"b0").await;
+
+    let mut client = PersistentSubscriptionsClient::connect(addr)
+        .await
+        .expect("连接持久化订阅服务");
+    let created = client
+        .create_persistent_subscription(CreatePersistentSubscriptionRequest {
+            name: "epoch-workers".into(),
+            target: Some(persistent_streams_target(&["epoch-a", "epoch-b"])),
+            start: Some(PersistentStartSpec {
+                default: PersistentStartDefault::PersistentStartBeginning as i32,
+                next_versions: Default::default(),
+            }),
+            settings: None,
+        })
+        .await
+        .expect("创建 epoch 回归组")
+        .into_inner();
+    let first = client
+        .fetch_persistent_subscription(FetchPersistentSubscriptionRequest {
+            name: "epoch-workers".into(),
+            consumer_id: "epoch-consumer".into(),
+            max_events: 3,
+            max_bytes: 4096,
+            wait_ms: 1,
+        })
+        .await
+        .expect("首次拉取乱序确认批次")
+        .into_inner();
+    let a0 = first
+        .deliveries
+        .iter()
+        .find(|delivery| {
+            let event = delivery.event.as_ref().unwrap();
+            event.stream_id == "epoch-a" && event.version == 0
+        })
+        .expect("批次包含 epoch-a v0")
+        .clone();
+    let a1 = first
+        .deliveries
+        .iter()
+        .find(|delivery| {
+            let event = delivery.event.as_ref().unwrap();
+            event.stream_id == "epoch-a" && event.version == 1
+        })
+        .expect("批次包含 epoch-a v1")
+        .clone();
+    assert_eq!(
+        settle_delivery(
+            &mut client,
+            "epoch-workers",
+            "epoch-consumer",
+            &a1,
+            PersistentSettlementAction::PersistentSettlementAck,
+        )
+        .await,
+        PersistentSettlementStatus::PersistentSettlementApplied
+    );
+
+    let updated = client
+        .update_persistent_subscription(UpdatePersistentSubscriptionRequest {
+            name: "epoch-workers".into(),
+            expected_revision: created.revision,
+            target: None,
+            settings: None,
+            resets: vec![PersistentStreamReset {
+                stream_id: "epoch-b".into(),
+                start: Some(persistent_stream_reset::Start::Beginning(Empty {})),
+            }],
+        })
+        .await
+        .expect("reset 另一条 Stream")
+        .into_inner();
+    assert!(updated.epoch > a0.group_epoch);
+
+    let redelivered = fetch_persistent_one(&mut client, "epoch-workers", "epoch-consumer").await;
+    let event = redelivered.event.as_ref().unwrap();
+    assert_eq!((event.stream_id.as_str(), event.version), ("epoch-a", 0));
+    assert_eq!(redelivered.group_epoch, updated.epoch);
+    assert_eq!(redelivered.attempt, a0.attempt);
+    assert_eq!(
+        settle_delivery(
+            &mut client,
+            "epoch-workers",
+            "epoch-consumer",
+            &redelivered,
+            PersistentSettlementAction::PersistentSettlementAck,
+        )
+        .await,
+        PersistentSettlementStatus::PersistentSettlementApplied
+    );
+
+    append_one(&mut events, "epoch-a", b"a2").await;
+    let next = client
+        .fetch_persistent_subscription(FetchPersistentSubscriptionRequest {
+            name: "epoch-workers".into(),
+            consumer_id: "epoch-consumer".into(),
+            max_events: 2,
+            max_bytes: 4096,
+            wait_ms: 1,
+        })
+        .await
+        .expect("闭合 gap 后拉取下一版本")
+        .into_inner();
+    assert!(next.deliveries.iter().any(|delivery| {
+        let event = delivery.event.as_ref().unwrap();
+        event.stream_id == "epoch-a" && event.version == 2
+    }));
+
+    handle.abort();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn persistent_subscription_scan_skips_ineligible_streams_without_spending_limit() {
+    let (addr, handle, server, _dir) = start_test_server().await;
+    let mut events = EventStoreClient::connect(addr.clone())
+        .await
+        .expect("连接事件服务");
+    for stream in ["scan-a", "scan-b", "scan-c"] {
+        append_one(&mut events, stream, b"v0").await;
+    }
+    let mut client = PersistentSubscriptionsClient::connect(addr)
+        .await
+        .expect("连接持久化订阅服务");
+    client
+        .create_persistent_subscription(CreatePersistentSubscriptionRequest {
+            name: "scan-workers".into(),
+            target: Some(persistent_streams_target(&["scan-a", "scan-b", "scan-c"])),
+            start: Some(PersistentStartSpec {
+                default: PersistentStartDefault::PersistentStartBeginning as i32,
+                next_versions: Default::default(),
+            }),
+            settings: Some(PersistentSubscriptionSettings {
+                max_unacked_per_consumer: 8,
+                max_unacked_per_group: 8,
+                ack_timeout_ms: 60_000,
+                max_retries: 3,
+                retry_min_ms: 60_000,
+                retry_max_ms: 60_000,
+            }),
+        })
+        .await
+        .expect("创建扫描公平性回归组");
+
+    let a0 = fetch_persistent_one(&mut client, "scan-workers", "scan-consumer").await;
+    assert_eq!(a0.event.as_ref().unwrap().stream_id, "scan-a");
+    settle_delivery(
+        &mut client,
+        "scan-workers",
+        "scan-consumer",
+        &a0,
+        PersistentSettlementAction::PersistentSettlementAck,
+    )
+    .await;
+
+    let b0 = fetch_persistent_one(&mut client, "scan-workers", "scan-consumer").await;
+    assert_eq!(b0.event.as_ref().unwrap().stream_id, "scan-b");
+    settle_delivery(
+        &mut client,
+        "scan-workers",
+        "scan-consumer",
+        &b0,
+        PersistentSettlementAction::PersistentSettlementRetry,
+    )
+    .await;
+
+    let c0 = fetch_persistent_one(&mut client, "scan-workers", "scan-consumer").await;
+    assert_eq!(c0.event.as_ref().unwrap().stream_id, "scan-c");
+    settle_delivery(
+        &mut client,
+        "scan-workers",
+        "scan-consumer",
+        &c0,
+        PersistentSettlementAction::PersistentSettlementAck,
+    )
+    .await;
+
+    append_one(&mut events, "scan-a", b"v1").await;
+    let a1 = fetch_persistent_one(&mut client, "scan-workers", "scan-consumer").await;
+    assert_eq!(a1.event.as_ref().unwrap().stream_id, "scan-a");
+    settle_delivery(
+        &mut client,
+        "scan-workers",
+        "scan-consumer",
+        &a1,
+        PersistentSettlementAction::PersistentSettlementAck,
+    )
+    .await;
+
+    append_one(&mut events, "scan-c", b"v1").await;
+    let c1 = fetch_persistent_one(&mut client, "scan-workers", "scan-consumer").await;
+    let event = c1.event.as_ref().unwrap();
+    assert_eq!((event.stream_id.as_str(), event.version), ("scan-c", 1));
+
+    handle.abort();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn persistent_subscription_all_discovers_new_stream_and_long_polls() {
+    let (addr, handle, server, _dir) = start_test_server().await;
+    let mut client = PersistentSubscriptionsClient::connect(addr.clone())
+        .await
+        .expect("连接持久化订阅服务");
+    let created = client
+        .create_persistent_subscription(CreatePersistentSubscriptionRequest {
+            name: "all-workers".into(),
+            target: Some(persistent_all_target()),
+            start: Some(PersistentStartSpec {
+                default: PersistentStartDefault::PersistentStartBeginning as i32,
+                next_versions: Default::default(),
+            }),
+            settings: None,
+        })
+        .await
+        .expect("创建 $all 组")
+        .into_inner();
+
+    let started = tokio::time::Instant::now();
+    let empty = client
+        .fetch_persistent_subscription(FetchPersistentSubscriptionRequest {
+            name: "all-workers".into(),
+            consumer_id: "consumer-all".into(),
+            max_events: 10,
+            max_bytes: 1024,
+            wait_ms: 80,
+        })
+        .await
+        .expect("空组长轮询")
+        .into_inner();
+    assert!(empty.caught_up);
+    assert!(started.elapsed() >= Duration::from_millis(70));
+
+    let mut events = EventStoreClient::connect(addr).await.expect("连接事件服务");
+    append_one(&mut events, "created-after-group", b"new").await;
+    client
+        .update_persistent_subscription(UpdatePersistentSubscriptionRequest {
+            name: "all-workers".into(),
+            expected_revision: created.revision,
+            target: None,
+            settings: Some(PersistentSubscriptionSettings::default()),
+            resets: vec![],
+        })
+        .await
+        .expect("Fetch 对账前更新 $all settings")
+        .into_inner();
+    let fetched = client
+        .fetch_persistent_subscription(FetchPersistentSubscriptionRequest {
+            name: "all-workers".into(),
+            consumer_id: "consumer-all".into(),
+            max_events: 10,
+            max_bytes: 1024,
+            wait_ms: 100,
+        })
+        .await
+        .expect("拉取新发现 Stream")
+        .into_inner();
+    assert_eq!(fetched.deliveries.len(), 1);
+    assert_eq!(
+        fetched.deliveries[0].event.as_ref().unwrap().stream_id,
+        "created-after-group"
+    );
+
+    handle.abort();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn persistent_subscription_validates_start_update_limits_and_paging() {
+    let (addr, handle, server, _dir) = start_test_server().await;
+    let mut events = EventStoreClient::connect(addr.clone())
+        .await
+        .expect("连接事件服务");
+    for stream in ["validation-a", "validation-b"] {
+        append_one(&mut events, stream, b"zero").await;
+        append_one(&mut events, stream, b"one").await;
+    }
+    let mut client = PersistentSubscriptionsClient::connect(addr)
+        .await
+        .expect("连接持久化订阅服务");
+
+    let empty_target = client
+        .create_persistent_subscription(CreatePersistentSubscriptionRequest {
+            name: "empty-target".into(),
+            target: Some(PersistentSubscriptionTarget {
+                target: Some(persistent_subscription_target::Target::Streams(
+                    SubscribeStreams {
+                        stream_ids: vec![String::new()],
+                    },
+                )),
+            }),
+            start: None,
+            settings: None,
+        })
+        .await
+        .expect_err("空 Stream 目标必须拒绝");
+    assert_eq!(empty_target.code(), tonic::Code::InvalidArgument);
+
+    let unknown_start = client
+        .create_persistent_subscription(CreatePersistentSubscriptionRequest {
+            name: "unknown-start".into(),
+            target: Some(persistent_stream_target("validation-a")),
+            start: Some(PersistentStartSpec {
+                default: PersistentStartDefault::PersistentStartBeginning as i32,
+                next_versions: [(String::from("outside"), 0)].into_iter().collect(),
+            }),
+            settings: None,
+        })
+        .await
+        .expect_err("非目标 Stream 起点必须拒绝");
+    assert_eq!(unknown_start.code(), tonic::Code::InvalidArgument);
+
+    let past_head = client
+        .create_persistent_subscription(CreatePersistentSubscriptionRequest {
+            name: "past-head".into(),
+            target: Some(persistent_stream_target("validation-a")),
+            start: Some(PersistentStartSpec {
+                default: PersistentStartDefault::PersistentStartBeginning as i32,
+                next_versions: [(String::from("validation-a"), 99)].into_iter().collect(),
+            }),
+            settings: None,
+        })
+        .await
+        .expect_err("超过 head 的起点必须拒绝");
+    assert_eq!(past_head.code(), tonic::Code::InvalidArgument);
+
+    client
+        .create_persistent_subscription(CreatePersistentSubscriptionRequest {
+            name: "now-workers".into(),
+            target: Some(persistent_stream_target("validation-a")),
+            start: Some(PersistentStartSpec {
+                default: PersistentStartDefault::PersistentStartNow as i32,
+                next_versions: Default::default(),
+            }),
+            settings: None,
+        })
+        .await
+        .expect("创建 FromNow 组");
+
+    let created = client
+        .create_persistent_subscription(CreatePersistentSubscriptionRequest {
+            name: "validation-workers".into(),
+            target: Some(persistent_stream_target("validation-a")),
+            start: Some(PersistentStartSpec {
+                default: PersistentStartDefault::PersistentStartBeginning as i32,
+                next_versions: [(String::from("validation-a"), 0)].into_iter().collect(),
+            }),
+            settings: None,
+        })
+        .await
+        .expect("创建校验组")
+        .into_inner();
+
+    let missing_reset = client
+        .update_persistent_subscription(UpdatePersistentSubscriptionRequest {
+            name: "validation-workers".into(),
+            expected_revision: created.revision,
+            target: Some(PersistentSubscriptionTarget {
+                target: Some(persistent_subscription_target::Target::Streams(
+                    SubscribeStreams {
+                        stream_ids: vec!["validation-a".into(), "validation-b".into()],
+                    },
+                )),
+            }),
+            settings: None,
+            resets: vec![],
+        })
+        .await
+        .expect_err("新增 Stream 缺少 reset 必须拒绝");
+    assert_eq!(missing_reset.code(), tonic::Code::InvalidArgument);
+
+    let outside_reset = client
+        .update_persistent_subscription(UpdatePersistentSubscriptionRequest {
+            name: "validation-workers".into(),
+            expected_revision: created.revision,
+            target: None,
+            settings: None,
+            resets: vec![PersistentStreamReset {
+                stream_id: "validation-b".into(),
+                start: Some(persistent_stream_reset::Start::Beginning(Empty {})),
+            }],
+        })
+        .await
+        .expect_err("目标外 reset 必须拒绝");
+    assert_eq!(outside_reset.code(), tonic::Code::InvalidArgument);
+
+    let expanded = client
+        .update_persistent_subscription(UpdatePersistentSubscriptionRequest {
+            name: "validation-workers".into(),
+            expected_revision: created.revision,
+            target: Some(PersistentSubscriptionTarget {
+                target: Some(persistent_subscription_target::Target::Streams(
+                    SubscribeStreams {
+                        stream_ids: vec!["validation-a".into(), "validation-b".into()],
+                    },
+                )),
+            }),
+            settings: None,
+            resets: vec![PersistentStreamReset {
+                stream_id: "validation-b".into(),
+                start: Some(persistent_stream_reset::Start::Beginning(Empty {})),
+            }],
+        })
+        .await
+        .expect("新增目标并指定 reset")
+        .into_inner();
+    let reset = client
+        .update_persistent_subscription(UpdatePersistentSubscriptionRequest {
+            name: "validation-workers".into(),
+            expected_revision: expanded.revision,
+            target: None,
+            settings: None,
+            resets: vec![PersistentStreamReset {
+                stream_id: "validation-a".into(),
+                start: Some(persistent_stream_reset::Start::NextVersion(0)),
+            }],
+        })
+        .await
+        .expect("同目标 reset")
+        .into_inner();
+    assert!(reset.epoch > expanded.epoch);
+
+    for request in [
+        FetchPersistentSubscriptionRequest {
+            name: String::new(),
+            consumer_id: "consumer".into(),
+            max_events: 1,
+            max_bytes: 1,
+            wait_ms: 1,
+        },
+        FetchPersistentSubscriptionRequest {
+            name: "validation-workers".into(),
+            consumer_id: String::new(),
+            max_events: 1,
+            max_bytes: 1,
+            wait_ms: 1,
+        },
+        FetchPersistentSubscriptionRequest {
+            name: "validation-workers".into(),
+            consumer_id: "consumer".into(),
+            max_events: es_core::persistent::MAX_FETCH_EVENTS + 1,
+            max_bytes: 1,
+            wait_ms: 1,
+        },
+        FetchPersistentSubscriptionRequest {
+            name: "validation-workers".into(),
+            consumer_id: "consumer".into(),
+            max_events: 1,
+            max_bytes: es_core::persistent::MAX_FETCH_BYTES + 1,
+            wait_ms: 1,
+        },
+        FetchPersistentSubscriptionRequest {
+            name: "validation-workers".into(),
+            consumer_id: "consumer".into(),
+            max_events: 1,
+            max_bytes: 1,
+            wait_ms: es_core::persistent::MAX_FETCH_WAIT_MS + 1,
+        },
+    ] {
+        assert_eq!(
+            client
+                .fetch_persistent_subscription(request)
+                .await
+                .expect_err("非法 Fetch 参数必须拒绝")
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+
+    let fetched = client
+        .fetch_persistent_subscription(FetchPersistentSubscriptionRequest {
+            name: "validation-workers".into(),
+            consumer_id: "consumer".into(),
+            max_events: 0,
+            max_bytes: 0,
+            wait_ms: 0,
+        })
+        .await
+        .expect("零值使用服务端默认 Fetch 参数")
+        .into_inner();
+    assert!(fetched.deliveries.len() >= 2);
+
+    for request in [
+        SettlePersistentSubscriptionRequest {
+            name: "validation-workers".into(),
+            consumer_id: String::new(),
+            group_epoch: fetched.deliveries[0].group_epoch,
+            settlements: vec![PersistentSettlement {
+                delivery_id: fetched.deliveries[0].delivery_id.clone(),
+                action: PersistentSettlementAction::PersistentSettlementAck as i32,
+                reason: String::new(),
+            }],
+        },
+        SettlePersistentSubscriptionRequest {
+            name: "validation-workers".into(),
+            consumer_id: "consumer".into(),
+            group_epoch: fetched.deliveries[0].group_epoch,
+            settlements: vec![],
+        },
+    ] {
+        assert_eq!(
+            client
+                .settle_persistent_subscription(request)
+                .await
+                .expect_err("空 Settle 参数必须拒绝")
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+
+    client
+        .settle_persistent_subscription(SettlePersistentSubscriptionRequest {
+            name: "validation-workers".into(),
+            consumer_id: "consumer".into(),
+            group_epoch: fetched.deliveries[0].group_epoch,
+            settlements: fetched
+                .deliveries
+                .iter()
+                .take(2)
+                .map(|delivery| PersistentSettlement {
+                    delivery_id: delivery.delivery_id.clone(),
+                    action: PersistentSettlementAction::PersistentSettlementPark as i32,
+                    reason: "paging".into(),
+                })
+                .collect(),
+        })
+        .await
+        .expect("停放两条 delivery");
+    let default_page = client
+        .list_parked_persistent_subscription(ListParkedPersistentSubscriptionRequest {
+            name: "validation-workers".into(),
+            offset: 0,
+            limit: 0,
+        })
+        .await
+        .expect("parked 默认分页")
+        .into_inner();
+    assert_eq!(default_page.events.len(), 2);
+    let first_page = client
+        .list_parked_persistent_subscription(ListParkedPersistentSubscriptionRequest {
+            name: "validation-workers".into(),
+            offset: 0,
+            limit: 1,
+        })
+        .await
+        .expect("parked 显式分页")
+        .into_inner();
+    assert_eq!(first_page.events.len(), 1);
+    assert_eq!(first_page.next_offset, 1);
+
+    handle.abort();
+    server.shutdown().await;
 }
 
 #[tokio::test]
@@ -1505,6 +2496,61 @@ async fn subscribe_aggregates_remote_shard_through_internal_rpc() {
     drop(subscription);
     first_handle.abort();
     second_handle.abort();
+    first.shutdown().await;
+    second.shutdown().await;
+}
+
+#[tokio::test]
+async fn persistent_fetch_reads_remote_data_shard_through_internal_rpc() {
+    let (first_addr, first_handle, second_handle, first, second, _first_dir, _second_dir) =
+        start_two_shard_servers().await;
+    let second_addr = first.config().node.peers[0].addr.clone();
+    let mut first_events = EventStoreClient::connect(first_addr)
+        .await
+        .expect("连接数据节点");
+    let mut second_events = EventStoreClient::connect(second_addr.clone())
+        .await
+        .expect("连接 control 节点");
+    append_one(&mut second_events, "persistent-on-control", b"control").await;
+    append_one(&mut first_events, "persistent-on-remote", b"remote").await;
+    assert_eq!(
+        second.route_table().lookup("persistent-on-remote").await,
+        Some(1),
+        "第二个 Stream 应按最少负载落到远程数据 Shard"
+    );
+
+    let mut subscriptions = PersistentSubscriptionsClient::connect(second_addr)
+        .await
+        .expect("连接 control Shard 节点");
+    subscriptions
+        .create_persistent_subscription(CreatePersistentSubscriptionRequest {
+            name: "remote-workers".into(),
+            target: Some(persistent_stream_target("persistent-on-remote")),
+            start: None,
+            settings: None,
+        })
+        .await
+        .expect("创建远程数据源订阅");
+    let fetched = subscriptions
+        .fetch_persistent_subscription(FetchPersistentSubscriptionRequest {
+            name: "remote-workers".into(),
+            consumer_id: "consumer-remote".into(),
+            max_events: 1,
+            max_bytes: 1024,
+            wait_ms: 100,
+        })
+        .await
+        .expect("跨内部 RPC 拉取")
+        .into_inner();
+    assert_eq!(fetched.deliveries.len(), 1);
+    let event = fetched.deliveries[0].event.as_ref().expect("公开事件");
+    assert_eq!(event.stream_id, "persistent-on-remote");
+    assert_eq!(event.data, b"remote");
+
+    first_handle.abort();
+    second_handle.abort();
+    first.shutdown().await;
+    second.shutdown().await;
 }
 
 #[tokio::test]
@@ -1925,6 +2971,8 @@ async fn subscribe_reports_degraded_when_remote_source_is_unavailable() {
     }
     drop(stream);
     first_handle.abort();
+    first.shutdown().await;
+    second.shutdown().await;
 }
 
 #[tokio::test]
@@ -1971,24 +3019,12 @@ async fn subscribe_all_aggregates_remote_shards_and_emits_caught_up_once() {
         .await
         .expect("连接远程节点");
     // 通过权威归属 interface 创建，顺序保证两个 Stream 分别落到远程和本地 Shard。
-    append_one(&mut second_client, "all-remote-stream", b"remote-history").await;
-    append_one(&mut first_client, "all-local-stream", b"local-history").await;
-    assert_eq!(
-        first.route_table().lookup("all-remote-stream").await,
-        Some(0)
-    );
-    assert_eq!(
-        first.route_table().lookup("all-local-stream").await,
-        Some(1)
-    );
-    assert_eq!(
-        second.route_table().lookup("all-remote-stream").await,
-        Some(0)
-    );
-    assert_eq!(
-        second.route_table().lookup("all-local-stream").await,
-        Some(1)
-    );
+    let remote = append_one(&mut second_client, "all-remote-stream", b"remote-history").await;
+    let local = append_one(&mut first_client, "all-local-stream", b"local-history").await;
+    assert_eq!(remote.shard_id, 0);
+    assert_eq!(local.shard_id, 1);
+    wait_route_projection(&first, "all-remote-stream", 0).await;
+    wait_route_projection(&first, "all-local-stream", 1).await;
 
     let mut subscription = first_client
         .subscribe(SubscribeRequest {
@@ -2033,6 +3069,8 @@ async fn subscribe_all_aggregates_remote_shards_and_emits_caught_up_once() {
     drop(subscription);
     first_handle.abort();
     second_handle.abort();
+    first.shutdown().await;
+    second.shutdown().await;
 }
 
 #[tokio::test]

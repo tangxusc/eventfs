@@ -550,7 +550,7 @@ pub enum ClientError {
 
 impl ClientError {
     /// 由 gRPC Status 构造 RpcFailed（保留码与消息）
-    fn from_status(status: Status) -> Self {
+    pub(crate) fn from_status(status: Status) -> Self {
         ClientError::RpcFailed {
             code: status.code(),
             message: status.message().to_string(),

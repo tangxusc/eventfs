@@ -1,11 +1,32 @@
 //! RaftStateMachine apply 语义测试。
 
+use openraft::RaftSnapshotBuilder;
 use openraft::storage::RaftStateMachine;
 
 use super::*;
 use crate::EsResponse;
 use es_core::{ExpectedVersion, Hlc};
 use es_core::{OwnershipCommand, OwnershipOutcome};
+
+fn persistent_group() -> es_core::PersistentGroup {
+    es_core::PersistentGroup::new(
+        "orders-workers".into(),
+        es_core::PersistentTarget::Streams(std::collections::BTreeSet::from(["orders/1".into()])),
+        es_core::PersistentSettings::default(),
+        std::collections::BTreeMap::from([("orders/1".into(), es_core::StreamProgress::new(0, 1))]),
+    )
+    .expect("构造持久化订阅组")
+}
+
+fn persistent_candidate(version: u64) -> es_core::DeliveryCandidate {
+    es_core::DeliveryCandidate {
+        delivery_id: uuid::Uuid::new_v4(),
+        stream_id: "orders/1".into(),
+        version,
+        event_id: uuid::Uuid::new_v4(),
+        replayed: false,
+    }
+}
 
 fn hlc(wall: u64) -> Hlc {
     Hlc { wall, logical: 0 }
@@ -32,6 +53,198 @@ fn append_entry(
         *h = hlc(1000 + index);
     }
     e
+}
+
+#[tokio::test]
+async fn persistent_subscription_same_batch_create_claim_settle_is_visible() {
+    let (mut st, _d) = new_storage(0);
+    let candidate = persistent_candidate(0);
+    let responses = st
+        .apply(vec![
+            request_entry(
+                0,
+                crate::EsRequest::PersistentSubscription {
+                    command: crate::PersistentSubscriptionCommand::Create {
+                        group: persistent_group(),
+                    },
+                },
+            ),
+            request_entry(
+                1,
+                crate::EsRequest::PersistentSubscription {
+                    command: crate::PersistentSubscriptionCommand::Claim {
+                        name: "orders-workers".into(),
+                        consumer_id: "consumer-a".into(),
+                        now_ms: 10,
+                        deadline_ms: 20,
+                        candidates: vec![candidate.clone()],
+                    },
+                },
+            ),
+            request_entry(
+                2,
+                crate::EsRequest::PersistentSubscription {
+                    command: crate::PersistentSubscriptionCommand::Settle {
+                        name: "orders-workers".into(),
+                        consumer_id: "consumer-a".into(),
+                        group_epoch: 1,
+                        now_ms: 11,
+                        settlements: vec![es_core::Settlement {
+                            delivery_id: candidate.delivery_id,
+                            action: es_core::SettlementAction::Ack,
+                            reason: String::new(),
+                        }],
+                    },
+                },
+            ),
+        ])
+        .await
+        .expect("应用持久化订阅批次");
+
+    assert!(matches!(
+        &responses[1],
+        crate::EsResponse::PersistentSubscription(
+            crate::PersistentSubscriptionResponse::Claimed(deliveries)
+        ) if deliveries.len() == 1
+    ));
+    assert!(matches!(
+        &responses[2],
+        crate::EsResponse::PersistentSubscription(
+            crate::PersistentSubscriptionResponse::Settled(results)
+        ) if results == &[es_core::SettlementResult::Applied]
+    ));
+    let stored = st
+        .read_persistent_group("orders-workers")
+        .expect("读取组")
+        .expect("组存在");
+    assert!(stored.deliveries.is_empty());
+    assert_eq!(stored.progress["orders/1"].next_version, 1);
+}
+
+#[tokio::test]
+async fn persistent_subscription_reconciles_ownership_generation_idempotently() {
+    let (mut st, _d) = new_storage(0);
+    let candidate = persistent_candidate(0);
+    let responses = st
+        .apply(vec![
+            request_entry(
+                0,
+                crate::EsRequest::PersistentSubscription {
+                    command: crate::PersistentSubscriptionCommand::Create {
+                        group: persistent_group(),
+                    },
+                },
+            ),
+            request_entry(
+                1,
+                crate::EsRequest::PersistentSubscription {
+                    command: crate::PersistentSubscriptionCommand::Claim {
+                        name: "orders-workers".into(),
+                        consumer_id: "consumer-a".into(),
+                        now_ms: 10,
+                        deadline_ms: 20,
+                        candidates: vec![candidate],
+                    },
+                },
+            ),
+            request_entry(
+                2,
+                crate::EsRequest::PersistentSubscription {
+                    command: crate::PersistentSubscriptionCommand::ReconcileOwnership {
+                        name: "orders-workers".into(),
+                        generations: std::collections::BTreeMap::from([("orders/1".into(), 2)]),
+                    },
+                },
+            ),
+            request_entry(
+                3,
+                crate::EsRequest::PersistentSubscription {
+                    command: crate::PersistentSubscriptionCommand::ReconcileOwnership {
+                        name: "orders-workers".into(),
+                        generations: std::collections::BTreeMap::from([("orders/1".into(), 2)]),
+                    },
+                },
+            ),
+        ])
+        .await
+        .expect("应用 ownership generation 对账");
+
+    assert!(matches!(
+        &responses[2],
+        crate::EsResponse::PersistentSubscription(
+            crate::PersistentSubscriptionResponse::Group(group)
+        ) if group.progress["orders/1"] == es_core::StreamProgress::new(0, 2)
+            && group.deliveries.is_empty()
+    ));
+    assert!(matches!(
+        &responses[3],
+        crate::EsResponse::PersistentSubscription(
+            crate::PersistentSubscriptionResponse::Group(group)
+        ) if group.revision == 2
+    ));
+    let stored = st
+        .read_persistent_group("orders-workers")
+        .expect("读取对账后的组")
+        .expect("组存在");
+    assert_eq!(stored.progress["orders/1"], es_core::StreamProgress::new(0, 2));
+    assert!(stored.deliveries.is_empty());
+    assert_eq!(stored.revision, 2, "相同 generation 重放必须幂等");
+}
+
+#[tokio::test]
+async fn persistent_subscription_survives_storage_reopen() {
+    let dir = tempfile::tempdir().expect("建临时目录");
+    let path = dir.path().to_path_buf();
+    let snapshots = path.join("snapshots");
+    let tree = std::sync::Arc::new(
+        surrealkv::TreeBuilder::new()
+            .with_path(path.clone())
+            .build()
+            .expect("打开 tree"),
+    );
+    let mut st = crate::EsStorage::new(
+        0,
+        tree,
+        crate::snapshot::SnapshotConfig {
+            dir: snapshots.clone(),
+            ..Default::default()
+        },
+    )
+    .expect("创建存储");
+    st.apply(vec![request_entry(
+        0,
+        crate::EsRequest::PersistentSubscription {
+            command: crate::PersistentSubscriptionCommand::Create {
+                group: persistent_group(),
+            },
+        },
+    )])
+    .await
+    .expect("创建组");
+    st.close().await.expect("关闭存储");
+    drop(st);
+
+    let tree = std::sync::Arc::new(
+        surrealkv::TreeBuilder::new()
+            .with_path(path)
+            .build()
+            .expect("重新打开 tree"),
+    );
+    let reopened = crate::EsStorage::new(
+        0,
+        tree,
+        crate::snapshot::SnapshotConfig {
+            dir: snapshots,
+            ..Default::default()
+        },
+    )
+    .expect("重新创建存储");
+    let group = reopened
+        .read_persistent_group("orders-workers")
+        .expect("重启后读取组")
+        .expect("重启后组存在");
+    assert_eq!(group, persistent_group());
+    reopened.close().await.expect("关闭重开存储");
 }
 
 #[tokio::test]
@@ -606,6 +819,32 @@ async fn snapshot_roundtrip_consistent() {
 }
 
 #[tokio::test]
+async fn snapshot_roundtrip_preserves_persistent_subscription() {
+    let (mut src, _src_dir) = new_storage(0);
+    src.apply(vec![request_entry(
+        0,
+        crate::EsRequest::PersistentSubscription {
+            command: crate::PersistentSubscriptionCommand::Create {
+                group: persistent_group(),
+            },
+        },
+    )])
+    .await
+    .expect("创建持久化订阅组");
+    let snap = src.build_snapshot().await.expect("构建快照");
+
+    let (mut dst, _dst_dir) = new_storage(0);
+    dst.install_snapshot(&snap.meta, snap.snapshot)
+        .await
+        .expect("安装快照");
+    let restored = dst
+        .read_persistent_group("orders-workers")
+        .expect("读取快照中的组")
+        .expect("快照应包含组");
+    assert_eq!(restored, persistent_group());
+}
+
+#[tokio::test]
 async fn snapshot_overwrite_clears_old() {
     use openraft::RaftSnapshotBuilder;
 
@@ -1028,8 +1267,8 @@ async fn snapshot_empty_build_install() {
 #[tokio::test]
 async fn snapshot_restore_to_point_in_time() {
     use crate::snapshot::restore;
-    use openraft::storage::RaftLogStorage;
     use openraft::RaftSnapshotBuilder;
+    use openraft::storage::RaftLogStorage;
 
     // 源：apply 5 条（index 0..4）后建快照，再 apply 3 条（恢复点之后的数据）
     let (mut src, _d1) = new_storage(0);
