@@ -2,13 +2,13 @@
 
 ![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)
 
-基于 Rust + [openraft](https://github.com/datafuselabs/openraft) + [surrealkv](https://github.com/surrealdb/surrealkv) 的分布式事件存储中间件。分片由**显式放置表**（`[placement]`）定义，每个分片是一个独立的 Raft group + 独立的 surrealkv LSM tree；stream → shard 归属由服务端**流路由表**（`routes.json`）显式分配，支持运行期动态扩容与在线迁移。提供事件溯源语义：乐观并发、幂等写入、流订阅（catch-up → live）。
+基于 Rust + [openraft](https://github.com/datafuselabs/openraft) + [surrealkv](https://github.com/surrealdb/surrealkv) 的分布式事件存储中间件。分片由**显式放置表**（`[placement]`）定义，每个分片是一个独立的 Raft group + 独立的 surrealkv LSM tree；stream → shard 归属由控制 Shard 的 Raft 状态机强一致提交，`routes.json` 保留为兼容投影。支持运行期动态扩容与在线迁移。提供事件溯源语义：乐观并发、幂等写入、流订阅（catch-up → live）。
 
 ## 特性
 
 - **显式放置表分片**：`[placement]` 配置（`replication_factor` 默认 2、每节点 primary/replica shard 列表）取代旧 `[shards] num_shards`；每个 shard 的 raft 成员 = 放置表中承载它的节点子集，各分片独立选主与复制
 - **per-shard 独立 LSM tree**：每个 shard 一个独立 surrealkv tree（`{data_dir}/shard-{id}/`，memtable 4MiB），分片独立落盘、独立 LOCK、崩溃域隔离，取代「共享单 tree + key 前缀隔离」
-- **流路由表（显式分配）**：`{data_dir}/routes.json` 记录 stream → shard（+ per-shard 计数 + 版本号）；`esctl create-stream` 与隐式建流由服务端分配（大致最少流）；watcher 热更新 + 整表广播 + 版本仲裁跨节点收敛
+- **强一致 Stream 归属**：首次部署选择编号最小的 Shard，并把控制 Shard ID 持久化到 `ownership-control.json`；首次归属经 Raft 线性化提交，generation fencing 阻止迁移后的旧路由继续写源
 - **乐观并发控制**：`Any` / `NoStream` / `StreamExists` / `Exact(version)` 四种期望版本，校验在状态机 `apply` 内完成（单 Raft group 串行执行点，保证原子性）
 - **幂等写入**：按 `event_id` 建索引，客户端重试（网络超时但实际已提交）不会产生重复事件
 - **单事务原子提交**：事件、流元数据、position 指针、幂等索引、已应用状态在同一 surrealkv 事务内提交，崩溃不留下版本回退
@@ -20,8 +20,8 @@
 - **运行期动态扩容**：加节点 = 更新所有节点配置 → 各节点 watch 热更新 → 动态创建
   新 shards 并自举，全程无需重启
 - **在线迁移**：`esctl migrate` 取代离线 reshard——`Preparing → FullCopying → Tailing →
-  Switching → Draining → Verifying → Finalizing`，流数据处理不暂停；排水冲突 Any
-  兜底、重跑自愈、孤儿流自动定位
+  Switching → Draining → Verifying → Finalizing`；切换失败可短暂不可写但不双写，
+  排水冲突 Any 兜底、重跑自愈、孤儿流自动定位
 - **优雅退出**：Ctrl-C / SIGTERM → 逐 shard 停 Raft + 关闭存储（flush WAL 并释放 LOCK）
 
 ## 架构
@@ -33,10 +33,11 @@
 | `EventStore` | 客户端 API | `Append` / `ReadStream` / `ReadAll` / `Subscribe` / `GetStreamMeta` / `CreateStream` |
 | `RaftRpc` | 节点间复制与选举 | `AppendEntries` / `Vote` / `InstallSnapshot` |
 | `RaftAdmin` | 集群管理 | `Initialize` / `AddLearner` / `ChangeMembership` / `GetRaftState` / `ListShards` |
-| `Migration` | 路由表同步 + 在线迁移原语（节点间） | `GetRouteTable` / `PushRouteTable` / `SetStreamShard` / `RecountStreams` / `AppendMigrated` / `DeleteStreamFromShard` / `ReadStreamFromShard` / `GetStreamMetaFromShard` / `ListStreams` |
+| `Migration` | 归属投影通知 + 在线迁移原语 | `GetRouteTable` / `PushRouteTable` / `SetStreamShard` / `RecountStreams` / `AppendMigrated` / `DeleteStreamFromShard` / `ReadStreamFromShard` / `GetStreamMetaFromShard` / `ListStreams` |
 
-跨节点聚合订阅使用的 `InternalSubscription` 只在可选的
-`internal_listen_addr` 专用端口提供，内部端口必须由网络策略限制为仅集群节点可访问。
+跨节点聚合订阅使用的 `InternalSubscription` 与归属控制使用的 `OwnershipInternal`
+只在 `internal_listen_addr` 专用端口提供。多节点部署必须配置该端口及每个 peer 的
+`internal_addr`，并由网络策略限制为仅集群节点可访问。
 
 crate 依赖自上而下单向：
 
@@ -59,12 +60,11 @@ surrealkv（每 shard 一个独立 LSM tree：{data_dir}/shard-{id}/）
 memtable arena 默认 4MiB（`[storage] memtable_arena_bytes`）——surrealkv 默认 100MB
 且打开即预分配，per-shard 布局下 N 个 shard 就是 N 个实例，必须调小。
 
-**流路由表**（`RouteTableManager`）与 ShardManager 并列：写路径先查/分配
-stream → shard 归属（`{data_dir}/routes.json`），再按归属寻址分片。未知名流写入 =
-隐式建流（锁内双检查，同节点并发不重复分配）；读未建流 → NotFound（显式分配语义）。
-跨节点收敛靠**整表广播 + 版本仲裁**（接收方只采纳更高版本，重复广播幂等）；
-watcher 监听本地文件热更新（运维手工改文件、版本更高同样生效），损坏文件保留内存
-旧表并告警。
+**Stream 归属**由 `StreamOwnership` module 统一处理：已知 Stream 使用本地投影快读；
+未知 Stream 通过控制 Shard Raft 提交后才返回。Append 携带 generation，数据 Shard
+拒绝未安装或过期代次。`RouteTableManager` 管理 `{data_dir}/routes.json` 兼容投影；
+广播 payload 不会直接安装，只触发接收节点回控制 Shard 刷新。watcher 拒绝并恢复运行时手工改写的归属，
+同时以文件指纹轮询补偿操作系统通知丢失。
 
 **集群组建**：`node.peers` 非空时启动后自动组建（etcd 静态引导语义：探测无现存集群
 的节点用完整成员 `initialize` 一步到位），**每个分片独立组建**，成员 = 放置表中承载
@@ -93,7 +93,7 @@ cargo build --bin eventstored
 [node]
 id = 1
 listen_addr = "127.0.0.1:50051"
-# 仅节点间内部订阅 RPC；必须由网络策略限制为集群节点可访问。
+# 仅节点间订阅与归属控制 RPC；多节点必填，必须限制为集群节点可访问。
 internal_listen_addr = "127.0.0.1:51051"
 
 # 必须包含本节点，且所有节点配置完全一致（不一致可能形成双集群）
@@ -250,7 +250,7 @@ esctl route                    # 展示 stream -> shard 归属与表版本
 esctl route --recount          # 校准 per-shard 流计数（迁移后建议执行）
 esctl route --check            # 孤儿流检测（对比各分片实际存储与路由表）
 
-# 在线迁移：把流从当前 shard 迁到 shard 3（流数据处理不暂停，取代离线 reshard）
+# 在线迁移：复制阶段持续可写；切换 fencing 时可能短暂不可写，但不会双写
 esctl migrate --stream orders/1 --to 3 --dry-run   # 先看迁移计划与版本差
 esctl migrate --stream orders/1 --to 3
 
@@ -270,10 +270,10 @@ esctl snapshot restore ./data/node1 ./data/node1/snapshots/snap-0-1-100.esnap --
 ## 测试
 
 ```bash
-# 默认套件：422 项（不含 14 项真实多进程用例）
+# 默认套件：496 项通过（另有 16 项真实多进程用例按设计忽略）
 cargo test --workspace
 
-# 真实多进程测试：es-server 12 项（7 手动组建 + 5 自动组建）
+# 真实多进程测试：es-server 14 项
 cargo test -p es-server --test multi_node_test -- --ignored --test-threads=1
 
 # 真实多进程测试：esctl 2 项
@@ -282,14 +282,14 @@ cargo test -p es-ctl --test multi_node_test -- --ignored --test-threads=1
 
 | 套件 | 项数 | 内容 |
 |---|---|---|
-| `es-core` | 42 | HLC 单调性、流路由表分配与版本仲裁（最少流/双检查/recount/跨节点仲裁）、leader 重定向策略 |
+| `es-core` | 51 | HLC 单调性、归属 catalog 命令矩阵与模糊测试、兼容投影、leader 重定向策略 |
 | `es-proto` | 10 | gRPC 代码生成验证、TLS 信任策略、端点归一化 |
-| `es-storage` | 89 | Key 编码排序性质、日志语义、apply、快照往返、模糊测试（随机 append/delete 不变量） |
+| `es-storage` | 92 | Key 编码排序性质、日志语义、归属提交与 fencing、快照往返、模糊测试（随机 append/delete 不变量） |
 | `es-raft` | 34 | ShardManager 注册与寻址、RaftAdmin 参数校验、网络分区、慢节点、消息大小限制（进程内可控网络层） |
-| `es-server` | 92 | 服务器启动、bootstrap 自动组建、路由表 watcher 热更新、端到端读写/乐观并发/订阅/跨分片 ReadAll/反向读取与翻页终止 |
-| `es-server/multi_node_test` | 12 | 3 节点真实进程集群（7 项手动组建 + 5 项自动组建，`--ignored` 启用） |
-| `es-client` | 39 | SDK 单测 + stub 集成 + 进程内 e2e（重定向重试、正反向翻页、订阅含 catch-up 窗口、元数据） |
-| `es-ctl` 单测 | 79 | 参数解析、leader 提示解析、分片探测、输出渲染、重定向重试 |
+| `es-server` | 143 | 服务器启动、归属 interface、bootstrap、watcher 调和、端到端读写/订阅/跨分片读取 |
+| `es-server/multi_node_test` | 14 | 3 节点真实进程集群，含并发首次归属与控制 Shard 无 quorum（`--ignored` 启用） |
+| `es-client` | 40 | SDK 单测 + stub 集成 + 进程内 e2e（重定向重试、正反向翻页、订阅含 catch-up 窗口、元数据） |
+| `es-ctl` | 126 | 参数解析、leader 提示、分片探测、输出渲染及迁移/订阅/管理面 e2e |
 | `es-ctl/e2e_test` | 29 | 进程内全链路：读写/订阅/管理面/TLS/成员管理/翻页/CAS + 在线迁移场景矩阵（单流/批量/干跑/重跑幂等/孤儿自动定位/切换中断自愈） |
 | `es-ctl/client_failover_test` | 4 | 端点故障转移（写重试、leader 未知退避、轮询起点分散负载） |
 | `es-ctl/snapshot_test` | 4 | 快照 list/restore 端到端（离线 LOCK 约束） |
@@ -302,10 +302,13 @@ cargo test -p es-server --test multi_node_test -- --ignored --test-threads=1
 cargo test -p es-ctl --test multi_node_test -- --ignored --test-threads=1
 ```
 
-本次覆盖率（`cargo llvm-cov --workspace`，2026-08-13）：行 89.43%、区域 87.70%、
-函数 80.28%。
-`cargo-llvm-cov 0.8.7` 在本次统计中未输出分支数据；因此分支覆盖率需使用能产生
-分支统计的工具链重新验收。
+覆盖率使用 nightly 分支统计验收：
+
+```bash
+cargo +nightly llvm-cov --workspace --branch --summary-only
+```
+
+2026-08-14 验收结果：行 `92.01%`、分支 `80.09%`、区域 `90.57%`、函数 `83.26%`。
 
 ```bash
 # 存储层基准
@@ -339,7 +342,7 @@ cargo bench -p es-storage
 - [x] 保留多个历史快照（`[snapshot] keep`），`esctl snapshot list/restore` 支持时间点恢复
 
 **集群运维**
-- [x] 显式放置表（`[placement]`）与流路由表（`routes.json` 热更新 + 版本仲裁）
+- [x] 显式放置表（`[placement]`）与强一致 Stream 归属（控制 Shard 权威，`routes.json` 兼容投影）
 - [x] 运行期动态扩容（配置热更新 + 动态创建 shards，不重启）
 - [x] 在线迁移（`esctl migrate`：单流/批量/断点续传/孤儿流修复，取代离线 reshard）
 - [ ] 磁盘故障注入测试
@@ -375,9 +378,6 @@ cargo bench -p es-storage
 - **迁移切换→收敛窗口读者可见性 <1s**：切换点（`SetStreamShard`）后路由表整表
   广播到全部节点前，打到未收敛节点的读者仍按旧归属读源分片（读到的是迁移前
   数据，无损坏），窗口通常 <1s；广播失败由下次变更全表重发自愈。
-- **跨节点并发首建同一流有孤儿流残留窗口**：多个节点同时首次写入同一个未知名流时，
-  可能各自分配归属、未收敛一侧产生孤儿流（存储有数据但路由表无记录）；
-  `esctl route check` 检测、`esctl migrate` 合并修复。
 - **`esctl member remove` 无法移除 learner**：RaftAdmin 无 remove_learner RPC；
   `member list` 不含地址列与 learner 行（GetRaftState 不暴露成员地址）。
 - **订阅恢复**：跨 stream 聚合订阅暂不提供消费进度或续订 token；断点恢复属于后续持久化订阅能力。

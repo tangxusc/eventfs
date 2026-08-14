@@ -27,6 +27,12 @@ pub struct RouteTable {
     pub streams: BTreeMap<String, u64>,
     /// shard → 承载的流数（分配用，允许不精确）
     pub shard_stream_counts: BTreeMap<u64, u64>,
+    /// stream → 归属代次。旧文件没有该字段时按 generation=1 导入。
+    #[serde(default)]
+    pub stream_generations: BTreeMap<String, u64>,
+    /// stream → 最后一次归属变化的 revision。旧文件缺失时回退到表版本。
+    #[serde(default)]
+    pub stream_revisions: BTreeMap<String, u64>,
 }
 
 impl RouteTable {
@@ -50,14 +56,19 @@ impl RouteTable {
             return false;
         }
         self.streams.insert(stream.to_string(), shard);
+        self.stream_generations.insert(stream.to_string(), 1);
         *self.shard_stream_counts.entry(shard).or_insert(0) += 1;
         self.version += 1;
+        self.stream_revisions
+            .insert(stream.to_string(), self.version);
         true
     }
 
     /// 移除 stream（迁移清尾/孤儿清理用），版本 +1。返回被移除的 shard。
     pub fn remove(&mut self, stream: &str) -> Option<u64> {
         let shard = self.streams.remove(stream)?;
+        self.stream_generations.remove(stream);
+        self.stream_revisions.remove(stream);
         if let Some(c) = self.shard_stream_counts.get_mut(&shard) {
             *c = c.saturating_sub(1);
         }
@@ -82,15 +93,14 @@ impl RouteTable {
     }
 
     /// 全表重建计数（RecountStreams 用）：把 streams 逐条重新计数。
-    /// 版本 +1——recount 结果要经整表广播让集群收敛，同版本会被
-    /// 接收方以「版本不高于本地」忽略，校准就只对本节点生效。
+    ///
+    /// 计数是兼容投影的派生数据，不是归属变更，不能推进权威 revision。
     pub fn recount(&mut self) {
         let mut counts: BTreeMap<u64, u64> = BTreeMap::new();
         for &s in self.streams.values() {
             *counts.entry(s).or_insert(0) += 1;
         }
         self.shard_stream_counts = counts;
-        self.version += 1;
     }
 }
 
@@ -107,6 +117,16 @@ mod tests {
                 ("c".to_string(), 2),
             ]),
             shard_stream_counts: BTreeMap::from([(1, 2), (2, 1)]),
+            stream_generations: BTreeMap::from([
+                ("a".to_string(), 1),
+                ("b".to_string(), 1),
+                ("c".to_string(), 1),
+            ]),
+            stream_revisions: BTreeMap::from([
+                ("a".to_string(), 3),
+                ("b".to_string(), 5),
+                ("c".to_string(), 7),
+            ]),
         }
     }
 
@@ -187,11 +207,12 @@ mod tests {
     #[test]
     fn recount_rebuilds_counts() {
         let mut t = table();
+        let revision = t.version;
         // 手工制造漂移：计数与 streams 不符
         t.shard_stream_counts = BTreeMap::from([(1, 99), (2, 99)]);
         t.recount();
         assert_eq!(t.shard_stream_counts, BTreeMap::from([(1, 2), (2, 1)]));
-        assert_eq!(t.version, 8, "recount 应 bump 版本（使广播可被 peers 采纳）");
+        assert_eq!(t.version, revision, "计数校准不得推进归属 revision");
     }
 
     #[test]
@@ -201,6 +222,19 @@ mod tests {
         let back: RouteTable = serde_json::from_str(&json).expect("反序列化");
         assert_eq!(back, t);
     }
+
+    #[test]
+    fn legacy_three_field_json_defaults_ownership_metadata() {
+        let json = r#"{
+            "version": 9,
+            "streams": {"legacy": 2},
+            "shard_stream_counts": {"2": 1}
+        }"#;
+        let table: RouteTable = serde_json::from_str(json).expect("读取旧三字段 routes.json");
+        assert_eq!(table.lookup("legacy"), Some(2));
+        assert!(table.stream_generations.is_empty());
+        assert!(table.stream_revisions.is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -208,7 +242,7 @@ mod fuzz {
     use super::*;
     use proptest::prelude::*;
 
-    /// 分配不变量：分配的 shard 必在集合内；计数单调不变量在 insert 后成立
+    // 分配不变量：分配的 shard 必在集合内；计数单调不变量在 insert 后成立。
     proptest! {
         #[test]
         fn allocate_always_in_set(
@@ -228,7 +262,7 @@ mod fuzz {
         }
     }
 
-    /// 插入-分配交替：分配出的 shard 计数在 insert 后必为所选 shard 的最小值之一
+    // 插入-分配交替：分配出的 shard 计数在 insert 后必为所选 shard 的最小值之一。
     proptest! {
         #[test]
         fn insert_then_allocate_consistent(

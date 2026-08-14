@@ -4,6 +4,7 @@ pub mod bootstrap;
 pub mod config;
 pub mod factory;
 pub mod migration_service;
+pub mod ownership;
 pub mod route_table;
 pub mod server;
 pub mod service;

@@ -6,12 +6,33 @@ use std::time::Duration;
 use es_proto::eventstore::event_store_server::EventStoreServer;
 use es_proto::eventstore::internal_subscription_client::InternalSubscriptionClient;
 use es_proto::eventstore::internal_subscription_server::InternalSubscriptionServer;
+use es_proto::eventstore::migration_server::MigrationServer;
+use es_proto::eventstore::ownership_internal_server::OwnershipInternalServer;
 use es_proto::eventstore::raft_admin_server::RaftAdminServer;
 use es_proto::eventstore::{event_store_client::EventStoreClient, *};
-use es_server::Server;
 use es_server::config::{
     Config, NodeConfig, PeerConfig, PlacementConfig, PlacementNode, StorageConfig,
 };
+use es_server::Server;
+
+async fn wait_shard_leader(server: &Server, shard_id: u64) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let shard = server
+            .shard_manager()
+            .get_shard(shard_id)
+            .await
+            .expect("等待 leader 时获取分片");
+        if shard.raft.metrics().borrow().state.is_leader() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "等待 shard {shard_id} leader 超时"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
 
 /// 启动测试服务器。
 ///
@@ -223,33 +244,49 @@ async fn start_two_shard_servers() -> (
         .initialize(std::collections::BTreeSet::from([2u64]))
         .await
         .expect("初始化节点二 raft");
+    wait_shard_leader(&first, 1).await;
+    wait_shard_leader(&second, 0).await;
 
-    let first_service = es_server::service::EsService::with_limits(
+    let first_service = es_server::service::EsService::with_ownership(
         first.shard_manager().clone(),
         first_config.limits.clone(),
         first.route_table().clone(),
+        first.ownership().clone(),
         &first_config,
     )
     .expect("节点一服务");
-    let second_service = es_server::service::EsService::with_limits(
+    let second_service = es_server::service::EsService::with_ownership(
         second.shard_manager().clone(),
         second_config.limits.clone(),
         second.route_table().clone(),
+        second.ownership().clone(),
         &second_config,
     )
     .expect("节点二服务");
     let first_admin = es_raft::RaftAdminService::new(first.shard_manager().clone());
     let second_admin = es_raft::RaftAdminService::new(second.shard_manager().clone());
+    let first_migration = es_server::migration_service::MigrationService::new(
+        first.route_table().clone(),
+        first.shard_manager().clone(),
+        first.ownership().clone(),
+    );
+    let second_migration = es_server::migration_service::MigrationService::new(
+        second.route_table().clone(),
+        second.shard_manager().clone(),
+        second.ownership().clone(),
+    );
     let first_handle = tokio::spawn(async move {
         let _ = tokio::try_join!(
             tonic::transport::Server::builder()
                 .add_service(EventStoreServer::new(first_service.clone()))
                 .add_service(RaftAdminServer::new(first_admin))
+                .add_service(MigrationServer::new(first_migration.clone()))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
                     first_listener
                 )),
             tonic::transport::Server::builder()
                 .add_service(InternalSubscriptionServer::new(first_service))
+                .add_service(OwnershipInternalServer::new(first_migration))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
                     first_internal_listener
                 )),
@@ -260,11 +297,13 @@ async fn start_two_shard_servers() -> (
             tonic::transport::Server::builder()
                 .add_service(EventStoreServer::new(second_service.clone()))
                 .add_service(RaftAdminServer::new(second_admin))
+                .add_service(MigrationServer::new(second_migration.clone()))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
                     second_listener
                 )),
             tonic::transport::Server::builder()
                 .add_service(InternalSubscriptionServer::new(second_service))
+                .add_service(OwnershipInternalServer::new(second_migration))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
                     second_internal_listener
                 )),
@@ -336,7 +375,7 @@ async fn append_one(
             events: vec![new_event(data)],
         })
         .await
-        .expect("append 应成功")
+        .unwrap_or_else(|error| panic!("append {stream_id} 应成功: {error}"))
         .into_inner()
 }
 
@@ -1418,30 +1457,6 @@ async fn subscribe_aggregates_remote_shard_through_internal_rpc() {
     let (first_addr, first_handle, second_handle, first, second, _first_dir, _second_dir) =
         start_two_shard_servers().await;
 
-    // 两个路由表在相同顺序下分配，保证接入节点和远程承载节点对同一 stream 一致。
-    first
-        .route_table()
-        .allocate("remote-stream")
-        .await
-        .expect("节点一记录远程路由");
-    second
-        .route_table()
-        .allocate("remote-stream")
-        .await
-        .expect("节点二记录远程路由");
-    first
-        .route_table()
-        .allocate("local-stream")
-        .await
-        .expect("节点一记录本地路由");
-    second
-        .route_table()
-        .allocate("local-stream")
-        .await
-        .expect("节点二记录本地路由");
-    assert_eq!(first.route_table().lookup("remote-stream").await, Some(0));
-    assert_eq!(first.route_table().lookup("local-stream").await, Some(1));
-
     let mut first_client = EventStoreClient::connect(first_addr)
         .await
         .expect("连接节点一");
@@ -1450,8 +1465,13 @@ async fn subscribe_aggregates_remote_shard_through_internal_rpc() {
         .await
         .expect("连接节点二");
 
-    append_one(&mut first_client, "local-stream", b"local-history").await;
+    // 通过权威归属 interface 创建，顺序保证最少负载分配依次落到 shard 0、1。
     append_one(&mut second_client, "remote-stream", b"remote-history").await;
+    append_one(&mut first_client, "local-stream", b"local-history").await;
+    assert_eq!(first.route_table().lookup("remote-stream").await, Some(0));
+    assert_eq!(first.route_table().lookup("local-stream").await, Some(1));
+    assert_eq!(second.route_table().lookup("remote-stream").await, Some(0));
+    assert_eq!(second.route_table().lookup("local-stream").await, Some(1));
 
     let mut subscription = first_client
         .subscribe(SubscribeRequest {
@@ -1571,11 +1591,16 @@ async fn subscribe_from_follower_forwards_to_leader_internal_listener() {
         node: NodeConfig {
             id: 2,
             listen_addr: "127.0.0.1:0".into(),
-            internal_listen_addr: None,
+            internal_listen_addr: Some(
+                leader_internal_listener
+                    .local_addr()
+                    .expect("读取 leader 内部监听地址")
+                    .to_string(),
+            ),
             peers: vec![PeerConfig {
                 id: 1,
                 addr: follower_public_addr.clone(),
-                internal_addr: None,
+                internal_addr: Some(follower_internal_addr.clone()),
             }],
         },
         storage: StorageConfig {
@@ -1612,30 +1637,44 @@ async fn subscribe_from_follower_forwards_to_leader_internal_listener() {
         .await
         .expect("记录 leader 路由");
 
-    let follower_service = es_server::service::EsService::with_limits(
+    let follower_service = es_server::service::EsService::with_ownership(
         follower.shard_manager().clone(),
         follower_config.limits.clone(),
         follower.route_table().clone(),
+        follower.ownership().clone(),
         &follower_config,
     )
     .expect("创建 follower 服务");
-    let leader_service = es_server::service::EsService::with_limits(
+    let leader_service = es_server::service::EsService::with_ownership(
         leader.shard_manager().clone(),
         leader_config.limits.clone(),
         leader.route_table().clone(),
+        leader.ownership().clone(),
         &leader_config,
     )
     .expect("创建 leader 服务");
     let leader_admin = es_raft::RaftAdminService::new(leader.shard_manager().clone());
+    let follower_migration = es_server::migration_service::MigrationService::new(
+        follower.route_table().clone(),
+        follower.shard_manager().clone(),
+        follower.ownership().clone(),
+    );
+    let leader_migration = es_server::migration_service::MigrationService::new(
+        leader.route_table().clone(),
+        leader.shard_manager().clone(),
+        leader.ownership().clone(),
+    );
     let follower_handle = tokio::spawn(async move {
         let _ = tokio::try_join!(
             tonic::transport::Server::builder()
                 .add_service(EventStoreServer::new(follower_service.clone()))
+                .add_service(MigrationServer::new(follower_migration.clone()))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
                     follower_public_listener,
                 )),
             tonic::transport::Server::builder()
                 .add_service(InternalSubscriptionServer::new(follower_service))
+                .add_service(OwnershipInternalServer::new(follower_migration))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
                     follower_internal_listener,
                 )),
@@ -1646,11 +1685,13 @@ async fn subscribe_from_follower_forwards_to_leader_internal_listener() {
             tonic::transport::Server::builder()
                 .add_service(EventStoreServer::new(leader_service.clone()))
                 .add_service(RaftAdminServer::new(leader_admin))
+                .add_service(MigrationServer::new(leader_migration.clone()))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
                     leader_public_listener,
                 )),
             tonic::transport::Server::builder()
                 .add_service(InternalSubscriptionServer::new(leader_service))
+                .add_service(OwnershipInternalServer::new(leader_migration))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
                     leader_internal_listener,
                 )),
@@ -1923,19 +1964,15 @@ async fn subscribe_all_aggregates_remote_shards_and_emits_caught_up_once() {
     let (first_addr, first_handle, second_handle, first, second, _first_dir, _second_dir) =
         start_two_shard_servers().await;
 
-    // 两个节点用相同顺序创建路由，保证 $all 的本地和远程来源可分别写入。
-    for server in [&first, &second] {
-        server
-            .route_table()
-            .allocate("all-remote-stream")
-            .await
-            .expect("记录远程路由");
-        server
-            .route_table()
-            .allocate("all-local-stream")
-            .await
-            .expect("记录本地路由");
-    }
+    let mut first_client = EventStoreClient::connect(first_addr)
+        .await
+        .expect("连接接入节点");
+    let mut second_client = EventStoreClient::connect(first.config().node.peers[0].addr.clone())
+        .await
+        .expect("连接远程节点");
+    // 通过权威归属 interface 创建，顺序保证两个 Stream 分别落到远程和本地 Shard。
+    append_one(&mut second_client, "all-remote-stream", b"remote-history").await;
+    append_one(&mut first_client, "all-local-stream", b"local-history").await;
     assert_eq!(
         first.route_table().lookup("all-remote-stream").await,
         Some(0)
@@ -1944,15 +1981,14 @@ async fn subscribe_all_aggregates_remote_shards_and_emits_caught_up_once() {
         first.route_table().lookup("all-local-stream").await,
         Some(1)
     );
-
-    let mut first_client = EventStoreClient::connect(first_addr)
-        .await
-        .expect("连接接入节点");
-    let mut second_client = EventStoreClient::connect(first.config().node.peers[0].addr.clone())
-        .await
-        .expect("连接远程节点");
-    append_one(&mut first_client, "all-local-stream", b"local-history").await;
-    append_one(&mut second_client, "all-remote-stream", b"remote-history").await;
+    assert_eq!(
+        second.route_table().lookup("all-remote-stream").await,
+        Some(0)
+    );
+    assert_eq!(
+        second.route_table().lookup("all-local-stream").await,
+        Some(1)
+    );
 
     let mut subscription = first_client
         .subscribe(SubscribeRequest {

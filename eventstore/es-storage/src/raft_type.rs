@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use es_core::{ExpectedVersion, Hlc, NewEvent};
+use es_core::{ExpectedVersion, Hlc, NewEvent, OwnershipApply, OwnershipCommand};
 
 /// Raft 应用层请求
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +21,20 @@ pub enum EsRequest {
     /// 删除流（在线迁移清尾用）：同事务删除该流全部事件、StreamMeta、
     /// 幂等索引与 position 指针。删除不存在的流 = no-op（幂等）。
     DeleteStream { stream_id: String },
+    /// 携带已提交归属代次的公开写入；状态机拒绝过期代次。
+    ///
+    /// 新变体必须追加在旧 `Append`、`DeleteStream` 之后，保持 bincode 编号稳定。
+    AppendOwned {
+        stream_id: String,
+        ownership_generation: u64,
+        expected_version: ExpectedVersion,
+        events: Vec<NewEvent>,
+        hlc: Hlc,
+    },
+    /// 在控制 Shard 串行提交归属命令。
+    CommitOwnership { command: OwnershipCommand },
+    /// 在数据 Shard 安装单调递增的归属代次 fencing。
+    InstallOwnershipFence { stream_id: String, generation: u64 },
 }
 
 /// Raft 应用层响应
@@ -36,6 +50,12 @@ pub enum EsResponse {
     OptimisticConflict { actual_version: u64 },
     /// 删除流成功（含删除不存在流的幂等 no-op）
     DeleteOk,
+    /// 归属状态机命令结果。
+    OwnershipApplied(OwnershipApply),
+    /// 数据 Shard 已安装的当前 fencing 代次。
+    OwnershipFenceInstalled { generation: u64 },
+    /// 写入携带的归属代次已过期或尚未安装。
+    OwnershipFenced { current_generation: u64 },
 }
 
 // Raft 类型配置：绑定应用请求/响应、节点 ID、日志条目与快照数据类型
@@ -51,3 +71,41 @@ openraft::declare_raft_types!(
         SnapshotData = crate::snapshot::SnapshotFile,
         AsyncRuntime = openraft::TokioRuntime,
 );
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+
+    #[allow(dead_code)]
+    #[derive(Serialize)]
+    enum LegacyEsRequest {
+        Append {
+            stream_id: String,
+            expected_version: ExpectedVersion,
+            events: Vec<NewEvent>,
+            hlc: Hlc,
+        },
+        DeleteStream {
+            stream_id: String,
+        },
+    }
+
+    #[test]
+    fn decodes_delete_stream_from_previous_raft_format() {
+        let bytes = bincode::serde::encode_to_vec(
+            LegacyEsRequest::DeleteStream {
+                stream_id: "orders/legacy".into(),
+            },
+            bincode::config::standard(),
+        )
+        .expect("编码旧请求");
+        let (decoded, consumed): (EsRequest, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                .expect("新版本必须能读取旧 Raft 日志");
+        assert_eq!(consumed, bytes.len());
+        assert!(matches!(
+            decoded,
+            EsRequest::DeleteStream { stream_id } if stream_id == "orders/legacy"
+        ));
+    }
+}

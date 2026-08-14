@@ -179,6 +179,12 @@ service InternalSubscription {
   rpc SubscribeInternal(InternalSubscribeRequest) returns (stream InternalSubscribeResponse);
 }
 
+// 归属共识与 fencing 的节点间协议，只能注册到内部监听端口。
+service OwnershipInternal {
+  rpc CommitOwnership(CommitOwnershipRequest) returns (CommitOwnershipResponse);
+  rpc InstallOwnershipFence(InstallOwnershipFenceRequest) returns (InstallOwnershipFenceResponse);
+}
+
 message InternalSubscribeRequest {
   uint64 shard_id = 1;
   // 空列表表示该 shard 内全部 stream；否则只推送列出的 stream。
@@ -312,6 +318,32 @@ message RouteTable {
   uint64 version = 1;
   map<string, uint64> streams = 2;
   map<uint64, uint64> shard_stream_counts = 3;
+  // 可选归属代次；旧节点与旧 routes.json 缺失时按 generation=1 导入。
+  map<string, uint64> stream_generations = 4;
+  // 可选单 Stream revision；旧节点缺失时按整表 version 导入。
+  map<string, uint64> stream_revisions = 5;
+}
+
+message CommitOwnershipRequest {
+  // 承载归属权威的控制 Shard。
+  uint64 control_shard_id = 1;
+  // bincode 编码的 es_core::OwnershipCommand。
+  bytes payload = 2;
+}
+
+message CommitOwnershipResponse {
+  // bincode 编码的 es_core::OwnershipApply。
+  bytes payload = 1;
+}
+
+message InstallOwnershipFenceRequest {
+  uint64 shard_id = 1;
+  string stream_id = 2;
+  uint64 generation = 3;
+}
+
+message InstallOwnershipFenceResponse {
+  uint64 generation = 1;
 }
 
 message GetRouteTableRequest {}
@@ -329,6 +361,11 @@ message PushRouteTableResponse {}
 message SetStreamShardRequest {
   string stream_id = 1;
   uint64 shard_id = 2;
+  // 迁移任务在复制开始前观察到的归属；服务端按此执行 CAS。
+  uint64 expected_shard_id = 3;
+  uint64 expected_generation = 4;
+  // 16 字节 UUID；超时重试必须复用，保证 PrepareMove 幂等。
+  bytes operation_id = 5;
 }
 
 message SetStreamShardResponse {

@@ -6,7 +6,8 @@ use std::sync::Arc;
 use crate::config::Config;
 use crate::factory;
 use crate::migration_service::MigrationService;
-use crate::route_table::{RouteTableManager, routes_path};
+use crate::ownership::StreamOwnership;
+use crate::route_table::{routes_path, RouteTableManager};
 use crate::service::EsService;
 use es_raft::{Shard, ShardManager};
 
@@ -16,6 +17,8 @@ pub struct Server {
     shard_manager: Arc<ShardManager>,
     /// 流路由表（stream → shard 归属；启动加载 + 热更新）
     route_table: Arc<RouteTableManager>,
+    /// Stream 强一致归属 module。
+    ownership: Arc<StreamOwnership>,
 }
 
 impl Server {
@@ -36,11 +39,16 @@ impl Server {
             RouteTableManager::new(&config, routes_path(&config.storage.data_dir))
                 .map_err(anyhow::Error::msg)?,
         );
+        let ownership = Arc::new(
+            StreamOwnership::new(&config, shard_manager.clone(), route_table.clone())
+                .map_err(anyhow::Error::msg)?,
+        );
 
         Ok(Self {
             config,
             shard_manager,
             route_table,
+            ownership,
         })
     }
 
@@ -57,6 +65,11 @@ impl Server {
     /// 获取路由表管理器（测试与 watcher 用）
     pub fn route_table(&self) -> &Arc<RouteTableManager> {
         &self.route_table
+    }
+
+    /// 获取 Stream 强一致归属 module（watcher/测试用）。
+    pub fn ownership(&self) -> &Arc<StreamOwnership> {
+        &self.ownership
     }
 
     /// 初始化存储与 Raft 节点（本节点承载的 shards，每个 shard 独立 LSM tree）。
@@ -126,22 +139,26 @@ impl Server {
 
     /// 启动 gRPC 服务器。
     ///
-    /// 公共端口提供客户端 API、Raft 节点间 RPC 与集群管理 API；内部订阅 RPC
-    /// 仅在 `node.internal_listen_addr` 配置的专用端口监听。
+    /// 公共端口提供客户端 API、Raft 节点间 RPC 与集群管理 API；内部订阅和
+    /// 归属控制 RPC 仅在 `node.internal_listen_addr` 配置的专用端口监听。
     /// 配置 [tls] 时以 TLS（https）监听，否则明文。
     pub async fn serve(&self) -> Result<()> {
         let addr: std::net::SocketAddr = self.config.node.listen_addr.parse()?;
-        let es_service = EsService::with_limits(
+        let es_service = EsService::with_ownership(
             self.shard_manager.clone(),
             self.config.limits.clone(),
             self.route_table.clone(),
+            self.ownership.clone(),
             &self.config,
         )
         .map_err(anyhow::Error::msg)?;
         let raft_service = es_raft::RaftRpcService::new(self.shard_manager.clone());
         let admin_service = es_raft::RaftAdminService::new(self.shard_manager.clone());
-        let migration_service =
-            MigrationService::new(self.route_table.clone(), self.shard_manager.clone());
+        let migration_service = MigrationService::new(
+            self.route_table.clone(),
+            self.shard_manager.clone(),
+            self.ownership.clone(),
+        );
 
         let mut public_server = tonic::transport::Server::builder();
         // tls_config 必须在 add_service 之前
@@ -183,7 +200,7 @@ impl Server {
                 .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
                 .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE);
         let migration =
-            es_proto::eventstore::migration_server::MigrationServer::new(migration_service)
+            es_proto::eventstore::migration_server::MigrationServer::new(migration_service.clone())
                 .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
                 .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE);
         let public_server = public_server
@@ -196,6 +213,12 @@ impl Server {
             Some(internal_addr) => {
                 let internal_addr: std::net::SocketAddr = internal_addr.parse()?;
                 let internal_subscription = es_proto::eventstore::internal_subscription_server::InternalSubscriptionServer::new(es_service)
+                    .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
+                    .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE);
+                let ownership_internal =
+                    es_proto::eventstore::ownership_internal_server::OwnershipInternalServer::new(
+                        migration_service,
+                    )
                     .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
                     .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE);
                 let mut internal_server = tonic::transport::Server::builder();
@@ -219,6 +242,7 @@ impl Server {
                     public_server.serve(addr),
                     internal_server
                         .add_service(internal_subscription)
+                        .add_service(ownership_internal)
                         .serve(internal_addr),
                 )?;
             }

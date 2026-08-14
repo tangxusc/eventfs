@@ -81,6 +81,7 @@ async fn main() -> Result<()> {
         std::path::PathBuf::from(&args.config),
         es_server::route_table::routes_path(&server.config().storage.data_dir),
         server.route_table().clone(),
+        server.ownership().clone(),
         server.shard_manager().clone(),
         server.config().node.id, // --node-id 覆盖后的实际节点
     ) {

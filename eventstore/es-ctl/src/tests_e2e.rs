@@ -9,14 +9,14 @@ use std::time::Duration;
 
 use es_proto::eventstore::event_store_server::EventStoreServer;
 use es_proto::eventstore::*;
-use es_server::Server;
 use es_server::config::{Config, NodeConfig, PlacementConfig, PlacementNode, StorageConfig};
+use es_server::Server;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 use crate::cli::*;
 use crate::client::ClusterClient;
-use crate::commands::{Ctx, append, init, member, meta, migrate, read, route, status, watch};
+use crate::commands::{append, init, member, meta, migrate, read, route, status, watch, Ctx};
 
 /// 启动单节点测试集群（2 分片，raft 已初始化，gRPC 已监听）。
 /// 返回 (gRPC 地址, Server, TempDir)。
@@ -68,10 +68,11 @@ async fn start_server() -> (String, Server, tempfile::TempDir) {
         .expect("绑定端口");
     let addr = format!("http://{}", listener.local_addr().expect("取本地地址"));
     // 共享 server 的路由表实例（EsService::new 会自建独立实例，内存态不同步）
-    let service = es_server::service::EsService::with_limits(
+    let service = es_server::service::EsService::with_ownership(
         server.shard_manager().clone(),
         config.limits.clone(),
         server.route_table().clone(),
+        server.ownership().clone(),
         &config,
     )
     .expect("创建服务");
@@ -80,6 +81,7 @@ async fn start_server() -> (String, Server, tempfile::TempDir) {
     let migration = es_server::migration_service::MigrationService::new(
         server.route_table().clone(),
         server.shard_manager().clone(),
+        server.ownership().clone(),
     );
     tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()

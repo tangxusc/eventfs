@@ -7,13 +7,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use es_proto::eventstore::GetRaftStateRequest;
 use es_proto::eventstore::raft_admin_client::RaftAdminClient;
-use es_proto::tls::{TlsClientConfig, apply_endpoint_tls};
-use es_server::Server;
+use es_proto::eventstore::GetRaftStateRequest;
+use es_proto::tls::{apply_endpoint_tls, TlsClientConfig};
 use es_server::config::{
     Config, NodeConfig, PeerConfig, PlacementConfig, PlacementNode, StorageConfig, TlsConfig,
 };
+use es_server::Server;
 
 /// 测试固定用分片 0
 const SHARD: u64 = 0;
@@ -73,7 +73,8 @@ impl Drop for TestNode {
 async fn start_node(
     id: u64,
     port: u16,
-    peers: &[(u64, String)],
+    internal_port: u16,
+    peers: &[(u64, String, String)],
     num_shards: u64,
     tls: Option<&TestTls>,
 ) -> TestNode {
@@ -105,13 +106,13 @@ async fn start_node(
         node: NodeConfig {
             id,
             listen_addr: format!("127.0.0.1:{}", port),
-            internal_listen_addr: None,
+            internal_listen_addr: Some(format!("127.0.0.1:{internal_port}")),
             peers: peers
                 .iter()
-                .map(|(pid, addr)| PeerConfig {
+                .map(|(pid, addr, internal_addr)| PeerConfig {
                     id: *pid,
                     addr: addr.clone(),
-                    internal_addr: None,
+                    internal_addr: Some(internal_addr.clone()),
                 })
                 .collect(),
         },
@@ -126,7 +127,7 @@ async fn start_node(
             replication_factor: peers.len() as u64,
             nodes: peers
                 .iter()
-                .map(|(pid, _)| PlacementNode {
+                .map(|(pid, _, _)| PlacementNode {
                     id: *pid,
                     primary: if *pid == 1 {
                         (0..num_shards).collect()
@@ -253,17 +254,32 @@ async fn inprocess_three_node_bootstrap() {
     init_tracing();
     eprintln!("\n=== 进程内 3 节点（配置完整 peers，自动组建）===");
     let ports: Vec<u16> = (0..3).map(|_| alloc_port()).collect();
+    let internal_ports: Vec<u16> = (0..3).map(|_| alloc_port()).collect();
     let addrs: Vec<String> = ports.iter().map(|p| format!("127.0.0.1:{}", p)).collect();
-    let peers: Vec<(u64, String)> = vec![
-        (1, addrs[0].clone()),
-        (2, addrs[1].clone()),
-        (3, addrs[2].clone()),
+    let internal_addrs: Vec<String> = internal_ports
+        .iter()
+        .map(|p| format!("127.0.0.1:{p}"))
+        .collect();
+    let peers: Vec<(u64, String, String)> = vec![
+        (1, addrs[0].clone(), internal_addrs[0].clone()),
+        (2, addrs[1].clone(), internal_addrs[1].clone()),
+        (3, addrs[2].clone(), internal_addrs[2].clone()),
     ];
 
     // 依次启动（模拟同时上线：bootstrap 任务会等全部端口就绪再探测）
     let mut nodes = Vec::new();
     for id in 1..=3u64 {
-        nodes.push(start_node(id, ports[(id - 1) as usize], &peers, 1, None).await);
+        nodes.push(
+            start_node(
+                id,
+                ports[(id - 1) as usize],
+                internal_ports[(id - 1) as usize],
+                &peers,
+                1,
+                None,
+            )
+            .await,
+        );
     }
 
     eprintln!("\n=== 等待自动组建完成 ===");
@@ -303,18 +319,33 @@ async fn inprocess_three_node_bootstrap() {
 async fn inprocess_out_of_order_bootstrap() {
     eprintln!("\n=== 进程内乱序启动：先起 node2，再起 node1、node3 ===");
     let ports: Vec<u16> = (0..3).map(|_| alloc_port()).collect();
+    let internal_ports: Vec<u16> = (0..3).map(|_| alloc_port()).collect();
     let addrs: Vec<String> = ports.iter().map(|p| format!("127.0.0.1:{}", p)).collect();
-    let peers: Vec<(u64, String)> = vec![
-        (1, addrs[0].clone()),
-        (2, addrs[1].clone()),
-        (3, addrs[2].clone()),
+    let internal_addrs: Vec<String> = internal_ports
+        .iter()
+        .map(|p| format!("127.0.0.1:{p}"))
+        .collect();
+    let peers: Vec<(u64, String, String)> = vec![
+        (1, addrs[0].clone(), internal_addrs[0].clone()),
+        (2, addrs[1].clone(), internal_addrs[1].clone()),
+        (3, addrs[2].clone(), internal_addrs[2].clone()),
     ];
 
     // node2 先起：探测不到其它节点，自行用完整成员 initialize（无 quorum 条目未提交）；
     // node1/node3 后起探测到 node2 已初始化 → 跳过自举 → 投票使其提交
     let mut nodes = Vec::new();
     for id in [2u64, 1, 3] {
-        nodes.push(start_node(id, ports[(id - 1) as usize], &peers, 1, None).await);
+        nodes.push(
+            start_node(
+                id,
+                ports[(id - 1) as usize],
+                internal_ports[(id - 1) as usize],
+                &peers,
+                1,
+                None,
+            )
+            .await,
+        );
     }
 
     eprintln!("\n=== 等待自动组建完成 ===");
@@ -348,14 +379,19 @@ async fn inprocess_out_of_order_bootstrap() {
 async fn start_https_cluster(strict: bool) -> (Vec<TestNode>, u64, String) {
     let certs = gen_tls(3);
     let ports: Vec<u16> = (0..3).map(|_| alloc_port()).collect();
+    let internal_ports: Vec<u16> = (0..3).map(|_| alloc_port()).collect();
     let addrs: Vec<String> = ports
         .iter()
         .map(|p| format!("https://127.0.0.1:{}", p))
         .collect();
-    let peers: Vec<(u64, String)> = vec![
-        (1, addrs[0].clone()),
-        (2, addrs[1].clone()),
-        (3, addrs[2].clone()),
+    let internal_addrs: Vec<String> = internal_ports
+        .iter()
+        .map(|p| format!("https://127.0.0.1:{p}"))
+        .collect();
+    let peers: Vec<(u64, String, String)> = vec![
+        (1, addrs[0].clone(), internal_addrs[0].clone()),
+        (2, addrs[1].clone(), internal_addrs[1].clone()),
+        (3, addrs[2].clone(), internal_addrs[2].clone()),
     ];
 
     let mut nodes = Vec::new();
@@ -365,7 +401,17 @@ async fn start_https_cluster(strict: bool) -> (Vec<TestNode>, u64, String) {
         if !strict {
             t.ca = None;
         }
-        nodes.push(start_node(id, ports[(id - 1) as usize], &peers, 1, Some(&t)).await);
+        nodes.push(
+            start_node(
+                id,
+                ports[(id - 1) as usize],
+                internal_ports[(id - 1) as usize],
+                &peers,
+                1,
+                Some(&t),
+            )
+            .await,
+        );
     }
 
     // 轮询信任策略与集群一致：严格模式用 CA，否则默认跳过校验

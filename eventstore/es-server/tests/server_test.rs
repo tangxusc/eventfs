@@ -3,10 +3,10 @@
 use std::time::Duration;
 use tokio::time::timeout;
 
-use es_server::Server;
 use es_server::config::{
     Config, NodeConfig, PlacementConfig, PlacementNode, StorageConfig, TlsConfig,
 };
+use es_server::Server;
 
 #[test]
 fn config_validation_rejects_invalid_runtime_configuration() {
@@ -175,6 +175,39 @@ async fn server_serves_public_and_internal_listeners() {
     };
     wait_listener(&public_addr).await;
     wait_listener(&internal_addr).await;
+
+    let request = es_proto::eventstore::InstallOwnershipFenceRequest {
+        shard_id: 0,
+        stream_id: "listener-scope".into(),
+        generation: 1,
+    };
+    let mut public =
+        es_proto::eventstore::ownership_internal_client::OwnershipInternalClient::connect(format!(
+            "http://{public_addr}"
+        ))
+        .await
+        .expect("连接公共端口");
+    let public_error = public
+        .install_ownership_fence(request.clone())
+        .await
+        .expect_err("公共端口不得暴露归属控制协议");
+    assert_eq!(public_error.code(), tonic::Code::Unimplemented);
+
+    let mut internal =
+        es_proto::eventstore::ownership_internal_client::OwnershipInternalClient::connect(format!(
+            "http://{internal_addr}"
+        ))
+        .await
+        .expect("连接内部端口");
+    let internal_error = internal
+        .install_ownership_fence(request)
+        .await
+        .expect_err("未组建 Raft 时应返回业务错误");
+    assert_ne!(
+        internal_error.code(),
+        tonic::Code::Unimplemented,
+        "内部端口必须注册归属控制协议"
+    );
 
     serving.abort();
     let _ = serving.await;

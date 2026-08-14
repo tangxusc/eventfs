@@ -17,7 +17,7 @@
 | 全局顺序语义 | 仅分片内有序 + 记录 HLC | 无写入瓶颈，可水平扩展；HLC 已落盘，日后可平滑加近似全序 |
 | crate 结构 | 多 crate 拆分 | 边界清晰、可并行编译、可独立测试，客户端 SDK 可单独发布 |
 | 节点发现 | 静态配置 | 开发期 3 节点，节点数可配置 |
-| 数据分片 | multi-raft + 流路由表显式分配（stream → shard） | 单 stream 完整落在一个 Raft group，无需跨分片事务；归属由服务端分配并记录（`routes.json`），支持在线迁移 |
+| 数据分片 | multi-raft + Raft-backed Stream 归属（stream → shard） | 单 stream 完整落在一个 Raft group；控制 Shard 强一致提交归属，`routes.json` 仅为兼容投影 |
 | 管理 API | 已实现（`RaftAdmin`：Initialize / AddLearner / ChangeMembership / GetRaftState / ListShards；`Migration`：路由表同步 + 迁移原语） | 组建双路径（自动按 peers 配置 / 手动 RaftAdmin），见 7.3；迁移见 7.5 |
 
 ## 2. 依赖验证证据
@@ -128,9 +128,9 @@ rustls 0.23）；rustls 直接依赖仅 es-proto 一处（`NoCertVerify` 内部�
 节点间通过 gRPC 交换 Raft 消息（Vote / AppendEntries / InstallSnapshot），
 每条消息携带 `shard_id` 用于路由到对应的 Raft 实例。
 
-**流路由表**（RouteTable Manager）与 ShardManager 并列：写路径先查/分配
-stream → shard 归属（`{data_dir}/routes.json`，watcher 热更新 + 整表广播 + 版本仲裁，
-见 §6），再按归属寻址分片；Migration 服务承载路由表同步与在线迁移原语（见 §7.5）。
+**Stream 归属**由 `StreamOwnership` module 管理：未知 Stream 经控制 Shard Raft 提交，
+已知 Stream 读取 `{data_dir}/routes.json` 兼容投影并携带 generation 写入；Migration
+服务承载投影同步、归属提交与在线迁移原语（见 §7.5）。
 
 **存储布局**：每 shard 一个独立 surrealkv LSM tree（`{data_dir}/shard-{id}/`，
 独立 LOCK），取代旧「全分片共享单 tree + key 前缀隔离」。memtable arena 调小
@@ -310,16 +310,20 @@ pub struct Hlc {
 消费者（含 `eventfs-fuse`）需接受跨分片存在有界乱序。
 per-stream 顺序始终严格，因为单 stream 恒在单一分片内。
 
-## 6. 流路由表（显式分配）
+## 6. Stream 归属（显式分配）
 
 流 → 分片的归属**不再由 `hash(stream_id) % shard_count` 推导**，而是服务端显式
-分配并记录在**流路由表**中。路由表是「专门文件 + 热更新」的分布式实现：
+分配并记录在**归属权威**中。首次部署选择编号最小的现有 Shard，并把控制 Shard ID
+持久化到 `{data_dir}/ownership-control.json`；其 Raft 状态机
+线性化提交首次归属和迁移切换；路由表是面向快读与旧工具的兼容投影：
 
 ```rust
 pub struct RouteTable {
     pub version: u64,                            // 集群级单调版本号，每次变更 +1
-    pub streams: BTreeMap<String, u64>,          // stream → shard 映射（写路径权威）
+    pub streams: BTreeMap<String, u64>,          // stream → shard 兼容投影
     pub shard_stream_counts: BTreeMap<u64, u64>, // per-shard 流计数（分配用，允许漂移）
+    pub stream_generations: BTreeMap<String, u64>, // 迁移 fencing 代次
+    pub stream_revisions: BTreeMap<String, u64>,   // 单 Stream 最后变更 revision
 }
 ```
 
@@ -328,36 +332,37 @@ pub struct RouteTable {
 ### 6.1 分配策略
 
 - 创建流（`EventStore.CreateStream`）与隐式建流（写未知名流，见 6.3）都由
-  `RouteTableManager::allocate` 分配：从放置表全部分片（`shard_set`）中选
+  `StreamOwnership::for_append` 提交控制 Shard：从放置表全部分片中选
   **计数最少的 shard**，并列取最小 shard_id（「大致最少流」即可，需求确认流持续
   生产、不要求精确均衡）。
 - 已存在的流返回现有归属（写锁内双检查），不重复分配、不 bump 版本。
 - 计数允许漂移（删除/迁移不精确扣减），由 `Migration.RecountStreams` 校准
-  （`esctl route recount`）。
-- 分配成功后版本 +1、落盘（temp + rename **+ 文件/目录 fsync**——掉电后路由回退会让流被重新分配、旧事件成孤儿）、整表广播到全部 peers。
+  （`esctl route recount`）；计数是派生数据，校准不推进归属 revision。
+- 分配成功后权威 revision +1，再发布 `routes.json` 投影并整表广播到 peers；无法确认
+  控制 Shard quorum 时拒绝首次写入，不回退到本地分配。
 
 ### 6.2 跨节点收敛
 
-- **整表广播 + 版本仲裁**：变更节点 `PushRouteTable` 全表广播，接收方
-  **只采纳版本更高的表**（幂等，重复广播无害）；广播/拉取带 **2s 超时**（peer 挂起不阻塞本节点路由表操作）；广播失败仅告警，下次变更
-  全表重发自愈。
+- **Raft 是裁决点**：同一 Stream 的并发首次归属只由控制 Shard 状态机创建一次。
+- **整表广播是刷新通知**：`PushRouteTable` 的 payload 不会直接安装，接收节点必须
+  回控制 Shard 取得权威投影；写入仍携带 generation。广播/拉取带 2s 超时。
 - **启动加载**：本地文件与 peers 取**版本最高**的表（本地缺失时向 peers 拉取；本地存在时也比对——节点离线期间集群路由表可能已前进）
   （`GetRouteTable`，首个成功者）。
-- **本地文件热更新**：watcher 监听 routes.json，运维手工修改文件（版本更高）
-  同样生效；损坏文件保留内存旧表并告警。
-- 单节点内更新串行化（update_mutex + 写锁），版本号是收敛的原子点。
+- **本地文件调和**：watcher 接受内容相同的 no-op；新增、删除或改写归属会被拒绝，
+  并用权威内存投影恢复文件。文件事件丢失由周期指纹检查补偿。
 
 ### 6.3 读写路径语义
 
-- **写**（Append）：路由表命中直接返回归属；未命中 = **隐式建流**，分配并记录
-  （锁内双检查，同节点并发不重复分配）。写请求打到未承载该 shard 的节点时，
+- **写**（Append）：投影命中走本地快路径；未命中 = **隐式建流**，经控制 Shard
+  Raft 提交。每次写携带归属 generation；遇到过期 fencing 时刷新权威归属并重试一次。
+  写请求打到未承载该 shard 的节点时，
   返回与本地 ForwardToLeader 同格式的 leader 重定向提示。
 - **读**（ReadStream / GetStreamMeta）：**只查不分配**（读无副作用）。未知流
   （从未创建或路由表缺失）→ ReadStream 返回 **NotFound**；GetStreamMeta 返回
   `exists=false`（不报错，退出码 0）——显式分配语义：流必须先创建
   （CreateStream 或首次写入）才能读。
 - `event_id` 必须是合法 **16 字节 UUID**，否则 Append/CreateStream 相关写入返回 `InvalidArgument`（静默替换会破坏幂等去重）。
-- 服务端是路由的**唯一权威**。es-core 仍保留 `hash(stream_id) % count` 的
+- 控制 Shard Raft 状态机是归属的**唯一权威**。es-core 仍保留 `hash(stream_id) % count` 的
   `route()` 函数，但仅作 esctl 的**客户端预选提示**（选起始探测端点、
   预显示分片，以服务端落盘为准），不参与数据寻址。
 
@@ -385,6 +390,8 @@ pub struct RouteTable {
   分配到尚未就绪的 shard（append 重定向失败且流永久钉在新建分片上）
 - watcher 事件**前置过滤**（FSEvents 目录 watch 是递归的，surrealkv 写活动
   产生事件风暴会挤掉配置变更事件）
+- watcher 同时每 500ms 比较目标文件内容指纹，补偿文件系统通知丢失；运行时不得
+  从放置表移除持久化控制 Shard；加入更小编号 Shard不会在重启后改变控制 Shard
 
 ## 7. gRPC 接口
 
@@ -501,9 +508,10 @@ peer 时对比其 voter_ids 与本节点配置，不一致即告警，且要求�
 
 | RPC | 作用 |
 |---|---|
-| `GetRouteTable` / `PushRouteTable` | 拉取/推送路由表（整表广播；接收方按版本仲裁采纳，见 §6.2） |
-| `SetStreamShard` | 原子切换流归属（迁移切换点），路由表版本 +1 并广播 |
-| `RecountStreams` | 校准 per-shard 流计数（**版本 +1 并广播**——同版本会被接收方忽略，校准只对本节点生效） |
+| `GetRouteTable` / `PushRouteTable` | 读取兼容投影/通知接收方回控制 Shard刷新；payload 不参与归属裁决 |
+| `SetStreamShard` | 携带调用方观察到的 Shard + generation + operation ID，条件切换归属 |
+| `OwnershipInternal.CommitOwnership` / `InstallOwnershipFence` | 仅内部 listener：控制 Shard 提交与数据 Shard fencing |
+| `RecountStreams` | 校准本地 per-shard 派生计数，不改变归属 revision |
 | `AppendMigrated` | 迁移复制写入：单事件一条 raft 日志、**保留源 HLC**、按显式 shard 寻址（不走路由表、不隐式建流） |
 | `DeleteStreamFromShard` | 迁移清尾：删除源 shard 上的流（幂等 no-op） |
 | `ReadStreamFromShard` | 显式 shard 读流（迁移排水/校验用；路由表已切换时仍可读源） |
@@ -521,7 +529,7 @@ peer 时对比其 voter_ids 与本节点配置，不一致即告警，且要求�
 [node]
 id = 1
 listen_addr = "127.0.0.1:50051"   # 四个 gRPC 服务共用一个端口
-internal_listen_addr = "127.0.0.1:51051" # 仅节点间内部订阅；网络层限制为节点可访问
+internal_listen_addr = "127.0.0.1:51051" # 节点间订阅与归属控制；多节点必填
 
 # 集群节点列表（3 节点示例；非空即触发启动时自动组建，见 7.3）
 # 必须包含本节点，且所有节点配置完全一致；addr 可省略 http:// 前缀
@@ -567,10 +575,10 @@ replica = [2, 3]
 
 | 层次 | 内容 |
 |---|---|
-| 单元测试 | key 编码往返与**排序性质**（随机 index 排序后字节序须一致）、路由表分配与版本仲裁（最少流、双检查、recount、跨节点仲裁）、HLC 单调性、`ExpectedVersion` 校验矩阵 |
-| 存储层测试 | RaftLogStorage 语义（append/truncate/purge/无空洞不变量）、apply 幂等性、快照往返 |
-| 端到端测试 | 3 节点真实集群：启动选主、写读一致性、乐观并发冲突、leader 故障转移、重启恢复、订阅 catch-up 到 live 切换、显式建流/隐式建流/读未建流 NotFound、在线迁移（esctl migrate） |
-| 模糊测试 | 路由表分配不变量（proptest 随机流名/计数）；随机 Append/DeleteStream 序列（确定性 LCG），断言不变量：版本连续无空洞、per-stream 严格有序 |
+| 单元测试 | key 编码与排序性质、归属命令的幂等/冲突/非法输入、归属 interface 错误映射、HLC 单调性、`ExpectedVersion` 校验矩阵 |
+| 存储层测试 | RaftLogStorage 语义、归属 catalog 持久化、缺失/过期 generation fencing、apply 幂等性、快照往返 |
+| 端到端测试 | 3 节点真实集群：并发首次归属、控制 Shard 无 quorum 拒写与恢复、读写一致性、leader 故障、订阅、在线迁移 |
+| 模糊测试 | 归属 Ensure 序列唯一性与投影计数；随机 Append/DeleteStream 序列的版本连续、per-stream 严格有序不变量 |
 
 key 编码的排序性质测试是重点：第 2.1 节的大端约束若被破坏，
 错误表现为范围扫描静默返回错误数据，而非崩溃，只有排序性质断言能捕获。

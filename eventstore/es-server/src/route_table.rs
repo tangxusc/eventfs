@@ -1,16 +1,17 @@
-//! 路由表管理器：内存态 + `{data_dir}/routes.json` 落盘 + 跨节点广播同步。
+//! 路由表管理器：控制 Shard 权威状态的内存与 `{data_dir}/routes.json` 兼容投影。
 //!
 //! 路由表是「显式分配」架构的核心：stream → shard 归属由服务端在创建流
 //! （或隐式建流）时分配并记录。本管理器保证：
 //! - 单节点内更新原子（写锁内读-改-写，双检查防重复分配）
 //! - 落盘原子（temp + rename，防半写）
-//! - 跨节点收敛（整表广播 + 版本号仲裁，接收方只采纳更高版本）
-//! - 本地文件热更新（watcher 触发 reload，运维手工改文件同样生效）
+//! - 跨节点通知（广播只触发接收方刷新控制 Shard，不仲裁归属）
+//! - 本地文件变化由 watcher 转为显式归属意图，不能直接替换权威状态
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use es_core::route::RouteTable;
+use es_core::Owner;
 use es_proto::eventstore::migration_client::MigrationClient;
 use es_proto::eventstore::{GetRouteTableRequest, PushRouteTableRequest};
 use es_proto::tls::TlsClientConfig;
@@ -80,7 +81,8 @@ impl RouteTableManager {
         let local = self.load_local()?;
         let mut best = local.clone();
 
-        // 向 peers 拉取（首个成功者即可——版本仲裁会拒绝更旧的）
+        // 向全部可达 peers 拉取。相同 version 的不同内容必须显式报错，
+        // 不能任选一个作为强一致归属的旧格式 genesis。
         for (id, addr) in &self.peers {
             if *id == self.self_id {
                 continue;
@@ -93,7 +95,14 @@ impl RouteTableManager {
                 Ok(resp) => {
                     let t = proto_to_table(resp.into_inner().table);
                     let t_version = t.version;
-                    let is_newer = best.as_ref().map_or(true, |b| t_version > b.version);
+                    if let Some(current) = &best {
+                        if t_version == current.version && t != *current {
+                            return Err(format!(
+                                "节点 {id} 的路由表与当前候选 version={t_version} 内容不同"
+                            ));
+                        }
+                    }
+                    let is_newer = best.as_ref().is_none_or(|b| t_version > b.version);
                     if is_newer {
                         best = Some(t);
                     }
@@ -102,7 +111,6 @@ impl RouteTableManager {
                         t_version,
                         local.as_ref().map(|b| b.version).unwrap_or(0)
                     );
-                    break; // 任意一个 peer 即可，版本仲裁保证收敛
                 }
                 Err(_) => continue,
             }
@@ -132,10 +140,15 @@ impl RouteTableManager {
         }
     }
 
+    /// 读取当前 `routes.json`，供 watcher 转换为归属变更意图。
+    pub fn read_file(&self) -> Result<Option<RouteTable>, String> {
+        self.load_local()
+    }
+
     /// 原子落盘：temp + rename（同目录，rename 原子）+ fsync。
     ///
-    /// routes.json 是流归属的唯一权威，掉电后回退会让流被重新分配、
-    /// 旧事件成孤儿——文件与目录都必须 fsync（write 后 rename 前各一次）。
+    /// `routes.json` 是控制 Shard 权威状态的兼容投影。
+    /// 文件仍需原子持久化，避免旧工具观察到截断或部分更新的投影。
     fn persist(&self, table: &RouteTable) -> Result<(), String> {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| format!("建路由表目录失败: {e}"))?;
@@ -199,6 +212,24 @@ impl RouteTableManager {
         self.mem.read().await.lookup(stream)
     }
 
+    /// 查询带 generation 的已提交归属投影。
+    pub async fn lookup_owner(&self, stream: &str) -> Option<Owner> {
+        let table = self.mem.read().await;
+        let shard_id = table.lookup(stream)?;
+        let generation = table
+            .stream_generations
+            .get(stream)
+            .copied()
+            .unwrap_or(1)
+            .max(1);
+        let revision = table
+            .stream_revisions
+            .get(stream)
+            .copied()
+            .unwrap_or(table.version);
+        Some(Owner::new(shard_id, generation, revision))
+    }
+
     /// 分配 stream 到「大致最少流」的 shard 并记录（版本 +1 + 落盘 + 广播）。
     ///
     /// 双检查：锁内先查，已存在则直接返回现有归属（不 bump 版本）。
@@ -246,21 +277,37 @@ impl RouteTableManager {
         Ok(table)
     }
 
-    /// 应用远端广播的表：版本高于本地才采纳（落盘 + 替换内存态）。
-    pub async fn apply_remote(&self, table: RouteTable) -> Result<(), String> {
-        let current = self.mem.read().await.clone();
-        if table.version <= current.version {
-            return Ok(()); // 幂等：旧版/重复广播忽略
-        }
+    /// 安装控制 Shard 已提交的权威投影并向 peers 传播。
+    ///
+    /// 同 revision 内容不同表示本地仍持有旧实现产生的分歧；权威投影覆盖它。
+    pub async fn publish_authoritative(&self, table: RouteTable) -> Result<(), String> {
         let _guard = self.update_mutex.lock().await;
-        // 锁内复查（等待期间可能已被其它路径更新）
         let current = self.mem.read().await.clone();
-        if table.version <= current.version {
-            return Ok(());
+        if table != current {
+            self.persist(&table)?;
+            *self.mem.write().await = table.clone();
         }
-        self.persist(&table)?;
-        *self.mem.write().await = table;
+        drop(_guard);
+        self.broadcast(&table).await;
         Ok(())
+    }
+
+    /// 仅在本节点安装控制 Shard 返回的权威投影，不再次广播。
+    pub async fn apply_authoritative(&self, table: RouteTable) -> Result<(), String> {
+        let _guard = self.update_mutex.lock().await;
+        let current = self.mem.read().await.clone();
+        if table != current {
+            self.persist(&table)?;
+            *self.mem.write().await = table;
+        }
+        Ok(())
+    }
+
+    /// 用当前内存权威状态强制修复磁盘兼容投影。
+    pub(crate) async fn restore_projection(&self) -> Result<(), String> {
+        let _guard = self.update_mutex.lock().await;
+        let table = self.mem.read().await.clone();
+        self.persist(&table)
     }
 
     /// 本地文件变更后重载（watcher 触发；损坏时保留内存旧表并告警）。
@@ -278,15 +325,14 @@ impl RouteTableManager {
         }
     }
 
-    /// 校准 per-shard 流计数（recount），版本不变。返回校准后的表。
+    /// 校准 per-shard 流计数，保持权威 revision 不变并仅修复本地投影。
     pub async fn recount(&self) -> Result<RouteTable, String> {
         let _guard = self.update_mutex.lock().await;
         let mut mem = self.mem.write().await;
-        mem.recount(); // 版本 +1（使广播可被 peers 采纳）
+        mem.recount();
         let table = mem.clone();
         drop(mem);
         self.persist(&table)?;
-        self.broadcast(&table).await; // 锁外广播
         Ok(table)
     }
 
@@ -325,6 +371,8 @@ pub fn proto_to_table(t: Option<es_proto::eventstore::RouteTable>) -> RouteTable
             version: t.version,
             streams: t.streams.into_iter().collect(),
             shard_stream_counts: t.shard_stream_counts.into_iter().collect(),
+            stream_generations: t.stream_generations.into_iter().collect(),
+            stream_revisions: t.stream_revisions.into_iter().collect(),
         },
         None => RouteTable::new(),
     }
@@ -336,6 +384,8 @@ pub fn table_to_proto(t: &RouteTable) -> es_proto::eventstore::RouteTable {
         version: t.version,
         streams: t.streams.clone().into_iter().collect(),
         shard_stream_counts: t.shard_stream_counts.clone().into_iter().collect(),
+        stream_generations: t.stream_generations.clone().into_iter().collect(),
+        stream_revisions: t.stream_revisions.clone().into_iter().collect(),
     }
 }
 
@@ -421,7 +471,7 @@ mod tests {
         mgr.allocate("e").await.expect("e"); // shard 0: 5
         mgr.allocate("f").await.expect("f"); // shard 0: 6
         mgr.allocate("g").await.expect("g"); // shard 0: 7
-        // shard 0 有 7 个，shard 1/2 有 0 个 → 下一个去 shard 1
+                                             // shard 0 有 7 个，shard 1/2 有 0 个 → 下一个去 shard 1
         let (shard, _) = mgr.allocate("h").await.expect("h");
         assert_eq!(shard, 1);
     }
@@ -463,22 +513,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_remote_version_arbitration() {
+    async fn authoritative_projection_overwrites_higher_compatibility_version() {
         let dir = tempfile::tempdir().expect("临时目录");
         let mgr = RouteTableManager::new(&test_config(dir.path()), routes_path(dir.path()))
             .expect("创建");
-        let mut remote = RouteTable::new();
-        remote.insert("x", 1);
-        remote.version = 5;
-        mgr.apply_remote(remote).await.expect("应用远端表");
-        assert_eq!(mgr.lookup("x").await, Some(1));
-
-        // 旧版本被忽略
-        let mut stale = RouteTable::new();
-        stale.insert("y", 0);
-        stale.version = 3;
-        mgr.apply_remote(stale).await.expect("旧版本应忽略");
-        assert_eq!(mgr.lookup("y").await, None, "旧版本不应覆盖");
+        for index in 0..3 {
+            mgr.allocate(&format!("forged-{index}"))
+                .await
+                .expect("构造高版本投影");
+        }
+        let authoritative = RouteTable::new();
+        mgr.apply_authoritative(authoritative.clone())
+            .await
+            .expect("权威投影必须覆盖兼容版本");
+        assert_eq!(mgr.snapshot().await, authoritative);
     }
 
     #[tokio::test]
@@ -546,11 +594,13 @@ mod tests {
         mgr.allocate("a").await.expect("a");
         mgr.allocate("b").await.expect("b");
         mgr.allocate("c").await.expect("c");
+        let revision = mgr.snapshot().await.version;
         let t = mgr.recount().await.expect("校准");
         assert_eq!(
             t.shard_stream_counts,
             BTreeMap::from([(0u64, 1u64), (1u64, 1u64), (2u64, 1u64)])
         );
+        assert_eq!(t.version, revision, "recount 不得推进归属 revision");
     }
 
     #[tokio::test]

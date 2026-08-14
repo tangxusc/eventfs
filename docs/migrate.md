@@ -2,8 +2,9 @@
 
 ## 概述
 
-在线迁移把流从一个 shard 搬到另一个 shard，**流的数据处理不暂停**（读写
-全程可用），取代旧离线 reshard（`docs/reshard.md` 已删除，离线重分布下线）。
+在线迁移把流从一个 shard 搬到另一个 shard。复制阶段持续可读写；切换 fencing
+中途失败时允许短暂不可写，但不会同时接受源、目标旧代次写入。它取代旧离线
+reshard（`docs/reshard.md` 已删除，离线重分布下线）。
 
 适用场景：
 
@@ -15,8 +16,8 @@
 
 迁移按 **Migration 服务原语**（显式 shard 寻址，不走路由表）驱动：读走源
 leader、写走目标 leader（leader 由 `GetRaftState` 探测定位），任意节点执行
-切换（版本仲裁收敛）。**数据面路由唯一权威是路由表**——切换前新写落源、
-切换后新写落目标，迁移工具自己永远按显式 shard 读写，不受切换影响。
+切换（控制 Shard Raft 提交）。**数据面归属唯一权威是控制 Shard**——切换前新写落源、
+切换后新写落目标；`routes.json` 只是兼容投影，迁移工具按显式 shard 读写。
 
 ## 状态机
 
@@ -29,7 +30,7 @@ Preparing → FullCopying → Tailing → Switching → Draining → Verifying �
 | **Preparing** | 路由表查源归属（无记录 = 孤儿流 → 枚举分片自动定位）；**源 == 目标不报错**——检查其它分片是否有残留数据，有则直接进入排水收尾（上次切换后中断的自愈），无则提示完成；目标分片存在性检查；读源/目标元数据得版本差（dry-run 只报告此差） | 未产生任何写入，重跑安全 |
 | **FullCopying** | 从「目标当前版本 +1」读源 `[from, to]` 补差（每批 500 条，打源 leader 本地存储读），逐条写目标（Exact 版本链）；**追平判据 = 连续 3 轮复制后源版本无增长**；源持续生产（复制速率 < 生产速率）由 100 轮上限兜底——强制切换，剩余差量在排水期收敛 | 已写事件被幂等索引挡住，重跑从目标当前版本续 |
 | **Tailing** | 与 FullCopying 同一循环——FullCopying 追平时窗口内新写可能已落源，循环直到版本再次收敛 | 同上 |
-| **Switching** | `SetStreamShard` 原子切换路由表（版本 +1 + 落盘 + 整表广播），**切换点** | 失败则未切换，重跑从 Preparing 开始 |
+| **Switching** | `SetStreamShard` 携带 Preparing 阶段观察到的 Shard、generation 与稳定 operation ID；控制 Shard CAS 成功后生成新 generation，先安装目标 fence，再安装源 fence，最后发布投影。孤儿流以 generation=0 条件收养到目标 | 并发迁移先提交者获胜，后提交者返回 Conflict 并重新规划；瞬态重试复用 operation ID |
 | **Draining** | 切换后客户端新写直达目标（路由已切）；复制从目标当前版本续，天然兼容并发写入；**客户端写入占用版本槽（Exact 冲突）时自动改用 Any 兜底**——目标分配新版本，事件载荷/event_id/hlc 保真，version 允许重排（数据保真优先）；收敛判据 = **目标版本 ≥ 源版本且源连续 N 轮安静**（`--drain-quiet-rounds`，间隔 2s） | 排水超时（`--drain-timeout-secs`，默认 300s）退出：数据无害（源未动、目标只多不少），可重跑完成排水 |
 | **Verifying** | 源 ⊆ 目标：按 event_id 匹配，**内容保真**（hlc / event_type / data / metadata 全比对——复制中载荷截断或篡改必须在此拦截）；version 允许不同（排水 Any 兜底可能重排）；分页读取（整条流可能超 8MB 单消息，服务端已分块流式发送） | **失败自动回切路由到源**——源数据从未被动过，回切安全；已复制到目标的数据留着（重跑时幂等续写） |
 | **Finalizing** | `DeleteStreamFromShard` 删除源分片数据（幂等 no-op） | 残留源数据无碍读写，重跑清尾即可 |
@@ -43,14 +44,14 @@ Preparing → FullCopying → Tailing → Switching → Draining → Verifying �
 | 原语 | 幂等性保证 |
 |---|---|
 | `AppendMigrated` | 单事件一条 raft 日志，**hlc 保留源值**（迁移保真要求），期望版本链由工具驱动（version 0 用 `NoStream`，其余 `Exact(v-1)`）；**排水阶段冲突时工具自动改用 Any 兜底**；幂等索引逐事件记录 → 重放返回原结果，**断点续传不重复**；`event_id` 必须是合法 16 字节 UUID（否则 InvalidArgument） |
-| `SetStreamShard` | 切换是路由表版本号原子点；同值切换不重复 bump；接收方按版本仲裁，重复广播无害 |
+| `SetStreamShard` | 以调用方在复制前观察到的 Shard + generation 作条件；服务端不得临时读取当前值代替 expected；pending move 重试复用 operation ID |
 | `DeleteStreamFromShard` | 不存在的流 no-op |
 
 ## 切换窗口语义
 
 - 切换点（SetStreamShard）之前：新写落源，复制按源版本追（FullCopying/Tailing）
-- 切换点之后：客户端新写直达目标；复制从**目标当前版本**续——切换窗口内
-  源侧增量（旧客户端缓存的路由、广播未收敛窗口）在 Draining 阶段被补完
+- 切换点之后：客户端新写直达目标；旧投影携带的 generation 在源 Shard 被拒绝，
+  服务端刷新权威归属后重试目标。Draining 只补 source fence 前已经提交的源侧增量
 - 收敛判据：目标版本 ≥ 源版本 **且** 源连续 `drain-quiet-rounds` 轮（间隔 2s）
   无新增——两条件都满足才认为窗口彻底关闭
 - 收敛前中断：重跑命令即可，Draining 从目标当前版本继续（数据无害）；
@@ -105,7 +106,7 @@ esctl migrate --stream order-9 --to 2   # 合并修复（与路由表归属一�
 
 | 维度 | 旧 reshard（已下线） | esctl migrate |
 |---|---|---|
-| 停机 | 要求集群完全停机（LOCK 安全网） | **无需停机**，流数据处理不暂停 |
+| 停机 | 要求集群完全停机（LOCK 安全网） | **无需停机**；复制期持续可写，切换 fencing 时可能短暂不可写 |
 | 数据路径 | 读旧目录 → 归并重分配 position → 写新目录 | 源 leader 读 → 目标 leader 写（raft 复制），保留源 position/HLC |
 | position | 全局重分配，跨 reshard 游标失效 | 目标分片内重新分配（换分片即换序，见 design.md §5.5），源分片旧 position 随 Finalizing 删除 |
 | 断点续传 | 无（一次性离线工具） | 任意阶段中断重跑安全 |

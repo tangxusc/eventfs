@@ -53,16 +53,21 @@ async fn wait_shard_registered(server: &Arc<Server>, shard_id: u64, timeout: Dur
     }
 }
 
-/// 轮询等待路由表载入指定流，避免依赖操作系统事件投递的固定时序。
-async fn wait_route_loaded(server: &Arc<Server>, stream: &str, timeout: Duration) -> u64 {
+/// 等待单节点 Shard 完成选举，避免把 initialize 返回误当作 leader 已就绪。
+async fn wait_shard_leader(server: &Arc<Server>, shard_id: u64, timeout: Duration) {
+    let shard = server
+        .shard_manager()
+        .get_shard(shard_id)
+        .await
+        .expect("取 shard");
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if let Some(shard) = server.route_table().lookup(stream).await {
-            return shard;
+        if shard.raft.metrics().borrow().state.is_leader() {
+            return;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "等待流 {stream} 的路由表热更新超时"
+            "等待 shard {shard_id} leader 超时"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -87,6 +92,7 @@ async fn hot_config_adds_shards_dynamically() {
         config_path.clone(),
         es_server::route_table::routes_path(&server.config().storage.data_dir),
         server.route_table().clone(),
+        server.ownership().clone(),
         server.shard_manager().clone(),
         server.config().node.id,
     )
@@ -135,6 +141,7 @@ async fn hot_config_invalid_keeps_old_state() {
         config_path.clone(),
         es_server::route_table::routes_path(&server.config().storage.data_dir),
         server.route_table().clone(),
+        server.ownership().clone(),
         server.shard_manager().clone(),
         server.config().node.id,
     )
@@ -191,6 +198,7 @@ async fn hot_config_removal_keeps_existing_shards_and_updates_route_pool() {
         config_path.clone(),
         es_server::route_table::routes_path(&server.config().storage.data_dir),
         server.route_table().clone(),
+        server.ownership().clone(),
         server.shard_manager().clone(),
         server.config().node.id,
     )
@@ -214,15 +222,33 @@ async fn hot_config_removal_keeps_existing_shards_and_updates_route_pool() {
     watcher.stop().await;
 }
 
-/// 路由表文件热更新：watcher 应把版本更高的文件装入内存态。
+/// 路由表文件是兼容投影：运行时篡改不能覆盖权威归属，且会被恢复。
 #[tokio::test(flavor = "multi_thread")]
-async fn hot_routes_file_reloads_route_table() {
+async fn hot_routes_file_cannot_override_authoritative_ownership() {
     let dir = tempfile::tempdir().expect("临时目录");
     let config_path = write_config(dir.path(), &[0, 1]);
     let content = std::fs::read_to_string(&config_path).expect("读配置");
     let config: es_server::Config = toml::from_str(&content).expect("解析配置");
     let server = Arc::new(Server::new(config).expect("创建服务器"));
     server.init().await.expect("初始化");
+
+    for shard_id in [0, 1] {
+        server
+            .shard_manager()
+            .get_shard(shard_id)
+            .await
+            .expect("取 shard")
+            .raft
+            .initialize(std::collections::BTreeSet::from([1]))
+            .await
+            .expect("初始化单节点 shard");
+        wait_shard_leader(&server, shard_id, Duration::from_secs(10)).await;
+    }
+    let canonical = server
+        .ownership()
+        .for_append("canonical-route")
+        .await
+        .expect("创建权威归属");
 
     let routes_path = es_server::route_table::routes_path(&server.config().storage.data_dir);
     // watcher 监听目录，但预先创建目标文件可避免不同平台对新建文件事件的差异。
@@ -235,22 +261,41 @@ async fn hot_routes_file_reloads_route_table() {
         config_path,
         routes_path.clone(),
         server.route_table().clone(),
+        server.ownership().clone(),
         server.shard_manager().clone(),
         server.config().node.id,
     )
     .expect("watcher 启动");
 
-    let mut updated = es_core::route::RouteTable::new();
-    updated.insert("hot-route", 1);
+    let authoritative = server.route_table().snapshot().await;
+    let mut tampered = authoritative.clone();
+    tampered.insert("hot-route", 1);
     std::fs::write(
         &routes_path,
-        serde_json::to_vec(&updated).expect("序列化路由表"),
+        serde_json::to_vec(&tampered).expect("序列化路由表"),
     )
     .expect("写路由表");
 
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let disk: es_core::route::RouteTable =
+            serde_json::from_slice(&std::fs::read(&routes_path).expect("读取恢复后的投影"))
+                .expect("解析恢复后的投影");
+        if disk == authoritative {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "权威投影恢复超时");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(server.ownership().known("hot-route").await.is_none());
     assert_eq!(
-        wait_route_loaded(&server, "hot-route", Duration::from_secs(10)).await,
-        1
+        server
+            .ownership()
+            .known("canonical-route")
+            .await
+            .expect("原归属仍存在")
+            .shard_id(),
+        canonical.shard_id()
     );
     watcher.stop().await;
 }

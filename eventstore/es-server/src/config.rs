@@ -258,6 +258,24 @@ impl Config {
                 })?;
             }
         }
+        if self.node.peers.iter().any(|peer| peer.id != self.node.id) {
+            if self.node.internal_listen_addr.is_none() {
+                return Err(
+                    "多节点部署必须配置 node.internal_listen_addr 以承载归属内部协议".to_string(),
+                );
+            }
+            if let Some(peer) = self
+                .node
+                .peers
+                .iter()
+                .find(|peer| peer.id != self.node.id && peer.internal_addr.is_none())
+            {
+                return Err(format!(
+                    "多节点部署必须为 peer {} 配置 internal_addr",
+                    peer.id
+                ));
+            }
+        }
         if let Some(tls) = &self.tls {
             tls.validate()?;
         }
@@ -315,7 +333,7 @@ pub struct NodeConfig {
     /// gRPC 监听地址
     pub listen_addr: String,
 
-    /// 仅节点间内部订阅 RPC 的监听地址。
+    /// 节点间订阅与归属控制 RPC 的监听地址。
     ///
     /// 该端口必须由网络策略限制为集群节点可访问，避免将 shard 与 position
     /// 等内部实现细节暴露给客户端。
@@ -338,7 +356,7 @@ pub struct PeerConfig {
     /// gRPC 地址
     pub addr: String,
 
-    /// 对等节点内部订阅 RPC 地址。
+    /// 对等节点内部订阅与归属控制 RPC 地址。
     #[serde(default)]
     pub internal_addr: Option<String>,
 }
@@ -411,7 +429,7 @@ impl Default for Config {
             node: NodeConfig {
                 id: 1,
                 listen_addr: "127.0.0.1:50051".to_string(),
-                internal_listen_addr: None,
+                internal_listen_addr: Some("127.0.0.1:51051".into()),
                 peers: Vec::new(),
             },
             storage: StorageConfig {
@@ -565,22 +583,22 @@ mod tests {
             node: NodeConfig {
                 id: 1,
                 listen_addr: "127.0.0.1:50051".to_string(),
-                internal_listen_addr: None,
+                internal_listen_addr: Some("127.0.0.1:51051".to_string()),
                 peers: vec![
                     PeerConfig {
                         id: 1,
                         addr: "127.0.0.1:50051".into(),
-                        internal_addr: None,
+                        internal_addr: Some("127.0.0.1:51051".into()),
                     },
                     PeerConfig {
                         id: 2,
                         addr: "127.0.0.1:50052".into(),
-                        internal_addr: None,
+                        internal_addr: Some("127.0.0.1:51052".into()),
                     },
                     PeerConfig {
                         id: 3,
                         addr: "127.0.0.1:50053".into(),
-                        internal_addr: None,
+                        internal_addr: Some("127.0.0.1:51053".into()),
                     },
                 ],
             },
@@ -888,6 +906,19 @@ mod tests {
             err.contains("internal_listen_addr"),
             "错误应说明字段: {err}"
         );
+    }
+
+    #[test]
+    fn multi_node_requires_internal_ownership_addresses() {
+        let mut config = valid_config();
+        config.node.internal_listen_addr = None;
+        let error = config.validate().expect_err("多节点必须监听内部协议");
+        assert!(error.contains("internal_listen_addr"));
+
+        let mut config = valid_config();
+        config.node.peers[1].internal_addr = None;
+        let error = config.validate().expect_err("远端节点必须提供内部地址");
+        assert!(error.contains("peer 2"));
     }
 
     #[test]

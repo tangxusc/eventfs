@@ -249,11 +249,7 @@ impl EsStorage {
     ///
     /// - `from_position`：起始 position（含）
     /// - `limit`：最多读取多少条，0 表示不限量
-    pub fn read_all_events(
-        &self,
-        from_position: u64,
-        limit: u64,
-    ) -> es_core::Result<Vec<Event>> {
+    pub fn read_all_events(&self, from_position: u64, limit: u64) -> es_core::Result<Vec<Event>> {
         let shard = self.shard_id();
         let start = key::sm_position_ptr(shard, from_position);
         let end = key::successor(&key::sm_position_prefix(shard))
@@ -306,9 +302,8 @@ impl EsStorage {
 
         let mut out = Vec::with_capacity(kvs.len());
         for (k, v) in kvs {
-            let name = key::decode_stream_meta_key(&k).ok_or_else(|| {
-                es_core::Error::Serde(format!("StreamMeta key 解码失败: {k:?}"))
-            })?;
+            let name = key::decode_stream_meta_key(&k)
+                .ok_or_else(|| es_core::Error::Serde(format!("StreamMeta key 解码失败: {k:?}")))?;
             let meta: StreamMeta = crate::encode::decode(&v)
                 .map_err(|e| es_core::Error::Serde(format!("StreamMeta 反序列化失败: {e}")))?;
             out.push((name, meta));
@@ -335,7 +330,8 @@ impl ApplyBatch {
     /// Delete 在后 ⇒ 前面的 Put 作废），保证「同批先写后删」语义，
     /// 且批内 Append 的写入（事件/指针/幂等索引）无需显式收集删除。
     fn push_delete(&mut self, key: Vec<u8>) {
-        self.ops.retain(|op| !matches!(op, ApplyOp::Put(k, _) if *k == key));
+        self.ops
+            .retain(|op| !matches!(op, ApplyOp::Put(k, _) if *k == key));
         self.ops.push(ApplyOp::Delete(key));
     }
 }
@@ -352,6 +348,10 @@ struct ApplyBatch {
     next_position: u64,
     /// 本批次新产生的事件（用于 commit 后广播）
     new_events: Vec<Event>,
+    /// 本批控制 Shard 的归属 catalog；首次使用时从存储加载。
+    ownership_catalog: Option<es_core::OwnershipCatalog>,
+    /// 本批已读取或写入的 Stream fencing 代次。
+    ownership_fences: std::collections::HashMap<String, u64>,
 }
 
 impl EsStorage {
@@ -505,6 +505,7 @@ impl EsStorage {
         expected: ExpectedVersion,
         events: &[es_core::NewEvent],
         hlc: es_core::Hlc,
+        ownership_generation: Option<u64>,
     ) -> es_core::Result<EsResponse> {
         let shard = self.shard_id();
 
@@ -513,14 +514,22 @@ impl EsStorage {
         if let Some(first) = events.first() {
             let idem_k = key::sm_idempotency(shard, &first.event_id);
             if let Some(bytes) = self.get(&idem_k)? {
-                let (v0, p0): (u64, u64) = crate::encode::decode(&bytes).map_err(|e| {
-                    es_core::Error::Serde(format!("幂等索引反序列化失败: {e}"))
-                })?;
+                let (v0, p0): (u64, u64) = crate::encode::decode(&bytes)
+                    .map_err(|e| es_core::Error::Serde(format!("幂等索引反序列化失败: {e}")))?;
                 let n = events.len() as u64;
                 return Ok(EsResponse::AppendOk {
                     next_expected_version: v0 + n - 1,
                     first_position: p0,
                     last_position: p0 + n - 1,
+                });
+            }
+        }
+
+        if let Some(generation) = ownership_generation {
+            let current = self.batch_ownership_fence(batch, stream_id)?;
+            if current != generation {
+                return Ok(EsResponse::OwnershipFenced {
+                    current_generation: current,
                 });
             }
         }
@@ -573,10 +582,9 @@ impl EsStorage {
             // position 指针，供分片内 $all 流按提交序读取
             let ptr = crate::encode::encode(&(stream_id, version))
                 .map_err(|e| es_core::Error::Serde(format!("position 指针序列化失败: {e}")))?;
-            batch.ops.push(ApplyOp::Put(
-                key::sm_position_ptr(shard, position),
-                ptr,
-            ));
+            batch
+                .ops
+                .push(ApplyOp::Put(key::sm_position_ptr(shard, position), ptr));
 
             // 记录新事件（用于 commit 后广播）
             batch.new_events.push(stored);
@@ -615,13 +623,88 @@ impl EsStorage {
 
         // 批内累积版本号，供同批后续 Append 看到；
         // 重建流（先删后写）清除 deleted 标记
-        batch.stream_versions.insert(stream_id.to_string(), Some(last_version));
+        batch
+            .stream_versions
+            .insert(stream_id.to_string(), Some(last_version));
         batch.deleted.remove(stream_id);
 
         Ok(EsResponse::AppendOk {
             next_expected_version: last_version,
             first_position,
             last_position,
+        })
+    }
+
+    fn batch_ownership_fence(
+        &self,
+        batch: &mut ApplyBatch,
+        stream_id: &str,
+    ) -> es_core::Result<u64> {
+        if let Some(generation) = batch.ownership_fences.get(stream_id) {
+            return Ok(*generation);
+        }
+        let generation = match self.get(&key::sm_ownership_fence(self.shard_id(), stream_id))? {
+            Some(bytes) => crate::encode::decode(&bytes)
+                .map_err(|e| es_core::Error::Serde(format!("归属 fencing 反序列化失败: {e}")))?,
+            None => 0,
+        };
+        batch
+            .ownership_fences
+            .insert(stream_id.to_string(), generation);
+        Ok(generation)
+    }
+
+    fn apply_ownership_command(
+        &self,
+        batch: &mut ApplyBatch,
+        command: es_core::OwnershipCommand,
+    ) -> es_core::Result<EsResponse> {
+        if batch.ownership_catalog.is_none() {
+            let catalog = match self.get(&key::sm_ownership_catalog(self.shard_id()))? {
+                Some(bytes) => crate::encode::decode(&bytes).map_err(|e| {
+                    es_core::Error::Serde(format!("归属 catalog 反序列化失败: {e}"))
+                })?,
+                None => es_core::OwnershipCatalog::default(),
+            };
+            batch.ownership_catalog = Some(catalog);
+        }
+        let catalog = batch.ownership_catalog.as_mut().expect("上方已初始化");
+        let applied = catalog.apply(command);
+        let bytes = crate::encode::encode(catalog)
+            .map_err(|e| es_core::Error::Serde(format!("归属 catalog 序列化失败: {e}")))?;
+        batch.ops.push(ApplyOp::Put(
+            key::sm_ownership_catalog(self.shard_id()),
+            bytes,
+        ));
+        Ok(EsResponse::OwnershipApplied(applied))
+    }
+
+    fn apply_ownership_fence(
+        &self,
+        batch: &mut ApplyBatch,
+        stream_id: &str,
+        generation: u64,
+    ) -> es_core::Result<EsResponse> {
+        if stream_id.is_empty() || generation == 0 {
+            return Err(es_core::Error::Internal(
+                "归属 fencing 要求非空 Stream 且 generation > 0".into(),
+            ));
+        }
+        let current = self.batch_ownership_fence(batch, stream_id)?;
+        let installed = current.max(generation);
+        if installed != current {
+            let bytes = crate::encode::encode(&installed)
+                .map_err(|e| es_core::Error::Serde(format!("归属 fencing 序列化失败: {e}")))?;
+            batch.ops.push(ApplyOp::Put(
+                key::sm_ownership_fence(self.shard_id(), stream_id),
+                bytes,
+            ));
+            batch
+                .ownership_fences
+                .insert(stream_id.to_string(), installed);
+        }
+        Ok(EsResponse::OwnershipFenceInstalled {
+            generation: installed,
         })
     }
 
@@ -681,7 +764,10 @@ impl RaftStateMachine<TypeConfig> for EsStorage {
     async fn applied_state(
         &mut self,
     ) -> std::result::Result<
-        (Option<LogId<u64>>, StoredMembership<u64, openraft::BasicNode>),
+        (
+            Option<LogId<u64>>,
+            StoredMembership<u64, openraft::BasicNode>,
+        ),
         StorageError<u64>,
     > {
         let sm = self.sm_cache().read().await;
@@ -703,6 +789,8 @@ impl RaftStateMachine<TypeConfig> for EsStorage {
             deleted: std::collections::HashSet::new(),
             next_position: self.read_next_position().map_err(sm_read_err)?,
             new_events: Vec::new(),
+            ownership_catalog: None,
+            ownership_fences: std::collections::HashMap::new(),
         };
 
         let mut responses = Vec::new();
@@ -729,12 +817,55 @@ impl RaftStateMachine<TypeConfig> for EsStorage {
                         hlc,
                     } => {
                         let resp = self
-                            .apply_append(&mut batch, stream_id, *expected_version, events, *hlc)
+                            .apply_append(
+                                &mut batch,
+                                stream_id,
+                                *expected_version,
+                                events,
+                                *hlc,
+                                None,
+                            )
+                            .map_err(sm_write_err)?;
+                        responses.push(resp);
+                    }
+                    EsRequest::AppendOwned {
+                        stream_id,
+                        ownership_generation,
+                        expected_version,
+                        events,
+                        hlc,
+                    } => {
+                        let resp = self
+                            .apply_append(
+                                &mut batch,
+                                stream_id,
+                                *expected_version,
+                                events,
+                                *hlc,
+                                Some(*ownership_generation),
+                            )
                             .map_err(sm_write_err)?;
                         responses.push(resp);
                     }
                     EsRequest::DeleteStream { stream_id } => {
-                        let resp = self.apply_delete(&mut batch, stream_id).map_err(sm_write_err)?;
+                        let resp = self
+                            .apply_delete(&mut batch, stream_id)
+                            .map_err(sm_write_err)?;
+                        responses.push(resp);
+                    }
+                    EsRequest::CommitOwnership { command } => {
+                        let resp = self
+                            .apply_ownership_command(&mut batch, command.clone())
+                            .map_err(sm_write_err)?;
+                        responses.push(resp);
+                    }
+                    EsRequest::InstallOwnershipFence {
+                        stream_id,
+                        generation,
+                    } => {
+                        let resp = self
+                            .apply_ownership_fence(&mut batch, stream_id, *generation)
+                            .map_err(sm_write_err)?;
                         responses.push(resp);
                     }
                 },
@@ -758,7 +889,9 @@ impl RaftStateMachine<TypeConfig> for EsStorage {
         // 已应用状态：与业务数据同事务提交，保证重启后 last_applied 与数据一致
         let mut cache = self.sm_cache().write().await;
         let new_last_applied = last_applied.or(cache.last_applied);
-        let new_membership = membership.clone().unwrap_or_else(|| cache.membership.clone());
+        let new_membership = membership
+            .clone()
+            .unwrap_or_else(|| cache.membership.clone());
         let applied = AppliedState {
             last_applied: new_last_applied,
             membership: new_membership.clone(),
@@ -856,9 +989,7 @@ impl RaftStateMachine<TypeConfig> for EsStorage {
         // 先清掉本分片状态机区的全部现有数据，再灌入快照内容。
         // 不清空会残留快照里已不存在的 key（例如被 purge 掉的事件）。
         let (sm_start, sm_end) = self.sm_range().map_err(sm_write_err)?;
-        let old_keys = self
-            .collect_keys(sm_start, sm_end)
-            .map_err(sm_write_err)?;
+        let old_keys = self.collect_keys(sm_start, sm_end).map_err(sm_write_err)?;
 
         let mut cache = self.sm_cache().write().await;
 
@@ -899,9 +1030,7 @@ impl RaftStateMachine<TypeConfig> for EsStorage {
         if is_temp {
             let final_path = self.snapshot_store().final_path(meta.last_log_id);
             if let Err(e) = std::fs::rename(&path, &final_path) {
-                tracing::warn!(
-                    "快照文件转正失败（仅损失文件缓存，SM 数据已提交）: {e}"
-                );
+                tracing::warn!("快照文件转正失败（仅损失文件缓存，SM 数据已提交）: {e}");
             } else {
                 temp_guard.0 = None; // 转正成功，guard 不再删除
             }
@@ -979,7 +1108,7 @@ impl RaftSnapshotBuilder<TypeConfig> for EsStorage {
             compression: store.compression(),
             shard_id: shard,
             // meta_len 必须与实际写 header 的编码一致（write_header 保留 serde_json）
-        meta_len: serde_json::to_vec(&meta).map_err(sm_write_err)?.len() as u64,
+            meta_len: serde_json::to_vec(&meta).map_err(sm_write_err)?.len() as u64,
             payload_len: snapshot::payload_len_for(&entries),
         };
         // 写段失败时清理 tmp（不调 finish 的 zstd Encoder Drop 不补帧尾，

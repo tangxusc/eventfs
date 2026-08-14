@@ -19,7 +19,7 @@
 
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 
 use es_proto::eventstore::migration_client::MigrationClient;
 use es_proto::eventstore::*;
@@ -70,7 +70,16 @@ async fn migrate_stream(
 ) -> Result<MigrateReport> {
     // ---- Preparing ----
     let route = ctx.cluster.get_route_table().await?;
-    let routed_shard = route.lookup(stream);
+    let routed_owner = route.lookup(stream).map(|shard_id| {
+        let generation = route
+            .stream_generations
+            .get(stream)
+            .copied()
+            .unwrap_or(1)
+            .max(1);
+        (shard_id, generation)
+    });
+    let routed_shard = routed_owner.map(|(shard_id, _)| shard_id);
     // 源分片定位：路由表优先；无记录（孤儿流：跨节点隐式建流竞态残留）
     // → 枚举分片自动定位
     let src_shard = match routed_shard {
@@ -196,7 +205,17 @@ async fn migrate_stream(
     }
 
     // ---- Switching：原子切换路由 ----
-    set_stream_shard(ctx, stream, dst_shard).await?;
+    // generation=0 明确表示“期望权威中不存在”；服务端据此原子收养孤儿流。
+    let (expected_shard, expected_generation) = routed_owner.unwrap_or((src_shard, 0));
+    set_stream_shard(
+        ctx,
+        stream,
+        expected_shard,
+        expected_generation,
+        dst_shard,
+        uuid::Uuid::new_v4(),
+    )
+    .await?;
     eprintln!("已切换路由：{stream} → shard {dst_shard}");
 
     // ---- Draining / Verifying / Finalizing ----
@@ -251,7 +270,25 @@ async fn complete_migration(
     if let Err(e) = verify(ctx, stream, src_shard, dst_shard).await {
         // 校验失败：回切路由（源数据从未被动过）
         eprintln!("校验失败，回切路由到源分片...");
-        let _ = set_stream_shard(ctx, stream, src_shard).await;
+        if let Ok(route) = ctx.cluster.get_route_table().await {
+            if let Some(current_shard) = route.lookup(stream) {
+                let current_generation = route
+                    .stream_generations
+                    .get(stream)
+                    .copied()
+                    .unwrap_or(1)
+                    .max(1);
+                let _ = set_stream_shard(
+                    ctx,
+                    stream,
+                    current_shard,
+                    current_generation,
+                    src_shard,
+                    uuid::Uuid::new_v4(),
+                )
+                .await;
+            }
+        }
         return Err(e);
     }
 
@@ -471,20 +508,43 @@ async fn delete_from_shard(ctx: &Ctx, shard: u64, stream: &str) -> Result<()> {
     Ok(())
 }
 
-/// 切换路由（任意节点执行，版本仲裁收敛）
-async fn set_stream_shard(ctx: &Ctx, stream: &str, shard: u64) -> Result<()> {
-    let mut client = ctx
-        .cluster
-        .migration_client(&ctx.cluster.pick_endpoint())
-        .await?;
-    client
-        .set_stream_shard(SetStreamShardRequest {
-            stream_id: stream.to_string(),
-            shard_id: shard,
-        })
-        .await
-        .map_err(|e| anyhow!("切换路由失败: {e}"))?;
-    Ok(())
+/// 通过任意节点向控制 Shard 提交条件归属切换；瞬态重试复用 operation ID。
+async fn set_stream_shard(
+    ctx: &Ctx,
+    stream: &str,
+    expected_shard: u64,
+    expected_generation: u64,
+    target_shard: u64,
+    operation_id: uuid::Uuid,
+) -> Result<()> {
+    let request = SetStreamShardRequest {
+        stream_id: stream.to_string(),
+        shard_id: target_shard,
+        expected_shard_id: expected_shard,
+        expected_generation,
+        operation_id: operation_id.as_bytes().to_vec(),
+    };
+    let mut last_error = None;
+    for _ in 0..WRITE_RETRIES {
+        let mut client = ctx
+            .cluster
+            .migration_client(&ctx.cluster.pick_endpoint())
+            .await?;
+        match client.set_stream_shard(request.clone()).await {
+            Ok(_) => return Ok(()),
+            Err(error) if error.code() == tonic::Code::Unavailable => {
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            Err(error) => return Err(anyhow!("条件切换归属失败: {error}")),
+        }
+    }
+    Err(anyhow!(
+        "条件切换归属重试耗尽: {}",
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_default()
+    ))
 }
 
 /// 源 ⊆ 目标校验：源的全部事件必须存在于目标，且载荷/时间戳保真。

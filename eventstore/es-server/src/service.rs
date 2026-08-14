@@ -13,7 +13,8 @@ use es_proto::tls::TlsClientConfig;
 use es_raft::ShardManager;
 
 use crate::config::Config;
-use crate::route_table::{RouteTableManager, routes_path};
+use crate::ownership::{AppendTarget, StreamOwnership};
+use crate::route_table::{routes_path, RouteTableManager};
 
 /// 远程 shard 的 leader 探测器。
 ///
@@ -324,6 +325,8 @@ pub struct EsService {
     limits: crate::config::LimitsSection,
     /// 流路由表（stream → shard 归属；写路径权威）
     route_table: Arc<RouteTableManager>,
+    /// 强一致归属；Append 只能通过它取得带 generation 的目标。
+    ownership: Arc<StreamOwnership>,
     /// 远程 shard 定位（本节点不承载的目标分片）
     remote: RemoteShards,
     /// 建立 `$all` 聚合订阅时的 shard 快照；公共接口不暴露这些内部 ID。
@@ -347,10 +350,27 @@ impl EsService {
         route_table: Arc<RouteTableManager>,
         config: &Config,
     ) -> Result<Self, String> {
+        let ownership = Arc::new(StreamOwnership::new(
+            config,
+            shard_manager.clone(),
+            route_table.clone(),
+        )?);
+        Self::with_ownership(shard_manager, limits, route_table, ownership, config)
+    }
+
+    /// 创建服务实例，并复用服务器持有的强一致归属 module。
+    pub fn with_ownership(
+        shard_manager: Arc<ShardManager>,
+        limits: crate::config::LimitsSection,
+        route_table: Arc<RouteTableManager>,
+        ownership: Arc<StreamOwnership>,
+        config: &Config,
+    ) -> Result<Self, String> {
         Ok(Self {
             shard_manager,
             limits,
             route_table,
+            ownership,
             remote: RemoteShards::new(config)?,
             all_shards: config
                 .placement
@@ -364,17 +384,12 @@ impl EsService {
         })
     }
 
-    /// 写路径解析 stream 归属 shard：路由表命中直接返回；未命中（隐式建流）
-    /// 分配并记录（锁内双检查，同节点并发不重复分配）。
-    async fn resolve_write_shard_id(&self, stream_id: &str) -> Result<u64, Status> {
-        if let Some(s) = self.route_table.lookup(stream_id).await {
-            return Ok(s);
-        }
-        self.route_table
-            .allocate(stream_id)
+    /// 写路径取得强一致归属目标；未知 Stream 不允许本地分配。
+    async fn resolve_write_target(&self, stream_id: &str) -> Result<AppendTarget, Status> {
+        self.ownership
+            .for_append(stream_id)
             .await
-            .map(|(s, _)| s)
-            .map_err(|e| Status::internal(format!("分配流失败: {e}")))
+            .map_err(crate::ownership::OwnershipError::into_status)
     }
 
     /// 读路径解析 stream 归属：只查不分配（读无副作用）。
@@ -614,8 +629,8 @@ impl EventStore for EsService {
 
         // 1. 解析 stream 归属 shard（未知流 = 隐式建流：分配并记录路由表）；
         //    本节点不承载时给出 leader 重定向提示
-        let shard_id = self.resolve_write_shard_id(stream_id).await?;
-        let shard = self.resolve_write_shard(shard_id).await?;
+        let target = self.resolve_write_target(stream_id).await?;
+        let shard = self.resolve_write_shard(target.shard_id()).await?;
 
         // 2. 转换 proto 请求为领域模型
         let expected_version = req
@@ -644,19 +659,43 @@ impl EventStore for EsService {
         // 3. 分配 HLC（leader 在提交前分配，保证所有副本一致）
         let hlc = es_core::Hlc::now();
 
-        let es_request = es_storage::EsRequest::Append {
+        let mut es_request = es_storage::EsRequest::AppendOwned {
             stream_id: stream_id.clone(),
+            ownership_generation: target.generation(),
             expected_version: expected,
             events,
             hlc,
         };
 
         // 4. 通过 Raft 提交（client_write 返回 apply 后的响应）
-        let resp = shard
+        let mut resp = shard
             .raft
-            .client_write(es_request)
+            .client_write(es_request.clone())
             .await
             .map_err(client_write_to_status)?;
+        let mut successful_shard_id = shard.id();
+
+        if matches!(resp.data, es_storage::EsResponse::OwnershipFenced { .. }) {
+            let refreshed = self
+                .ownership
+                .recover_fenced(stream_id, target.generation())
+                .await
+                .map_err(crate::ownership::OwnershipError::into_status)?;
+            let refreshed_shard = self.resolve_write_shard(refreshed.shard_id()).await?;
+            if let es_storage::EsRequest::AppendOwned {
+                ownership_generation,
+                ..
+            } = &mut es_request
+            {
+                *ownership_generation = refreshed.generation();
+            }
+            resp = refreshed_shard
+                .raft
+                .client_write(es_request)
+                .await
+                .map_err(client_write_to_status)?;
+            successful_shard_id = refreshed_shard.id();
+        }
 
         // 5. 转换响应
         match resp.data {
@@ -665,7 +704,7 @@ impl EventStore for EsService {
                 first_position,
                 last_position,
             } => Ok(Response::new(AppendResponse {
-                shard_id: shard.id(),
+                shard_id: successful_shard_id,
                 next_expected_version,
                 first_position,
                 last_position,
@@ -676,9 +715,12 @@ impl EventStore for EsService {
                     actual_version
                 )))
             }
-            es_storage::EsResponse::DeleteOk => {
-                Err(Status::internal("append 返回 DeleteOk（不应发生）"))
+            es_storage::EsResponse::OwnershipFenced { current_generation } => {
+                Err(Status::unavailable(format!(
+                    "stream ownership generation advanced to {current_generation}; retry"
+                )))
             }
+            other => Err(Status::internal(format!("append 返回意外结果: {other:?}"))),
         }
     }
 
@@ -1061,11 +1103,8 @@ impl EventStore for EsService {
         if req.stream_id.is_empty() {
             return Err(Status::invalid_argument("stream_id 不能为空"));
         }
-        let (shard_id, inserted) = self
-            .route_table
-            .allocate(&req.stream_id)
-            .await
-            .map_err(|e| Status::internal(format!("分配流失败: {e}")))?;
+        let target = self.resolve_write_target(&req.stream_id).await?;
+        let shard_id = target.shard_id();
 
         // 尽力探测 leader（仅提示用；失败不阻塞创建）
         let leader_addr = self
@@ -1078,7 +1117,7 @@ impl EventStore for EsService {
         Ok(Response::new(CreateStreamResponse {
             shard_id,
             leader_addr,
-            exists: !inserted,
+            exists: !target.created_now(),
         }))
     }
 }
@@ -1241,15 +1280,13 @@ mod tests {
             Some(subscribe_response::Payload::Event(event))
                 if event.stream_id == "s3" && event.version == 4
         ));
-        assert!(
-            aggregate_source_message(
-                SourceMessage::CaughtUp(3),
-                &mut pending,
-                &mut caught_up,
-                &mut degraded,
-            )
-            .is_none()
-        );
+        assert!(aggregate_source_message(
+            SourceMessage::CaughtUp(3),
+            &mut pending,
+            &mut caught_up,
+            &mut degraded,
+        )
+        .is_none());
         assert!(matches!(
             aggregate_source_message(
                 SourceMessage::CaughtUp(7),
@@ -1260,15 +1297,13 @@ mod tests {
             .and_then(|response| response.payload),
             Some(subscribe_response::Payload::CaughtUp(_))
         ));
-        assert!(
-            aggregate_source_message(
-                SourceMessage::CaughtUp(7),
-                &mut pending,
-                &mut caught_up,
-                &mut degraded,
-            )
-            .is_none()
-        );
+        assert!(aggregate_source_message(
+            SourceMessage::CaughtUp(7),
+            &mut pending,
+            &mut caught_up,
+            &mut degraded,
+        )
+        .is_none());
         assert!(matches!(
             aggregate_source_message(
                 SourceMessage::Degraded(3),
@@ -1279,15 +1314,13 @@ mod tests {
             .and_then(|response| response.payload),
             Some(subscribe_response::Payload::Degraded(_))
         ));
-        assert!(
-            aggregate_source_message(
-                SourceMessage::Degraded(7),
-                &mut pending,
-                &mut caught_up,
-                &mut degraded,
-            )
-            .is_none()
-        );
+        assert!(aggregate_source_message(
+            SourceMessage::Degraded(7),
+            &mut pending,
+            &mut caught_up,
+            &mut degraded,
+        )
+        .is_none());
     }
 
     #[tokio::test]

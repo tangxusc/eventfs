@@ -7,8 +7,8 @@ use std::time::Duration;
 use es_proto::eventstore::event_store_server::EventStoreServer;
 use es_proto::eventstore::raft_admin_server::RaftAdminServer;
 use es_proto::eventstore::raft_rpc_server::RaftRpcServer;
-use es_server::Server;
 use es_server::config::{Config, NodeConfig, PlacementConfig, PlacementNode, StorageConfig};
+use es_server::Server;
 
 /// 启动测试服务器（单节点、2 分片、每分片单成员自举）。
 ///
@@ -79,13 +79,15 @@ async fn start_server() -> (
     let sm = server.shard_manager().clone();
     // 共享 server 的路由表实例（EsService::new 会自建独立实例，内存态不同步）
     let route_table = server.route_table().clone();
+    let ownership = server.ownership().clone();
     let handle = tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
             .add_service(EventStoreServer::new(
-                es_server::service::EsService::with_limits(
+                es_server::service::EsService::with_ownership(
                     sm.clone(),
                     config.limits.clone(),
                     route_table.clone(),
+                    ownership.clone(),
                     &config,
                 )
                 .expect("创建服务"),
@@ -95,7 +97,7 @@ async fn start_server() -> (
             )))
             .add_service(
                 es_proto::eventstore::migration_server::MigrationServer::new(
-                    es_server::migration_service::MigrationService::new(route_table, sm),
+                    es_server::migration_service::MigrationService::new(route_table, sm, ownership),
                 ),
             )
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
@@ -154,13 +156,15 @@ async fn start_server_uninitialized(
     let sm = server.shard_manager().clone();
     // 共享 server 的路由表实例（EsService::new 会自建独立实例，内存态不同步）
     let route_table = server.route_table().clone();
+    let ownership = server.ownership().clone();
     let handle = tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
             .add_service(EventStoreServer::new(
-                es_server::service::EsService::with_limits(
+                es_server::service::EsService::with_ownership(
                     sm.clone(),
                     config.limits.clone(),
                     route_table.clone(),
+                    ownership.clone(),
                     &config,
                 )
                 .expect("创建服务"),
@@ -170,7 +174,7 @@ async fn start_server_uninitialized(
             )))
             .add_service(
                 es_proto::eventstore::migration_server::MigrationServer::new(
-                    es_server::migration_service::MigrationService::new(route_table, sm),
+                    es_server::migration_service::MigrationService::new(route_table, sm, ownership),
                 ),
             )
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
@@ -1438,6 +1442,9 @@ async fn migrate_switch_then_interrupt_resumes() {
             .set_stream_shard(es_proto::eventstore::SetStreamShardRequest {
                 stream_id: "mig/interrupt".to_string(),
                 shard_id: 1,
+                expected_shard_id: 0,
+                expected_generation: 1,
+                operation_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
             })
             .await
             .expect("切换路由");

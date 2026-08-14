@@ -27,6 +27,8 @@ const SM_POSITION_PTR: u8 = 0x03;
 const SM_APPLIED_STATE: u8 = 0x04;
 const SM_IDEMPOTENCY: u8 = 0x05;
 const SM_NEXT_POSITION: u8 = 0x06;
+const SM_OWNERSHIP_CATALOG: u8 = 0x07;
+const SM_OWNERSHIP_FENCE: u8 = 0x08;
 
 /// 快照子类别
 const SNAPSHOT_CURRENT: u8 = 0x01;
@@ -166,6 +168,20 @@ pub fn sm_next_position(shard_id: u64) -> Vec<u8> {
     k.extend_from_slice(&encode_u64_be(shard_id));
     k.push(SM_NEXT_POSITION);
     k
+}
+
+/// 控制 Shard 的 Stream 归属权威状态 key。
+pub fn sm_ownership_catalog(shard_id: u64) -> Vec<u8> {
+    sm_sub_prefix(shard_id, SM_OWNERSHIP_CATALOG)
+}
+
+/// 数据 Shard 的 Stream 归属代次 fencing key。
+pub fn sm_ownership_fence(shard_id: u64, stream_id: &str) -> Vec<u8> {
+    let stream_bytes = stream_id.as_bytes();
+    let mut key = sm_sub_prefix(shard_id, SM_OWNERSHIP_FENCE);
+    key.extend_from_slice(&(stream_bytes.len() as u64).to_be_bytes());
+    key.extend_from_slice(stream_bytes);
+    key
 }
 
 /// 快照 key: [0x03][shard:BE8][0x01]
@@ -469,5 +485,3 @@ mod tests {
         assert_eq!(decode_stream_meta_key(&[0u8; 17]), None);
     }
 }
-
-

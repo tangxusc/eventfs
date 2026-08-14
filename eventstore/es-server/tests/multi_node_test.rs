@@ -134,6 +134,15 @@ impl TestCluster {
                 port
             })
             .collect();
+        let internal_ports: Vec<u16> = (0..n)
+            .map(|_| {
+                let listener =
+                    std::net::TcpListener::bind("127.0.0.1:0").expect("绑定内部临时端口");
+                let port = listener.local_addr().expect("取内部地址").port();
+                drop(listener);
+                port
+            })
+            .collect();
 
         // 完整成员列表（含自己）——启动时自动组建的配置依据
         let all_peers: Vec<serde_json::Value> = ports
@@ -143,6 +152,7 @@ impl TestCluster {
                 serde_json::json!({
                     "id": (i + 1) as u64,
                     "addr": format!("127.0.0.1:{}", p),
+                    "internal_addr": format!("127.0.0.1:{}", internal_ports[i]),
                 })
             })
             .collect();
@@ -155,9 +165,21 @@ impl TestCluster {
             let mut node_json = serde_json::json!({
                 "id": node_id,
                 "listen_addr": format!("127.0.0.1:{}", port),
+                "internal_listen_addr": format!(
+                    "127.0.0.1:{}",
+                    internal_ports[(node_id - 1) as usize]
+                ),
             });
             if write_peers {
                 node_json["peers"] = serde_json::Value::Array(all_peers.clone());
+            } else {
+                node_json["peers"] = serde_json::Value::Array(
+                    all_peers
+                        .iter()
+                        .filter(|peer| peer["id"].as_u64() != Some(node_id))
+                        .cloned()
+                        .collect(),
+                );
             }
             // 放置表：
             // - write_peers=true（自动组建）：全复制语义（原「每节点全量 N 分片、
@@ -832,11 +854,9 @@ async fn sdk_append_redirects_to_leader() {
     sdk.append(
         "sdk-redirect".to_string(),
         es_client::ExpectedVersionBuilder::any(),
-        vec![
-            es_client::EventBuilder::new("E")
-                .data(b"x".to_vec())
-                .build(),
-        ],
+        vec![es_client::EventBuilder::new("E")
+            .data(b"x".to_vec())
+            .build()],
     )
     .await
     .expect("经 leader_addr 重定向后 append 成功");
@@ -1227,6 +1247,82 @@ async fn restart_rejoin_catchup() {
     let versions: Vec<u64> = events.iter().map(|e| e.version).collect();
     assert_eq!(versions, vec![0, 1, 2, 3, 4], "版本应连续");
     eprintln!("✓ 重启节点数据完整且版本连续");
+
+    cluster.shutdown();
+}
+
+#[tokio::test]
+#[ignore = "需启动多个进程，耗时较长"]
+async fn concurrent_stream_creation_is_linearized_across_nodes() {
+    let cluster = TestCluster::start_with_shards(2, false).await;
+    cluster.form_cluster().await;
+
+    // 两个入口同时提交同一未知 Stream，必须由控制 Shard 串行化为唯一归属。
+    let mut first = cluster.client(1).await;
+    let mut second = cluster.client(2).await;
+    let stream_id = "concurrent-owner".to_string();
+    let first_create = first.create_stream(CreateStreamRequest {
+        stream_id: stream_id.clone(),
+    });
+    let second_create = second.create_stream(CreateStreamRequest { stream_id });
+    let (first_result, second_result) = tokio::join!(first_create, second_create);
+    let first_shard = first_result
+        .expect("节点一创建 Stream")
+        .into_inner()
+        .shard_id;
+    let second_shard = second_result
+        .expect("节点二创建 Stream")
+        .into_inner()
+        .shard_id;
+
+    assert_eq!(
+        first_shard, second_shard,
+        "并发首次归属必须由同一个线性化裁决点返回相同 Shard"
+    );
+
+    cluster.shutdown();
+}
+
+#[tokio::test]
+#[ignore = "需启动多个进程，耗时较长"]
+async fn unknown_stream_is_rejected_without_control_shard_quorum_and_recovers() {
+    let mut cluster = TestCluster::start().await;
+    cluster.form_cluster().await;
+    let leader = cluster.wait_for_leader(Duration::from_secs(10)).await;
+    let followers: Vec<u64> = (1..=3).filter(|node_id| *node_id != leader).collect();
+
+    cluster.kill_node(followers[0]);
+    cluster.kill_node(followers[1]);
+    let mut isolated_leader = cluster.client(leader).await;
+    let rejected = tokio::time::timeout(
+        Duration::from_secs(10),
+        isolated_leader.create_stream(CreateStreamRequest {
+            stream_id: "requires-quorum".into(),
+        }),
+    )
+    .await;
+    match rejected {
+        Ok(Err(status)) => assert_eq!(status.code(), tonic::Code::Unavailable),
+        Err(_) => {} // 客户端超时同样没有确认成功，允许安全重试。
+        Ok(Ok(response)) => panic!("无 quorum 时不得确认首次归属: {:?}", response.into_inner()),
+    }
+
+    cluster.restart_node(followers[0]).await;
+    let recovered_leader = cluster
+        .wait_leader_among(&[leader, followers[0]], Duration::from_secs(20))
+        .await;
+    let mut recovered = cluster.client(recovered_leader).await;
+    let created = tokio::time::timeout(
+        Duration::from_secs(10),
+        recovered.create_stream(CreateStreamRequest {
+            stream_id: "requires-quorum".into(),
+        }),
+    )
+    .await
+    .expect("恢复 quorum 后请求不应超时")
+    .expect("恢复 quorum 后应可确认归属")
+    .into_inner();
+    assert!(created.shard_id < cluster.num_shards);
 
     cluster.shutdown();
 }

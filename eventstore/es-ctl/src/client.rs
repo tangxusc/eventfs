@@ -3,16 +3,16 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future::Future;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::RwLock;
 use std::time::Duration;
 
-use anyhow::{Context, anyhow, bail};
+use anyhow::{anyhow, bail, Context};
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Status};
 
-use es_core::{LeaderRetryPlan, parse_leader_hint};
 use es_core::route::RouteTable;
+use es_core::{parse_leader_hint, LeaderRetryPlan};
 use es_proto::endpoint::normalize_endpoint;
 use es_proto::eventstore::event_store_client::EventStoreClient;
 use es_proto::eventstore::migration_client::MigrationClient;
@@ -21,7 +21,7 @@ use es_proto::eventstore::{
     CreateStreamRequest, CreateStreamResponse, GetRaftStateRequest, GetRaftStateResponse,
     GetRouteTableRequest, ListShardsRequest, ListShardsResponse, RecountStreamsRequest,
 };
-use es_proto::tls::{TlsClientConfig, apply_endpoint_tls};
+use es_proto::tls::{apply_endpoint_tls, TlsClientConfig};
 
 /// 集群客户端。
 ///
@@ -157,10 +157,7 @@ impl ClusterClient {
     }
 
     /// Migration 操作：在任一可达端点执行（语义同 with_any_endpoint）。
-    pub async fn with_any_migration_endpoint<T, F, Fut>(
-        &self,
-        f: F,
-    ) -> Result<T, anyhow::Error>
+    pub async fn with_any_migration_endpoint<T, F, Fut>(&self, f: F) -> Result<T, anyhow::Error>
     where
         F: Fn(MigrationClient<Channel>) -> Fut,
         Fut: Future<Output = Result<T, Status>>,
@@ -485,6 +482,8 @@ fn proto_table_to_core(t: Option<es_proto::eventstore::RouteTable>) -> RouteTabl
             version: t.version,
             streams: t.streams.into_iter().collect(),
             shard_stream_counts: t.shard_stream_counts.into_iter().collect(),
+            stream_generations: t.stream_generations.into_iter().collect(),
+            stream_revisions: t.stream_revisions.into_iter().collect(),
         },
         None => RouteTable::new(),
     }

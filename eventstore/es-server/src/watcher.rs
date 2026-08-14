@@ -6,13 +6,17 @@
 //! 两条 watch：
 //! - config.toml：重载 + validate（失败仅告警，服务不受影响）→ diff 新增
 //!   shards → 逐个创建（factory::create_shard → register_shard → bootstrap）
-//! - routes.json：热更新路由表（运维手工修改文件同样生效）
+//! - routes.json：校验兼容投影；手工改写归属会被拒绝并恢复权威内容
 //!
 //! 配置中移除 shard：仅告警，数据目录保留；重新加入时幂等打开恢复。
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+};
 
 use notify::{RecursiveMode, Watcher};
 use tokio::sync::watch;
@@ -21,11 +25,21 @@ use es_raft::ShardManager;
 
 use crate::config::Config;
 use crate::factory;
+use crate::ownership::{OwnershipChange, StreamOwnership};
 use crate::route_table::RouteTableManager;
 
 /// 事件合并窗口：配置文件常见 temp+rename 写入，会触发多事件；
 /// 收到事件后等待窗口结束再重读文件（读到的即最终状态）。
 const DEBOUNCE: Duration = Duration::from_millis(200);
+/// 文件系统通知可能丢失时的最终调和周期。
+const RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
+
+fn file_fingerprint(path: &std::path::Path) -> Option<u64> {
+    let bytes = std::fs::read(path).ok()?;
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Some(hasher.finish())
+}
 
 /// watcher 生命周期句柄：持有 notify watcher（防 drop）与后台任务。
 pub struct WatcherHandle {
@@ -57,6 +71,7 @@ pub fn spawn(
     config_path: PathBuf,
     routes_path: PathBuf,
     route_table: Arc<RouteTableManager>,
+    ownership: Arc<StreamOwnership>,
     shard_manager: Arc<ShardManager>,
     self_node_id: u64,
 ) -> Result<WatcherHandle, notify::Error> {
@@ -89,13 +104,39 @@ pub fn spawn(
         }
     }
 
+    // 必须在返回前读取基线；若放进后台任务，调用方紧接着写文件时，
+    // 新内容可能先于任务调度并被误认为初始状态。
+    let initial_config_fingerprint = file_fingerprint(&config_path);
+    let initial_routes_fingerprint = file_fingerprint(&routes_path);
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
     let task = tokio::spawn(async move {
+        let mut config_fingerprint = initial_config_fingerprint;
+        let mut routes_fingerprint = initial_routes_fingerprint;
+        let mut reconcile = tokio::time::interval(RECONCILE_INTERVAL);
+        reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // 事件到达 → debounce → 按路径分发
         while !*shutdown_rx.borrow() {
             tokio::select! {
                 _ = shutdown_rx.changed() => break,
+                _ = reconcile.tick() => {
+                    let current_config = file_fingerprint(&config_path);
+                    if current_config != config_fingerprint {
+                        handle_config_change(
+                            &config_path,
+                            &route_table,
+                            &ownership,
+                            &shard_manager,
+                            self_node_id,
+                        ).await;
+                        config_fingerprint = file_fingerprint(&config_path);
+                    }
+                    let current_routes = file_fingerprint(&routes_path);
+                    if current_routes != routes_fingerprint {
+                        reconcile_routes(&route_table, &ownership).await;
+                        routes_fingerprint = file_fingerprint(&routes_path);
+                    }
+                }
                 maybe = rx.recv() => {
                     let Some(ev) = maybe else { break };
                     if ev.is_err() {
@@ -109,12 +150,20 @@ pub fn spawn(
                     if ev.as_ref().is_ok_and(|e| {
                         e.paths.iter().any(|p| p.file_name() == config_path.file_name())
                     }) {
-                        handle_config_change(&config_path, &route_table, &shard_manager, self_node_id)
+                        handle_config_change(
+                            &config_path,
+                            &route_table,
+                            &ownership,
+                            &shard_manager,
+                            self_node_id,
+                        )
                             .await;
+                        config_fingerprint = file_fingerprint(&config_path);
                     } else if ev.as_ref().is_ok_and(|e| {
                         e.paths.iter().any(|p| p.file_name() == routes_path.file_name())
                     }) {
-                        route_table.reload().await;
+                        reconcile_routes(&route_table, &ownership).await;
+                        routes_fingerprint = file_fingerprint(&routes_path);
                     }
                 }
             }
@@ -129,10 +178,26 @@ pub fn spawn(
     })
 }
 
+async fn reconcile_routes(route_table: &Arc<RouteTableManager>, ownership: &Arc<StreamOwnership>) {
+    match route_table.read_file() {
+        Ok(Some(table)) => {
+            if let Err(error) = ownership
+                .change(OwnershipChange::ImportLegacy { table })
+                .await
+            {
+                tracing::error!("路由表热更新被归属权威拒绝：{error}");
+            }
+        }
+        Ok(None) => {}
+        Err(error) => tracing::error!("路由表重载失败：{error}"),
+    }
+}
+
 /// 配置变更处理：重载 → 校验 → 创建新增 shards → 更新分配范围。
 async fn handle_config_change(
     config_path: &PathBuf,
     route_table: &Arc<RouteTableManager>,
+    ownership: &Arc<StreamOwnership>,
     shard_manager: &Arc<ShardManager>,
     self_node_id: u64,
 ) {
@@ -193,7 +258,7 @@ async fn handle_config_change(
     // 分配范围随放置表更新（新 shards 加入分配池；创建失败的部分不加入——
     // 由 cfg 的 placement 决定整体，失败 shard 无法从池中单独剔除，
     // 因此仅在全部创建成功时才更新，避免把未就绪 shard 暴露给分配）
-    if created_ok || !has_added {
+    if !has_added || created_ok {
         let shard_set: std::collections::BTreeSet<u64> = cfg
             .placement
             .nodes
@@ -201,6 +266,23 @@ async fn handle_config_change(
             .flat_map(|n| n.primary.iter().chain(n.replica.iter()))
             .copied()
             .collect();
+        if !shard_set.contains(&ownership.control_shard_id()) {
+            tracing::error!(
+                control_shard_id = ownership.control_shard_id(),
+                "配置热更新不能移除控制 Shard，保留原分配池"
+            );
+            return;
+        }
+        if let Err(error) = ownership
+            .change(OwnershipChange::ApplyPlacement {
+                eligible_shards: shard_set.clone(),
+            })
+            .await
+        {
+            tracing::error!("配置热更新提交分配池失败，保留原分配池：{error}");
+            return;
+        }
+        // 兼容旧的直接查询调用；权威提交成功后再更新本地选择视图。
         route_table.set_shard_set(shard_set).await;
     }
 }
@@ -300,6 +382,14 @@ data_dir = "./data"
         }
     }
 
+    fn watcher_ownership(
+        config: &Config,
+        table: Arc<RouteTableManager>,
+        manager: Arc<ShardManager>,
+    ) -> Arc<StreamOwnership> {
+        Arc::new(StreamOwnership::new(config, manager, table).expect("创建归属 module"))
+    }
+
     #[tokio::test]
     async fn invalid_hot_config_inputs_leave_route_table_unchanged() {
         let dir = tempfile::tempdir().expect("临时目录");
@@ -309,12 +399,13 @@ data_dir = "./data"
                 .expect("创建路由表管理器"),
         );
         let manager = Arc::new(ShardManager::new(1, 1));
+        let ownership = watcher_ownership(&config, table.clone(), manager.clone());
         let path = dir.path().join("config.toml");
 
         // 文件缺失、语法错误和语义非法都必须保留运行期状态。
-        handle_config_change(&path, &table, &manager, 1).await;
+        handle_config_change(&path, &table, &ownership, &manager, 1).await;
         std::fs::write(&path, "not [valid toml").expect("写入非法语法");
-        handle_config_change(&path, &table, &manager, 1).await;
+        handle_config_change(&path, &table, &ownership, &manager, 1).await;
         std::fs::write(
             &path,
             r#"
@@ -327,7 +418,7 @@ data_dir = "./data"
 "#,
         )
         .expect("写入语义非法配置");
-        handle_config_change(&path, &table, &manager, 1).await;
+        handle_config_change(&path, &table, &ownership, &manager, 1).await;
 
         assert!(manager.shard_ids().await.is_empty());
         assert!(table.snapshot().await.streams.is_empty());
@@ -343,12 +434,13 @@ data_dir = "./data"
                 .expect("创建路由表管理器"),
         );
         let manager = Arc::new(ShardManager::new(1, 1));
+        let ownership = watcher_ownership(&config, table.clone(), manager.clone());
         let config_path = dir.path().join("config/config.toml");
         let routes_path = dir.path().join("routes/routes.json");
         std::fs::create_dir_all(config_path.parent().expect("配置目录")).expect("创建配置目录");
         std::fs::create_dir_all(routes_path.parent().expect("路由目录")).expect("创建路由目录");
 
-        spawn(config_path, routes_path, table, manager, 1)
+        spawn(config_path, routes_path, table, ownership, manager, 1)
             .expect("不同目录均可启动 watcher")
             .stop()
             .await;
@@ -377,13 +469,15 @@ data_dir = "./data"
         let data_file = dir.path().join("not-a-directory");
         std::fs::write(&data_file, b"block shard directory").expect("写入占位文件");
 
-        let initial = watcher_config(&data_file);
+        let initial = watcher_config(dir.path());
         let table = Arc::new(
             RouteTableManager::new(&initial, dir.path().join("routes.json"))
                 .expect("创建路由表管理器"),
         );
         let manager = Arc::new(ShardManager::new(1, 1));
+        let ownership = watcher_ownership(&initial, table.clone(), manager.clone());
         let mut reloaded = initial;
+        reloaded.storage.data_dir = data_file;
         reloaded.placement.nodes[0].primary.push(1);
         let config_path = dir.path().join("config.toml");
         std::fs::write(
@@ -392,12 +486,74 @@ data_dir = "./data"
         )
         .expect("写入热更新配置");
 
-        handle_config_change(&config_path, &table, &manager, 1).await;
+        handle_config_change(&config_path, &table, &ownership, &manager, 1).await;
 
-        assert!(manager.shard_ids().await.is_empty(), "失败不得注册任何新增 shard");
-        let (first, _) = table.allocate("route-pool-before").await.expect("分配首个流");
-        let (second, _) = table.allocate("route-pool-after").await.expect("分配第二个流");
+        assert!(
+            manager.shard_ids().await.is_empty(),
+            "失败不得注册任何新增 shard"
+        );
+        let (first, _) = table
+            .allocate("route-pool-before")
+            .await
+            .expect("分配首个流");
+        let (second, _) = table
+            .allocate("route-pool-after")
+            .await
+            .expect("分配第二个流");
         assert_eq!(first, 0, "旧分配池只包含 shard 0");
         assert_eq!(second, 0, "创建失败后不得分配到未就绪的 shard 1");
+    }
+
+    /// 热更新不能移除启动时选定的控制 Shard，否则归属权威会随配置漂移。
+    #[tokio::test]
+    async fn hot_config_cannot_remove_control_shard() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let initial = watcher_config(dir.path());
+        let table = Arc::new(
+            RouteTableManager::new(&initial, dir.path().join("routes.json"))
+                .expect("创建路由表管理器"),
+        );
+        let manager = Arc::new(ShardManager::new(1, 2));
+        create_shard_blocking(&initial, &manager, 1)
+            .await
+            .expect("预先注册非控制 Shard");
+        let ownership = watcher_ownership(&initial, table.clone(), manager.clone());
+
+        let mut reloaded = initial;
+        reloaded.placement.nodes[0].primary = vec![1];
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            toml::to_string(&reloaded).expect("序列化热更新配置"),
+        )
+        .expect("写入热更新配置");
+
+        handle_config_change(&config_path, &table, &ownership, &manager, 1).await;
+
+        let (shard, inserted) = table
+            .allocate("control-shard-removal-rejected")
+            .await
+            .expect("按旧分配池分配");
+        assert_eq!(shard, 0);
+        assert_eq!(inserted, true);
+    }
+
+    /// 文件 watcher 可能重复投递同一事件；重复创建必须视为成功且只注册一次。
+    #[tokio::test]
+    async fn create_shard_is_idempotent_after_registration() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let config = watcher_config(dir.path());
+        let manager = Arc::new(ShardManager::new(1, 1));
+
+        let first = create_shard_blocking(&config, &manager, 0)
+            .await
+            .expect("首次创建 Shard");
+        let repeated = create_shard_blocking(&config, &manager, 0)
+            .await
+            .expect("重复创建 Shard 应幂等成功");
+
+        assert_eq!(first, true);
+        assert_eq!(repeated, true);
+        assert_eq!(manager.shard_ids().await, vec![0]);
     }
 }

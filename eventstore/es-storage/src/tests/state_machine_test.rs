@@ -5,9 +5,17 @@ use openraft::storage::RaftStateMachine;
 use super::*;
 use crate::EsResponse;
 use es_core::{ExpectedVersion, Hlc};
+use es_core::{OwnershipCommand, OwnershipOutcome};
 
 fn hlc(wall: u64) -> Hlc {
     Hlc { wall, logical: 0 }
+}
+
+fn request_entry(index: u64, request: crate::EsRequest) -> openraft::Entry<crate::TypeConfig> {
+    openraft::Entry {
+        log_id: log_id(1, index),
+        payload: openraft::EntryPayload::Normal(request),
+    }
 }
 
 /// 构造带事件的 Append entry
@@ -161,7 +169,10 @@ async fn exact_version_match_and_mismatch() {
         )])
         .await
         .expect("apply");
-    assert!(matches!(ok[0], EsResponse::AppendOk { .. }), "Exact(1) 应通过");
+    assert!(
+        matches!(ok[0], EsResponse::AppendOk { .. }),
+        "Exact(1) 应通过"
+    );
 
     // Exact(0) 现在应冲突（当前版本已是 2）
     let bad = st
@@ -218,14 +229,152 @@ async fn same_event_id_replay_idempotent() {
 }
 
 #[tokio::test]
+async fn ownership_ensure_is_serialized_and_persisted() {
+    let (mut st, _d) = new_storage(0);
+    let eligible = std::collections::BTreeSet::from([0, 1]);
+    let responses = st
+        .apply(vec![
+            request_entry(
+                0,
+                crate::EsRequest::CommitOwnership {
+                    command: OwnershipCommand::Ensure {
+                        stream: "orders/1".into(),
+                        eligible_shards: eligible.clone(),
+                    },
+                },
+            ),
+            request_entry(
+                1,
+                crate::EsRequest::CommitOwnership {
+                    command: OwnershipCommand::Ensure {
+                        stream: "orders/1".into(),
+                        eligible_shards: eligible,
+                    },
+                },
+            ),
+        ])
+        .await
+        .expect("应用归属命令");
+
+    let first = match &responses[0] {
+        EsResponse::OwnershipApplied(applied) => applied,
+        other => panic!("应返回归属结果，实际: {other:?}"),
+    };
+    let second = match &responses[1] {
+        EsResponse::OwnershipApplied(applied) => applied,
+        other => panic!("应返回归属结果，实际: {other:?}"),
+    };
+    assert!(matches!(
+        first.outcome,
+        OwnershipOutcome::Owner { created: true, .. }
+    ));
+    assert!(matches!(
+        second.outcome,
+        OwnershipOutcome::Owner { created: false, .. }
+    ));
+    assert_eq!(first.table.streams, second.table.streams);
+    assert_eq!(second.table.version, 1, "重复 Ensure 不能推进 revision");
+
+    let raw = st
+        .get(&crate::key::sm_ownership_catalog(0))
+        .expect("读 catalog")
+        .expect("catalog 已落盘");
+    let catalog: es_core::OwnershipCatalog = crate::encode::decode(&raw).expect("解码 catalog");
+    assert_eq!(
+        catalog.owner("orders/1").map(es_core::Owner::shard_id),
+        Some(0)
+    );
+}
+
+#[tokio::test]
+async fn ownership_fence_rejects_missing_and_stale_generations() {
+    let (mut st, _d) = new_storage(0);
+    let append_owned = |index, generation, data: &'static [u8]| {
+        request_entry(
+            index,
+            crate::EsRequest::AppendOwned {
+                stream_id: "orders/1".into(),
+                ownership_generation: generation,
+                expected_version: ExpectedVersion::Any,
+                events: vec![new_event("E", data)],
+                hlc: hlc(1000 + index),
+            },
+        )
+    };
+
+    let missing = st
+        .apply(vec![append_owned(0, 1, b"missing")])
+        .await
+        .expect("应用未安装 fence 的写入");
+    assert!(matches!(
+        missing[0],
+        EsResponse::OwnershipFenced {
+            current_generation: 0
+        }
+    ));
+
+    let installed = st
+        .apply(vec![request_entry(
+            1,
+            crate::EsRequest::InstallOwnershipFence {
+                stream_id: "orders/1".into(),
+                generation: 1,
+            },
+        )])
+        .await
+        .expect("安装 generation 1");
+    assert!(matches!(
+        installed[0],
+        EsResponse::OwnershipFenceInstalled { generation: 1 }
+    ));
+    assert!(matches!(
+        st.apply(vec![append_owned(2, 1, b"accepted")])
+            .await
+            .expect("generation 1 写入")[0],
+        EsResponse::AppendOk { .. }
+    ));
+
+    st.apply(vec![request_entry(
+        3,
+        crate::EsRequest::InstallOwnershipFence {
+            stream_id: "orders/1".into(),
+            generation: 2,
+        },
+    )])
+    .await
+    .expect("升级到 generation 2");
+    let stale = st
+        .apply(vec![append_owned(4, 1, b"stale")])
+        .await
+        .expect("旧 generation 写入");
+    assert!(matches!(
+        stale[0],
+        EsResponse::OwnershipFenced {
+            current_generation: 2
+        }
+    ));
+    assert_eq!(st.read_stream_events("orders/1", 0, 0).unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn batch_appends_version_chained() {
     let (mut st, _d) = new_storage(0);
     // 同一批 entry 里两条针对同一个 stream 的 Append，
     // 后一条必须看到前一条的版本号，否则会覆盖
     let resp = st
         .apply(vec![
-            append_entry(0, "s1", ExpectedVersion::NoStream, vec![new_event("E", b"a")]),
-            append_entry(1, "s1", ExpectedVersion::Exact(0), vec![new_event("E", b"b")]),
+            append_entry(
+                0,
+                "s1",
+                ExpectedVersion::NoStream,
+                vec![new_event("E", b"a")],
+            ),
+            append_entry(
+                1,
+                "s1",
+                ExpectedVersion::Exact(0),
+                vec![new_event("E", b"b")],
+            ),
         ])
         .await
         .expect("apply");
@@ -259,7 +408,11 @@ async fn hlc_persisted_with_event() {
 
     let evs = st.read_stream_events("s1", 0, 0).expect("读流");
     // append_entry 把 hlc 设为 1000+index
-    assert_eq!(evs[0].hlc, hlc(1007), "HLC 必须原样落盘，不能各节点各取本地时钟");
+    assert_eq!(
+        evs[0].hlc,
+        hlc(1007),
+        "HLC 必须原样落盘，不能各节点各取本地时钟"
+    );
 }
 
 #[tokio::test]
@@ -275,7 +428,10 @@ async fn applied_state_advances_and_recovers() {
         let mut st = crate::EsStorage::new(
             0,
             std::sync::Arc::new(tree),
-            crate::snapshot::SnapshotConfig { dir: dir.path().join("snapshots"), ..Default::default() },
+            crate::snapshot::SnapshotConfig {
+                dir: dir.path().join("snapshots"),
+                ..Default::default()
+            },
         )
         .expect("建存储");
         st.apply(vec![append_entry(
@@ -298,11 +454,14 @@ async fn applied_state_advances_and_recovers() {
         .build()
         .expect("重开 tree");
     let mut st = crate::EsStorage::new(
-            0,
-            std::sync::Arc::new(tree),
-            crate::snapshot::SnapshotConfig { dir: dir.path().join("snapshots"), ..Default::default() },
-        )
-        .expect("建存储");
+        0,
+        std::sync::Arc::new(tree),
+        crate::snapshot::SnapshotConfig {
+            dir: dir.path().join("snapshots"),
+            ..Default::default()
+        },
+    )
+    .expect("建存储");
     st.restore_applied_state().await.expect("恢复已应用状态");
 
     let (la, _) = st.applied_state().await.expect("读已应用状态");
@@ -343,8 +502,14 @@ async fn shard_sm_isolated() {
         "分片 1 上该流应视为不存在"
     );
 
-    assert_eq!(s0.read_stream_events("same", 0, 0).unwrap()[0].data, b"from0");
-    assert_eq!(s1.read_stream_events("same", 0, 0).unwrap()[0].data, b"from1");
+    assert_eq!(
+        s0.read_stream_events("same", 0, 0).unwrap()[0].data,
+        b"from0"
+    );
+    assert_eq!(
+        s1.read_stream_events("same", 0, 0).unwrap()[0].data,
+        b"from1"
+    );
 }
 
 #[tokio::test]
@@ -510,7 +675,8 @@ async fn read_all_position_ordered() {
     }
 
     // 来自不同流
-    let streams: std::collections::HashSet<_> = events.iter().map(|e| e.stream_id.as_str()).collect();
+    let streams: std::collections::HashSet<_> =
+        events.iter().map(|e| e.stream_id.as_str()).collect();
     assert_eq!(streams.len(), 3, "应来自 3 个流");
 }
 
@@ -601,8 +767,8 @@ async fn conflict_apply_no_broadcast() {
 /// 三种压缩算法下 build→get_current→install 全链路往返一致
 #[tokio::test]
 async fn snapshot_roundtrip_all_compressions() {
-    use openraft::RaftSnapshotBuilder;
     use crate::snapshot::Compression;
+    use openraft::RaftSnapshotBuilder;
 
     for c in [Compression::Zstd, Compression::Lz4, Compression::None] {
         let dir = tempfile::tempdir().expect("临时目录");
@@ -750,7 +916,9 @@ async fn snapshot_install_respects_retention() {
             "接收文件应写入完整快照内容"
         );
     }
-    dst.install_snapshot(&snap.meta, recv).await.expect("装快照");
+    dst.install_snapshot(&snap.meta, recv)
+        .await
+        .expect("装快照");
 
     let files: Vec<_> = dst.snapshot_store().list_entries().unwrap();
     assert_eq!(files.len(), 2, "install 后仍应只保留 keep 个");
@@ -761,7 +929,9 @@ async fn snapshot_install_respects_retention() {
     }
     // 转正成功：接收的快照文件进入 dst 快照目录
     assert!(
-        files.iter().any(|f| f.meta.as_ref().unwrap().last_log_id.unwrap().index == 2),
+        files
+            .iter()
+            .any(|f| f.meta.as_ref().unwrap().last_log_id.unwrap().index == 2),
         "接收的快照应转正为正式文件"
     );
 }
@@ -790,8 +960,8 @@ async fn snapshot_startup_cleanup_legacy() {
 /// 损坏的最新快照被跳过：get_current_snapshot 返回仍有效的快照
 #[tokio::test]
 async fn snapshot_corrupted_latest_skipped() {
-    use openraft::RaftSnapshotBuilder;
     use crate::snapshot::Compression;
+    use openraft::RaftSnapshotBuilder;
 
     let dir = tempfile::tempdir().expect("临时目录");
     let (mut src, _) = new_storage_cfg(
@@ -857,9 +1027,9 @@ async fn snapshot_empty_build_install() {
 /// 离线 restore：恢复到快照点，清空日志与后续数据
 #[tokio::test]
 async fn snapshot_restore_to_point_in_time() {
-    use openraft::RaftSnapshotBuilder;
-    use openraft::storage::RaftLogStorage;
     use crate::snapshot::restore;
+    use openraft::storage::RaftLogStorage;
+    use openraft::RaftSnapshotBuilder;
 
     // 源：apply 5 条（index 0..4）后建快照，再 apply 3 条（恢复点之后的数据）
     let (mut src, _d1) = new_storage(0);
@@ -913,7 +1083,9 @@ async fn snapshot_restore_to_point_in_time() {
         )])
         .await
         .expect("apply");
-        dst.set(&crate::key::raft_vote(0), b"{\"term\":9}").await.unwrap();
+        dst.set(&crate::key::raft_vote(0), b"{\"term\":9}")
+            .await
+            .unwrap();
         dst.close().await.expect("关闭");
     }
 
@@ -974,8 +1146,8 @@ async fn snapshot_restore_to_point_in_time() {
 /// restore 分片不匹配必须拒绝
 #[tokio::test]
 async fn snapshot_restore_shard_mismatch_rejected() {
-    use openraft::RaftSnapshotBuilder;
     use crate::snapshot::restore;
+    use openraft::RaftSnapshotBuilder;
 
     let (mut src, _d1) = new_storage(0);
     src.apply(vec![append_entry(
@@ -995,9 +1167,14 @@ async fn snapshot_restore_shard_mismatch_rejected() {
             .build()
             .expect("打开 tree"),
     );
-    let err = restore(tree.clone(), 1, snap.snapshot.path(), &dir.path().join("snapshots"))
-        .await
-        .expect_err("分片不匹配应报错");
+    let err = restore(
+        tree.clone(),
+        1,
+        snap.snapshot.path(),
+        &dir.path().join("snapshots"),
+    )
+    .await
+    .expect_err("分片不匹配应报错");
     assert!(
         err.to_string().contains("分片"),
         "错误应说明分片不匹配: {err}"
@@ -1007,8 +1184,8 @@ async fn snapshot_restore_shard_mismatch_rejected() {
 /// restore 后快照目录只剩恢复的快照（旧文件被清除）
 #[tokio::test]
 async fn snapshot_restore_replaces_snapshot_dir() {
-    use openraft::RaftSnapshotBuilder;
     use crate::snapshot::restore;
+    use openraft::RaftSnapshotBuilder;
 
     let (mut src, _d1) = new_storage(0);
     for i in 0..3u64 {
@@ -1100,7 +1277,10 @@ async fn delete_removes_all_stream_data() {
         .await
         .expect("重建");
     match &resp[0] {
-        EsResponse::AppendOk { next_expected_version, .. } => {
+        EsResponse::AppendOk {
+            next_expected_version,
+            ..
+        } => {
             assert_eq!(*next_expected_version, 0, "重建后版本重新从 0 起");
         }
         other => panic!("应成功，实际: {other:?}"),
@@ -1117,7 +1297,11 @@ async fn delete_nonexistent_is_noop() {
         .apply(vec![delete_entry(0, "ghost")])
         .await
         .expect("delete 不存在流");
-    assert!(matches!(resp[0], EsResponse::DeleteOk), "应返回 DeleteOk: {:?}", resp[0]);
+    assert!(
+        matches!(resp[0], EsResponse::DeleteOk),
+        "应返回 DeleteOk: {:?}",
+        resp[0]
+    );
     // 无副作用：$all 仍空、next_position 不推进
     assert!(st.read_all_events(0, 0).expect("读 all").is_empty());
 }
@@ -1126,13 +1310,23 @@ async fn delete_nonexistent_is_noop() {
 async fn delete_then_append_same_batch_recreates() {
     let (mut st, _d) = new_storage(0);
     // 同批：先删后写 → 流应存在（后操作覆盖）
-    st.apply(vec![append_entry(0, "s1", ExpectedVersion::NoStream, vec![new_event("E", b"a")])])
-        .await
-        .expect("写");
+    st.apply(vec![append_entry(
+        0,
+        "s1",
+        ExpectedVersion::NoStream,
+        vec![new_event("E", b"a")],
+    )])
+    .await
+    .expect("写");
     let resp = st
         .apply(vec![
             delete_entry(1, "s1"),
-            append_entry(2, "s1", ExpectedVersion::NoStream, vec![new_event("E", b"b")]),
+            append_entry(
+                2,
+                "s1",
+                ExpectedVersion::NoStream,
+                vec![new_event("E", b"b")],
+            ),
         ])
         .await
         .expect("同批先删后写");
@@ -1149,7 +1343,12 @@ async fn append_then_delete_same_batch_removes() {
     // 同批：先写后删 → 流不存在（后操作覆盖）
     let resp = st
         .apply(vec![
-            append_entry(0, "s1", ExpectedVersion::NoStream, vec![new_event("E", b"a")]),
+            append_entry(
+                0,
+                "s1",
+                ExpectedVersion::NoStream,
+                vec![new_event("E", b"a")],
+            ),
             delete_entry(1, "s1"),
         ])
         .await
