@@ -1,0 +1,10 @@
+# 使用全部公共端点，让客户端自动尝试实际承载目标 shard 的节点。
+endpoints = [
+  "http://eventfs-node1:50051",
+  "http://eventfs-node2:50051",
+  "http://eventfs-node3:50051",
+]
+
+max_event_bytes = 1048576
+max_state_bytes = 1048576
+insecure_skip_tls_verify = false

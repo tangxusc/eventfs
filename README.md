@@ -111,7 +111,9 @@ Cargo 版本为准。完整构建与故障恢复约定见
 ### Docker 三节点集群
 
 本地 Compose 使用 GitHub Actions 已验证的 Linux release 产物构建 Debian runtime
-镜像，启动三个 `eventstored` 和一个常驻 `esctl` 客户端。下载脚本按当前 Git `HEAD`
+镜像，启动三个 `eventstored` 和一个挂载 EventFS 的 FUSE 客户端；server 使用 Debian
+12，client 使用满足 Action 二进制 `GLIBC_2.39` 要求的 Debian 13，并同时包含 `esctl`。
+下载脚本按当前 Git `HEAD`
 查找成功的 `Release` 手动运行，并自动选择与 Docker 宿主一致的 Linux 架构：
 
 ```bash
@@ -143,10 +145,16 @@ docker compose exec client esctl \
 docker compose exec client esctl \
   --endpoints http://eventfs-node1:50051,http://eventfs-node2:50051,http://eventfs-node3:50051 \
   read docker/smoke --from-version 0 --max-count 10
+
+# FUSE 挂载只存在于 client 的 Linux mount namespace 中。
+docker compose exec client mountpoint /mnt/eventfs
+docker compose exec client ls -la /mnt/eventfs
 ```
 
 宿主公共端点是 `http://127.0.0.1:50051`、`:50052`、`:50053`；内部 `51051`
-不映射。节点数据不使用持久化 volume，执行 `docker compose down` 会随容器删除。
+不映射。FUSE client 仅映射 `/dev/fuse`、保留 `SYS_ADMIN` capability 并丢弃其他
+capabilities，不使用 `privileged`。挂载点不会映射到 macOS；节点数据和挂载点均不使用
+持久化 volume，执行 `docker compose down` 会随容器删除。
 完整设计与失败恢复方式见
 [Docker 三节点集群设计自检](docs/docker-cluster-self-check.md)。
 

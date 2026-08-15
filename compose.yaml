@@ -21,6 +21,7 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
+      target: server
       args:
         EVENTFS_ARCHIVE: ${EVENTFS_ARCHIVE:-.docker-artifacts/eventfs-linux-native.tar.gz}
     ports:
@@ -45,9 +46,32 @@ services:
       - ./docker/node3.toml:/etc/eventfs/config.toml:ro
 
   client:
-    image: eventfs-local:actions
+    image: eventfs-client-local:actions
     pull_policy: never
-    command: ["sleep", "infinity"]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: client
+      args:
+        EVENTFS_ARCHIVE: ${EVENTFS_ARCHIVE:-.docker-artifacts/eventfs-linux-native.tar.gz}
+    command: ["eventfs-fuse", "mount", "--config", "/etc/eventfs/fuse.toml", "/mnt/eventfs"]
+    cap_drop:
+      - ALL
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/fuse:/dev/fuse
+    security_opt:
+      - apparmor=unconfined
+    volumes:
+      - ./docker/fuse.toml:/etc/eventfs/fuse.toml:ro
+    healthcheck:
+      test: ["CMD", "mountpoint", "-q", "/mnt/eventfs"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    stop_grace_period: 10s
     restart: unless-stopped
     depends_on:
       eventfs-node1:

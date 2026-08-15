@@ -438,6 +438,44 @@ impl<B: EventFsBackend> Inner<B> {
         ))
     }
 
+    fn has_pending_state_write(&self, node: &Node) -> bool {
+        let Node::State {
+            business_space,
+            aggregate_type,
+            aggregate_id,
+        } = node
+        else {
+            return false;
+        };
+        let Ok(expected_event_set) = EventSet::new(business_space, aggregate_type) else {
+            return false;
+        };
+        self.handles
+            .lock()
+            .expect("handle table poisoned")
+            .values()
+            .any(|handle| {
+                matches!(
+                    handle.as_ref(),
+                    OpenHandle::StateWrite {
+                        event_set,
+                        aggregate_id: open_aggregate_id,
+                        revision: None,
+                        ..
+                    } if event_set == &expected_event_set && open_aggregate_id == aggregate_id
+                )
+            })
+    }
+
+    async fn state_attributes_for_getattr(&self, node: &Node) -> Result<(u64, SystemTime), Errno> {
+        match self.state_attributes(node).await {
+            // CREATE 后内核会在首个 WRITE 前 GETATTR；此时状态尚未提交，
+            // 但活动写句柄已证明该 inode 是一次合法的首次创建。
+            Err(Errno::ENOENT) if self.has_pending_state_write(node) => Ok((0, UNIX_EPOCH)),
+            result => result,
+        }
+    }
+
     fn insert_handle(&self, handle: OpenHandle) -> FileHandle {
         let id = self.next_handle.fetch_add(1, Ordering::Relaxed);
         self.handles
@@ -1067,7 +1105,7 @@ impl<B: EventFsBackend> Filesystem for EventFs<B> {
         if matches!(&node, Node::State { .. }) {
             let inner = self.inner.clone();
             self.inner.runtime.spawn(async move {
-                match inner.state_attributes(&node).await {
+                match inner.state_attributes_for_getattr(&node).await {
                     Ok((size, mtime)) => {
                         inner.ensure_node(node.clone(), size);
                         reply.attr(&TTL, &inner.attr(ino, &node, size, mtime));
@@ -2448,6 +2486,30 @@ mod tests {
         assert_eq!(
             filesystem.inner.state_attributes(&node).await.unwrap(),
             (5, UNIX_EPOCH + Duration::from_millis(2_000))
+        );
+    }
+
+    #[tokio::test]
+    async fn new_state_getattr_survives_until_first_write() {
+        let (filesystem, _backend) = mock_filesystem();
+        let node = Node::parse("/orders/order/states/order-new.json").unwrap();
+        assert_eq!(
+            filesystem.inner.state_attributes_for_getattr(&node).await,
+            Err(Errno::ENOENT)
+        );
+
+        let (_handle_id, _) = filesystem
+            .inner
+            .open_handle(node.clone(), OpenFlags(libc::O_WRONLY))
+            .await
+            .unwrap();
+        assert_eq!(
+            filesystem
+                .inner
+                .state_attributes_for_getattr(&node)
+                .await
+                .unwrap(),
+            (0, UNIX_EPOCH)
         );
     }
 
