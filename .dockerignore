@@ -1,0 +1,5 @@
+**
+!.docker-artifacts/
+!.docker-artifacts/*.tar.gz
+!docker/
+!docker/Dockerfile

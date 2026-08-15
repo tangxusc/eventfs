@@ -1,0 +1,41 @@
+[node]
+id = 3
+listen_addr = "0.0.0.0:50051"
+internal_listen_addr = "0.0.0.0:51051"
+
+[[node.peers]]
+id = 1
+addr = "http://eventfs-node1:50051"
+internal_addr = "http://eventfs-node1:51051"
+
+[[node.peers]]
+id = 2
+addr = "http://eventfs-node2:50051"
+internal_addr = "http://eventfs-node2:51051"
+
+[[node.peers]]
+id = 3
+addr = "http://eventfs-node3:50051"
+internal_addr = "http://eventfs-node3:51051"
+
+[storage]
+data_dir = "/var/lib/eventfs"
+memtable_arena_bytes = 4194304
+
+[placement]
+replication_factor = 2
+
+[[placement.nodes]]
+id = 1
+primary = [0, 1]
+replica = [2, 3]
+
+[[placement.nodes]]
+id = 2
+primary = [2, 3]
+replica = [4, 5]
+
+[[placement.nodes]]
+id = 3
+primary = [4, 5]
+replica = [0, 1]

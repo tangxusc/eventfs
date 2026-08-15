@@ -11,6 +11,7 @@ EventFS v2 —— 基于 Rust + openraft 的分布式事件存储。本目录收
 | [eventfs-fuse.md](eventfs-fuse.md) | AggregateStore 与 eventfs-fuse 设计：事件集分区、文件契约、状态 CAS、消费者组、故障语义与验收 |
 | [eventfs-fuse-self-check.md](eventfs-fuse-self-check.md) | eventfs-fuse 设计自检：需求覆盖、不变量、替代方案、风险与实施门槛 |
 | [release-action-self-check.md](release-action-self-check.md) | 四平台 Release Action：构建矩阵、资产契约、权限与故障恢复自检 |
+| [docker-cluster-self-check.md](docker-cluster-self-check.md) | 本地 Docker 三节点集群：Release 产物、网络、临时数据与恢复边界自检 |
 
 ## 专题文档
 

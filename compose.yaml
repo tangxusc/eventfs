@@ -1,0 +1,64 @@
+name: eventfs-local
+
+x-eventfs-node: &eventfs-node
+  image: eventfs-local:actions
+  pull_policy: never
+  restart: unless-stopped
+  networks:
+    - eventfs
+  stop_grace_period: 30s
+  healthcheck:
+    test: ["CMD", "esctl", "--endpoints", "http://127.0.0.1:50051", "status"]
+    interval: 5s
+    timeout: 5s
+    retries: 24
+    start_period: 10s
+
+services:
+  eventfs-node1:
+    <<: *eventfs-node
+    hostname: eventfs-node1
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        EVENTFS_ARCHIVE: ${EVENTFS_ARCHIVE:-.docker-artifacts/eventfs-linux-native.tar.gz}
+    ports:
+      - "50051:50051"
+    volumes:
+      - ./docker/node1.toml:/etc/eventfs/config.toml:ro
+
+  eventfs-node2:
+    <<: *eventfs-node
+    hostname: eventfs-node2
+    ports:
+      - "50052:50051"
+    volumes:
+      - ./docker/node2.toml:/etc/eventfs/config.toml:ro
+
+  eventfs-node3:
+    <<: *eventfs-node
+    hostname: eventfs-node3
+    ports:
+      - "50053:50051"
+    volumes:
+      - ./docker/node3.toml:/etc/eventfs/config.toml:ro
+
+  client:
+    image: eventfs-local:actions
+    pull_policy: never
+    command: ["sleep", "infinity"]
+    restart: unless-stopped
+    depends_on:
+      eventfs-node1:
+        condition: service_healthy
+      eventfs-node2:
+        condition: service_healthy
+      eventfs-node3:
+        condition: service_healthy
+    networks:
+      - eventfs
+
+networks:
+  eventfs:
+    internal: false

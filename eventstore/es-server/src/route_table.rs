@@ -277,19 +277,22 @@ impl RouteTableManager {
         Ok(table)
     }
 
-    /// 安装控制 Shard 已提交的权威投影并向 peers 传播。
+    /// 安装控制 Shard 已提交的权威投影，并在内容变化时向 peers 传播。
     ///
-    /// 同 revision 内容不同表示本地仍持有旧实现产生的分歧；权威投影覆盖它。
-    pub async fn publish_authoritative(&self, table: RouteTable) -> Result<(), String> {
+    /// `table` 是控制 Shard 已提交的完整路由表。返回 `true` 表示本地投影发生变化且已
+    /// 发起广播，返回 `false` 表示与当前投影相同；持久化失败时返回错误。相同投影不得
+    /// 再次广播，否则 peer 刷新控制 Shard 后会形成广播反馈环。
+    pub async fn publish_authoritative(&self, table: RouteTable) -> Result<bool, String> {
         let _guard = self.update_mutex.lock().await;
         let current = self.mem.read().await.clone();
-        if table != current {
-            self.persist(&table)?;
-            *self.mem.write().await = table.clone();
+        if table == current {
+            return Ok(false);
         }
+        self.persist(&table)?;
+        *self.mem.write().await = table.clone();
         drop(_guard);
         self.broadcast(&table).await;
-        Ok(())
+        Ok(true)
     }
 
     /// 仅在本节点安装控制 Shard 返回的权威投影，不再次广播。
@@ -527,6 +530,27 @@ mod tests {
             .await
             .expect("权威投影必须覆盖兼容版本");
         assert_eq!(mgr.snapshot().await, authoritative);
+    }
+
+    #[tokio::test]
+    async fn publish_authoritative_skips_unchanged_table() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let mgr = RouteTableManager::new(&test_config(dir.path()), routes_path(dir.path()))
+            .expect("创建");
+        let mut authoritative = RouteTable::new();
+        authoritative.insert("orders/1", 0);
+
+        let first = mgr
+            .publish_authoritative(authoritative.clone())
+            .await
+            .expect("首次发布");
+        assert!(first, "新权威投影必须发布");
+
+        let duplicate = mgr
+            .publish_authoritative(authoritative)
+            .await
+            .expect("重复发布");
+        assert!(!duplicate, "相同权威投影不得再次广播形成反馈环");
     }
 
     #[tokio::test]

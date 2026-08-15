@@ -108,6 +108,48 @@ macOS 可使用 `shasum -a 256` 单独核对 `SHA256SUMS` 中记录的摘要。t
 Cargo 版本为准。完整构建与故障恢复约定见
 [发布 Action 设计自检](docs/release-action-self-check.md)。
 
+### Docker 三节点集群
+
+本地 Compose 使用 GitHub Actions 已验证的 Linux release 产物构建 Debian runtime
+镜像，启动三个 `eventstored` 和一个常驻 `esctl` 客户端。下载脚本按当前 Git `HEAD`
+查找成功的 `Release` 手动运行，并自动选择与 Docker 宿主一致的 Linux 架构：
+
+```bash
+./scripts/download-release-artifact.sh
+docker compose up --build -d
+docker compose ps
+```
+
+下载需要代理时显式传入宿主代理；当前默认不启用代理：
+
+```bash
+EVENTFS_PROXY=http://127.0.0.1:7897 ./scripts/download-release-artifact.sh
+```
+
+下载其他提交的产物时，必须同时指定对应的 `EVENTFS_RUN_ID` 与 `EVENTFS_VERSION`，避免
+把运行 ID 和压缩包版本混用。脚本校验统一 artifact 中的 `SHA256SUMS` 后，生成供
+Docker 构建使用的 `.docker-artifacts/eventfs-linux-native.tar.gz`。
+
+客户端通过容器 DNS 访问所有节点。以下命令检查状态并完成一次写读闭环：
+
+```bash
+docker compose exec client esctl \
+  --endpoints http://eventfs-node1:50051,http://eventfs-node2:50051,http://eventfs-node3:50051 \
+  status
+docker compose exec client esctl \
+  --endpoints http://eventfs-node1:50051,http://eventfs-node2:50051,http://eventfs-node3:50051 \
+  append docker/smoke --event-type DockerSmoke --data '{"source":"compose"}' \
+  --expected-version nostream
+docker compose exec client esctl \
+  --endpoints http://eventfs-node1:50051,http://eventfs-node2:50051,http://eventfs-node3:50051 \
+  read docker/smoke --from-version 0 --max-count 10
+```
+
+宿主公共端点是 `http://127.0.0.1:50051`、`:50052`、`:50053`；内部 `51051`
+不映射。节点数据不使用持久化 volume，执行 `docker compose down` 会随容器删除。
+完整设计与失败恢复方式见
+[Docker 三节点集群设计自检](docs/docker-cluster-self-check.md)。
+
 ### 启动节点
 
 每个节点需要**独立的数据目录**。用配置文件（TOML 或 JSON，按扩展名判断），
@@ -330,7 +372,7 @@ esctl snapshot restore ./data/node1 ./data/node1/snapshots/snap-0-1-100.esnap --
 ## 测试
 
 ```bash
-# 默认套件：646 项通过（另有 17 项环境型用例按设计忽略）
+# 默认套件：647 项通过（另有 17 项环境型用例按设计忽略）
 cargo test --workspace
 
 # 真实多进程测试：es-server 14 项
@@ -349,7 +391,7 @@ cargo test -p eventfs-fuse --test mount_e2e_test -- --ignored --test-threads=1
 | `es-proto` | 10 | gRPC 代码生成验证、TLS 信任策略、端点归一化 |
 | `es-storage` | 114 | Key 编码排序性质、日志语义、AggregateStore 事务与 fencing、快照往返、模糊测试 |
 | `es-raft` | 34 | ShardManager 注册与寻址、RaftAdmin 参数校验、网络分区、慢节点、消息大小限制（进程内可控网络层） |
-| `es-server` | 170 | 服务器启动、AggregateStore、归属 interface、bootstrap、watcher、端到端读写/订阅/跨分片读取 |
+| `es-server` | 171 | 服务器启动、AggregateStore、归属 interface、bootstrap、watcher、端到端读写/订阅/跨分片读取 |
 | `es-client` | 53 | SDK 单测、stub 集成与进程内 e2e（AggregateStore、重定向、翻页、订阅与持久消费） |
 | `es-ctl` | 142 | 参数解析、AggregateStore 管理、故障转移、快照及进程内全链路 e2e |
 | `eventfs-fuse` | 36 | 路径/JSON 模糊测试、句柄状态机、errno、Backend 契约、Linux fuser Adapter 与 gRPC e2e |
@@ -368,7 +410,7 @@ cargo test -p es-ctl --test multi_node_test -- --ignored --test-threads=1
 cargo +nightly llvm-cov --workspace --branch --summary-only
 ```
 
-2026-08-15 完整 Linux workspace 验收：默认测试 646 项通过、17 项忽略。最近一次
+2026-08-15 完整 workspace 验收：默认测试 647 项通过、17 项忽略。最近一次
 可采信覆盖率基线为行 `89.90%`、分支 `80.08%`、函数 `83.03%`、区域
 `87.36%`，行和分支均达到 80% 门槛。本轮 Linux 插桩测试全部通过，但 profile
 由 Rust 1.88 生成，宿主 LLVM 23 无法合并 raw format 10，因此没有用不兼容工具
