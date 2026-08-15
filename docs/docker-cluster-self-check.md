@@ -52,7 +52,12 @@ Compose 网络中的容器访问。
 
 修复后该方法返回本次是否实际发布：相同表直接返回 `false`，只有内容变化才持久化并
 广播。单元回归测试覆盖首次发布为 `true`、重复表为 `false`；最终容器 e2e 还必须检查
-三个节点的 `routes.json` 一致，并分别通过单一端点读回同一事件。
+三个节点的 `routes.json` 一致，并从目标 shard 的两个副本读回同一事件。
+
+数据面读取只会依次尝试 `--endpoints` 显式提供的地址，不会由非承载节点代理请求。
+本配置的复制因子为 2，因此同一 shard 只存在于两个节点；仅提供第三个非承载端点时，
+返回 `shard ... not on this node, retry other nodes` 是预期行为。客户端应像 README 示例
+一样配置三个端点，以便自动尝试实际承载该 shard 的节点。
 
 ## 验证与失败恢复
 
@@ -71,4 +76,5 @@ Raft shard 可查询；最终以三端点 `status`、`member list` 和数据闭�
   workflow，或同时指定其他运行的 `EVENTFS_RUN_ID` 与 `EVENTFS_VERSION`。
 - 下载脚本仅支持 ARM64 与 x86_64 Docker 宿主，并选择对应的 GNU/Linux 原生包。
 - 这是临时本地开发集群，没有 TLS、跨主机网络、备份、监控和资源配额。
-- 本轮不改 Rust 代码，因此不新增单元覆盖率；运行中的三容器闭环作为环境型 e2e。
+- 路由广播修复由 `publish_authoritative_skips_unchanged_table` 单元测试覆盖；运行中的
+  三容器闭环作为环境型 e2e，不纳入默认覆盖率统计。
