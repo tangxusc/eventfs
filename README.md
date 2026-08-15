@@ -87,6 +87,27 @@ memtable arena 默认 4MiB（`[storage] memtable_arena_bytes`）——surrealkv 
 cargo build --bin eventstored
 ```
 
+### Release 产物
+
+推送 `v*` tag 后，GitHub Actions 会在 Linux 与 macOS 的 x86_64、ARM64 原生
+runner 上运行 workspace 默认测试，并编译 release 产物。也可以从 Actions 页面手动
+运行 `Release` workflow；手动运行只生成保留 30 天的 Actions artifact，不创建
+GitHub Release。
+
+每个平台对应一个 `eventfs-<版本>-<target>.tar.gz`：四个平台都包含
+`eventstored`、`esctl`、本 README 和 `config.example.toml`；两个 Linux 包额外包含
+`eventfs-fuse` 与 `eventfs-fuse.example.toml`。发布页同时提供 `SHA256SUMS`，下载后可
+在其所在目录校验：
+
+```bash
+sha256sum --check SHA256SUMS
+```
+
+macOS 可使用 `shasum -a 256` 单独核对 `SHA256SUMS` 中记录的摘要。tag 仅用于 Release
+和压缩包命名，不强制与 Cargo workspace 版本一致；程序 `--version` 输出以编译时的
+Cargo 版本为准。完整构建与故障恢复约定见
+[发布 Action 设计自检](docs/release-action-self-check.md)。
+
 ### 启动节点
 
 每个节点需要**独立的数据目录**。用配置文件（TOML 或 JSON，按扩展名判断），

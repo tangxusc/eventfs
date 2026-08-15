@@ -1,0 +1,223 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            artifact: release-linux-x86_64
+            binaries: eventstored esctl eventfs-fuse
+            build_args: --bin eventstored --bin esctl --bin eventfs-fuse
+            file_pattern: "ELF 64-bit.*x86-64"
+            include_fuse_config: true
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: release-linux-aarch64
+            binaries: eventstored esctl eventfs-fuse
+            build_args: --bin eventstored --bin esctl --bin eventfs-fuse
+            file_pattern: "ELF 64-bit.*ARM aarch64"
+            include_fuse_config: true
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            artifact: release-macos-x86_64
+            binaries: eventstored esctl
+            build_args: --bin eventstored --bin esctl
+            file_pattern: "Mach-O 64-bit executable x86_64"
+            include_fuse_config: false
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            artifact: release-macos-aarch64
+            binaries: eventstored esctl
+            build_args: --bin eventstored --bin esctl
+            file_pattern: "Mach-O 64-bit executable arm64"
+            include_fuse_config: false
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "35.1"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+          targets: ${{ matrix.target }}
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Verify native target
+        shell: bash
+        run: |
+          rustc -vV | grep -F "host: ${{ matrix.target }}"
+
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
+
+      - name: Build release binaries
+        shell: bash
+        run: >-
+          cargo build --release --locked --target "${{ matrix.target }}"
+          ${{ matrix.build_args }}
+
+      - name: Resolve package version
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="$GITHUB_REF_NAME"
+          else
+            version="sha-${GITHUB_SHA:0:7}"
+          fi
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test binaries and architecture
+        shell: bash
+        run: |
+          release_dir="target/${{ matrix.target }}/release"
+          for binary in ${{ matrix.binaries }}; do
+            "$release_dir/$binary" --help >/dev/null
+            file_output="$(file "$release_dir/$binary")"
+            echo "$file_output"
+            grep -E '${{ matrix.file_pattern }}' <<<"$file_output"
+          done
+
+      - name: Package release archive
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+          TARGET: ${{ matrix.target }}
+          INCLUDE_FUSE_CONFIG: ${{ matrix.include_fuse_config }}
+        run: |
+          package="eventfs-${VERSION}-${TARGET}"
+          package_dir="dist/${package}"
+          release_dir="target/${TARGET}/release"
+          mkdir -p "$package_dir"
+          for binary in ${{ matrix.binaries }}; do
+            install -m 755 "$release_dir/$binary" "$package_dir/$binary"
+          done
+          install -m 644 README.md config.example.toml "$package_dir/"
+          if [[ "$INCLUDE_FUSE_CONFIG" == "true" ]]; then
+            install -m 644 eventfs-fuse.example.toml "$package_dir/"
+          fi
+          COPYFILE_DISABLE=1 tar -C dist -czf "dist/${package}.tar.gz" "$package"
+
+      - name: Upload platform archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  assets:
+    name: Assemble release assets
+    needs: build
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+      artifact: ${{ steps.artifact.outputs.name }}
+    steps:
+      - name: Resolve package version
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="$GITHUB_REF_NAME"
+          else
+            version="sha-${GITHUB_SHA:0:7}"
+          fi
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve artifact name
+        id: artifact
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          echo "name=eventfs-release-assets-${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Download platform archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate and verify checksums
+        shell: bash
+        working-directory: dist
+        run: |
+          find . -maxdepth 1 -type f -name '*.tar.gz' -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq 4
+          sha256sum --check SHA256SUMS
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish GitHub Release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: assets
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.assets.outputs.artifact }}
+          path: dist
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          prerelease_args=()
+          if [[ "$TAG" == *-* ]]; then
+            prerelease_args+=(--prerelease)
+          fi
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag --generate-notes "${prerelease_args[@]}"
+          fi
+          gh release upload "$TAG" dist/*.tar.gz dist/SHA256SUMS --clobber
