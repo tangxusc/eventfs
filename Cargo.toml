@@ -8,9 +8,8 @@ members = [
     "eventstore/es-server",
     "eventstore/es-client",
     "eventstore/es-ctl",
+    "eventfs-fuse",
 ]
-# 注：eventfs-fuse 目录已预留（FUSE daemon，把聚合根与事件映射为文件），
-# 尚未设计与实现，故暂不列为 workspace 成员，避免空目录导致 workspace 解析失败。
 
 [workspace.package]
 version = "0.1.0"

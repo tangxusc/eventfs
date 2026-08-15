@@ -59,10 +59,7 @@ impl ShardScope {
 /// 1. `--shards` 显式 → 0..N（不触网）。
 /// 2. 否则逐端点 ListShards，全部响应的并集为集群分片集。
 /// 3. 一个端点都没成功（或并集为空）→ 回退默认 0..8（调用方负责告警）。
-pub async fn detect_shard_scope(
-    cluster: &ClusterClient,
-    flag: Option<u64>,
-) -> Result<ShardScope> {
+pub async fn detect_shard_scope(cluster: &ClusterClient, flag: Option<u64>) -> Result<ShardScope> {
     if let Some(n) = flag {
         return Ok(ShardScope {
             ids: (0..n).collect(),

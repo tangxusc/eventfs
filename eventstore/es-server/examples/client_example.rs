@@ -6,7 +6,7 @@
 //! - `EVT_CA`：CA 文件路径（可选）。设置后严格校验对端证书；未设置时
 //!   https 地址默认跳过校验（自签友好）
 
-use es_client::{EventStoreClient, ExpectedVersionBuilder, EventBuilder};
+use es_client::{EventBuilder, EventStoreClient, ExpectedVersionBuilder};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -16,11 +16,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 连接到 EventStore 集群
     let addr = std::env::var("EVT_ADDR").unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
     let mut client = match std::env::var("EVT_CA") {
-        Ok(ca) => EventStoreClient::connect_with_tls(
-            vec![addr.clone()],
-            Some(es_client::TlsClientConfig::Ca(std::fs::read(&ca)?)),
-        )
-        .await?,
+        Ok(ca) => {
+            EventStoreClient::connect_with_tls(
+                vec![addr.clone()],
+                Some(es_client::TlsClientConfig::Ca(std::fs::read(&ca)?)),
+            )
+            .await?
+        }
         Err(_) => EventStoreClient::connect(vec![addr.clone()]).await?,
     };
 

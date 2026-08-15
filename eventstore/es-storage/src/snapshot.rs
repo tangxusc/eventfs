@@ -84,9 +84,7 @@ impl Compression {
     pub fn reader(self, f: File) -> io::Result<SnapshotReader> {
         match self {
             Compression::None => Ok(SnapshotReader::None(f)),
-            Compression::Zstd => Ok(SnapshotReader::Zstd(zstd::stream::read::Decoder::new(
-                f,
-            )?)),
+            Compression::Zstd => Ok(SnapshotReader::Zstd(zstd::stream::read::Decoder::new(f)?)),
             Compression::Lz4 => Ok(SnapshotReader::Lz4(lz4_flex::frame::FrameDecoder::new(f))),
         }
     }
@@ -207,11 +205,15 @@ pub fn write_header<W: Write>(
 }
 
 /// 从读取流读文件头 + meta。magic/version/长度不符即报错
-pub fn read_header<R: Read>(r: &mut R) -> io::Result<(SnapshotHeader, SnapshotMeta<u64, openraft::BasicNode>)> {
+pub fn read_header<R: Read>(
+    r: &mut R,
+) -> io::Result<(SnapshotHeader, SnapshotMeta<u64, openraft::BasicNode>)> {
     let mut head = [0u8; HEADER_LEN];
     r.read_exact(&mut head)?;
     if head[0..4] != SNAP_MAGIC {
-        return Err(io::Error::other("快照文件 magic 不符（不是快照文件或已损坏）"));
+        return Err(io::Error::other(
+            "快照文件 magic 不符（不是快照文件或已损坏）",
+        ));
     }
     let version = head[4];
     if version != SNAP_VERSION {
@@ -253,7 +255,9 @@ pub fn read_header<R: Read>(r: &mut R) -> io::Result<(SnapshotHeader, SnapshotMe
 /// 从内存字节解析文件头 + meta（esctl list 用，不碰 payload）。
 ///
 /// `bytes` 需包含完整头部与 meta 段，payload 可以截断。
-pub fn parse_header_bytes(bytes: &[u8]) -> io::Result<(SnapshotHeader, SnapshotMeta<u64, openraft::BasicNode>)> {
+pub fn parse_header_bytes(
+    bytes: &[u8],
+) -> io::Result<(SnapshotHeader, SnapshotMeta<u64, openraft::BasicNode>)> {
     let mut cur = io::Cursor::new(bytes);
     read_header(&mut cur)
 }
@@ -264,7 +268,11 @@ pub fn parse_header_bytes(bytes: &[u8]) -> io::Result<(SnapshotHeader, SnapshotM
 /// 从中读记录流（先读 u64 记录数，再 for_each_record）。
 pub fn open_payload_reader(
     path: &Path,
-) -> io::Result<(SnapshotHeader, SnapshotMeta<u64, openraft::BasicNode>, SnapshotReader)> {
+) -> io::Result<(
+    SnapshotHeader,
+    SnapshotMeta<u64, openraft::BasicNode>,
+    SnapshotReader,
+)> {
     use std::io::Seek;
     let mut f = File::open(path)?;
     let (h, m) = read_header(&mut f)?;
@@ -642,7 +650,9 @@ impl SnapshotStore {
             if header.shard_id != self.shard_id {
                 continue; // 其它分片的快照
             }
-            let Some(meta) = entry.meta.as_ref() else { continue };
+            let Some(meta) = entry.meta.as_ref() else {
+                continue;
+            };
             // 领先于 applied 的快照跳过（restore/崩溃残留）。applied 为 None
             // 不过滤：启动恢复场景（如刚装快照的新节点）正需要返回快照。
             if let (Some(a), Some(m)) = (applied, meta.last_log_id) {
@@ -789,7 +799,11 @@ mod tests {
     /// 从快照文件读回 (header, meta, entries)；自动校验 payload_len 与 end_marker
     fn read_snap_file(
         path: &Path,
-    ) -> (SnapshotHeader, SnapshotMeta<u64, BasicNode>, Vec<(Vec<u8>, Vec<u8>)>) {
+    ) -> (
+        SnapshotHeader,
+        SnapshotMeta<u64, BasicNode>,
+        Vec<(Vec<u8>, Vec<u8>)>,
+    ) {
         let (h, m, mut r) = open_payload_reader(path).unwrap();
         let mut entries = Vec::new();
         let read_bytes = for_each_record(&mut r, |k, v| {
@@ -1030,14 +1044,33 @@ mod tests {
         let name = p.file_name().unwrap().to_str().unwrap().to_string();
         assert!(name.starts_with("snap-00000007-"), "分片宽度补零: {name}");
         assert!(name.contains("-00000000000000000012-"), "term 补零: {name}");
-        assert!(name.ends_with("-00000000000000000034.esnap"), "index 补零: {name}");
+        assert!(
+            name.ends_with("-00000000000000000034.esnap"),
+            "index 补零: {name}"
+        );
         // 空快照哨兵 term=0/index=0
         let p0 = store.final_path(None);
-        assert!(p0.to_str().unwrap().ends_with("-00000000000000000000-00000000000000000000.esnap"));
+        assert!(
+            p0.to_str()
+                .unwrap()
+                .ends_with("-00000000000000000000-00000000000000000000.esnap")
+        );
 
         // 写 3 个快照文件后 list 可见
-        write_snap_file(&store.final_path(Some(log_id(1, 10))), Compression::None, 1, 10, &[]);
-        write_snap_file(&store.final_path(Some(log_id(2, 20))), Compression::Lz4, 2, 20, &[]);
+        write_snap_file(
+            &store.final_path(Some(log_id(1, 10))),
+            Compression::None,
+            1,
+            10,
+            &[],
+        );
+        write_snap_file(
+            &store.final_path(Some(log_id(2, 20))),
+            Compression::Lz4,
+            2,
+            20,
+            &[],
+        );
         let entries = store.list_entries().unwrap();
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().all(|e| e.valid));
@@ -1060,8 +1093,20 @@ mod tests {
         .unwrap();
         store.ensure_dirs().unwrap();
         // 字符串排序陷阱：term=9 vs term=10（"9" > "10" 字符串序但数值序相反）
-        write_snap_file(&store.final_path(Some(log_id(10, 5))), Compression::None, 10, 5, &[]);
-        write_snap_file(&store.final_path(Some(log_id(9, 100))), Compression::None, 9, 100, &[]);
+        write_snap_file(
+            &store.final_path(Some(log_id(10, 5))),
+            Compression::None,
+            10,
+            5,
+            &[],
+        );
+        write_snap_file(
+            &store.final_path(Some(log_id(9, 100))),
+            Compression::None,
+            9,
+            100,
+            &[],
+        );
         let latest = store.latest(None).unwrap().unwrap();
         assert!(
             latest.to_str().unwrap().contains("-00000000000000000010-"),
@@ -1091,7 +1136,11 @@ mod tests {
         .unwrap();
 
         assert!(store.list_entries().unwrap().is_empty(), "缺失目录应视为空");
-        assert_eq!(store.cleanup_incoming().unwrap(), 0, "缺失 incoming 不应报错");
+        assert_eq!(
+            store.cleanup_incoming().unwrap(),
+            0,
+            "缺失 incoming 不应报错"
+        );
 
         store.ensure_dirs().unwrap();
         std::fs::create_dir(store.cfg.dir.join("nested")).unwrap();
@@ -1127,7 +1176,13 @@ mod tests {
         .unwrap();
         store.ensure_dirs().unwrap();
         for (t, i) in [(1, 10), (1, 20), (2, 5), (3, 1)] {
-            write_snap_file(&store.final_path(Some(log_id(t, i))), Compression::None, t, i, &[]);
+            write_snap_file(
+                &store.final_path(Some(log_id(t, i))),
+                Compression::None,
+                t,
+                i,
+                &[],
+            );
         }
         let removed = store.retain(2).unwrap();
         assert_eq!(removed.len(), 2, "保留最新 2 个应删除 2 个");
@@ -1175,31 +1230,50 @@ mod tests {
         // 生产布局：全部分片共享同一快照目录（文件名带分片号）
         let dir = tempfile::tempdir().unwrap();
         let store0 = SnapshotStore::new(
-            SnapshotConfig { dir: dir.path().to_path_buf(), compression: Compression::None, keep: 3 },
+            SnapshotConfig {
+                dir: dir.path().to_path_buf(),
+                compression: Compression::None,
+                keep: 3,
+            },
             0,
         )
         .unwrap();
         let store1 = SnapshotStore::new(
-            SnapshotConfig { dir: dir.path().to_path_buf(), compression: Compression::None, keep: 3 },
+            SnapshotConfig {
+                dir: dir.path().to_path_buf(),
+                compression: Compression::None,
+                keep: 3,
+            },
             1,
         )
         .unwrap();
         store0.ensure_dirs().unwrap();
 
         // 写分片 0（term=1,index=5）与分片 1（term=2,index=99，全局更大）的快照
-        let (p0, p1) = (store0.final_path(Some(log_id(1, 5))), store1.final_path(Some(log_id(2, 99))));
+        let (p0, p1) = (
+            store0.final_path(Some(log_id(1, 5))),
+            store1.final_path(Some(log_id(2, 99))),
+        );
         write_snap_file(&p0, Compression::None, 1, 5, &[]);
         write_snap_file(&p1, Compression::None, 2, 99, &[]);
 
         // 分片 0 的 store 必须只看到分片 0 的快照（不能取全局最大）
         let latest0 = store0.latest(None).unwrap().unwrap();
         assert!(
-            latest0.to_str().unwrap().contains("-00000000000000000005.esnap"),
+            latest0
+                .to_str()
+                .unwrap()
+                .contains("-00000000000000000005.esnap"),
             "分片 0 不应取到分片 1 的快照: {}",
             latest0.display()
         );
         let latest1 = store1.latest(None).unwrap().unwrap();
-        assert!(latest1.to_str().unwrap().contains("-00000000000000000099.esnap"));
+        assert!(
+            latest1
+                .to_str()
+                .unwrap()
+                .contains("-00000000000000000099.esnap")
+        );
 
         // retain 同样只清理本分片
         let removed = store0.retain(1).unwrap();
@@ -1212,25 +1286,49 @@ mod tests {
         // restore/崩溃残留的「更新」快照文件必须被 latest(applied) 过滤
         let dir = tempfile::tempdir().unwrap();
         let store = SnapshotStore::new(
-            SnapshotConfig { dir: dir.path().to_path_buf(), compression: Compression::None, keep: 3 },
+            SnapshotConfig {
+                dir: dir.path().to_path_buf(),
+                compression: Compression::None,
+                keep: 3,
+            },
             0,
         )
         .unwrap();
         store.ensure_dirs().unwrap();
         // 残留的更新文件 (term=5, index=100) 与正常文件 (term=1, index=4)
-        write_snap_file(&store.final_path(Some(log_id(5, 100))), Compression::None, 5, 100, &[]);
-        write_snap_file(&store.final_path(Some(log_id(1, 4))), Compression::None, 1, 4, &[]);
+        write_snap_file(
+            &store.final_path(Some(log_id(5, 100))),
+            Compression::None,
+            5,
+            100,
+            &[],
+        );
+        write_snap_file(
+            &store.final_path(Some(log_id(1, 4))),
+            Compression::None,
+            1,
+            4,
+            &[],
+        );
 
         // applied=(1,4) 时返回 (1,4) 而非残留的 (5,100)
         let latest = store.latest(Some(log_id(1, 4))).unwrap().unwrap();
         assert!(
-            latest.to_str().unwrap().contains("-00000000000000000004.esnap"),
+            latest
+                .to_str()
+                .unwrap()
+                .contains("-00000000000000000004.esnap"),
             "领先于 applied 的残留快照必须被跳过: {}",
             latest.display()
         );
         // applied=None（新节点）不过滤
         let latest = store.latest(None).unwrap().unwrap();
-        assert!(latest.to_str().unwrap().contains("-00000000000000000100.esnap"));
+        assert!(
+            latest
+                .to_str()
+                .unwrap()
+                .contains("-00000000000000000100.esnap")
+        );
     }
 }
 
@@ -1270,21 +1368,18 @@ pub async fn restore(
     use crate::key;
 
     // 1. 校验快照文件（magic/version/压缩 tag/分片一致）
-    let mut f = File::open(snapshot_file).map_err(|e| {
-        es_core::Error::Storage(format!("打开快照文件失败: {e}"))
-    })?;
-    let (header, meta) = read_header(&mut f).map_err(|e| {
-        es_core::Error::Storage(format!("快照文件头部校验失败: {e}"))
-    })?;
+    let mut f = File::open(snapshot_file)
+        .map_err(|e| es_core::Error::Storage(format!("打开快照文件失败: {e}")))?;
+    let (header, meta) = read_header(&mut f)
+        .map_err(|e| es_core::Error::Storage(format!("快照文件头部校验失败: {e}")))?;
     if header.shard_id != shard_id {
         return Err(es_core::Error::InvalidInput(format!(
             "快照属于分片 {}，不能恢复到分片 {shard_id}",
             header.shard_id
         )));
     }
-    std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(32 + header.meta_len)).map_err(
-        |e| es_core::Error::Storage(format!("定位快照 payload 失败: {e}")),
-    )?;
+    std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(32 + header.meta_len))
+        .map_err(|e| es_core::Error::Storage(format!("定位快照 payload 失败: {e}")))?;
     let mut reader = header
         .compression
         .reader(f)
@@ -1306,7 +1401,9 @@ pub async fn restore(
         shard_id,
     )
     .map_err(|e| es_core::Error::Storage(format!("快照目录初始化失败: {e}")))?;
-    store.ensure_dirs().map_err(|e| es_core::Error::Storage(format!("建快照目录失败: {e}")))?;
+    store
+        .ensure_dirs()
+        .map_err(|e| es_core::Error::Storage(format!("建快照目录失败: {e}")))?;
     let final_path = store.final_path(meta.last_log_id);
     // 源与目标是否为同一文件（canonicalize 比较，防 fs::copy 的 O_TRUNC 截断同 inode）
     let same_file = match (
@@ -1417,9 +1514,8 @@ pub async fn restore(
     };
     txn.set(
         key::sm_applied_state(shard_id),
-        crate::encode::encode(&applied).map_err(|e| {
-            es_core::Error::Serde(format!("applied 状态序列化失败: {e}"))
-        })?,
+        crate::encode::encode(&applied)
+            .map_err(|e| es_core::Error::Serde(format!("applied 状态序列化失败: {e}")))?,
     )
     .map_err(|e| es_core::Error::Storage(format!("写 applied 失败: {e}")))?;
 
@@ -1443,9 +1539,8 @@ pub async fn restore(
     //    源已在目标位置（规范名文件恢复）时跳过——fs::copy 以 O_TRUNC 打开
     //    目标会先截断同一 inode，导致快照文件被静默清空
     if !same_file {
-        std::fs::copy(snapshot_file, &final_path).map_err(|e| {
-            es_core::Error::Storage(format!("复制快照文件失败: {e}"))
-        })?;
+        std::fs::copy(snapshot_file, &final_path)
+            .map_err(|e| es_core::Error::Storage(format!("复制快照文件失败: {e}")))?;
     }
 
     Ok(RestoreReport {

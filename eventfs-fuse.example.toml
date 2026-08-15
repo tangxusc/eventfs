@@ -1,0 +1,10 @@
+# 至少一个 AggregateStore 公共 gRPC 端点。
+endpoints = ["http://127.0.0.1:50051"]
+
+# 本地写句柄上限还会与服务端能力取最小值，范围为 1..=6 MiB。
+max_event_bytes = 1048576
+max_state_bytes = 1048576
+
+# HTTPS 严格校验时配置 PEM CA；不要同时开启 insecure_skip_tls_verify。
+# ca_file = "/etc/eventfs/ca.pem"
+insecure_skip_tls_verify = false

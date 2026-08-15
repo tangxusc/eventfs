@@ -9,14 +9,14 @@ use std::time::Duration;
 
 use es_proto::eventstore::event_store_server::EventStoreServer;
 use es_proto::eventstore::*;
-use es_server::config::{Config, NodeConfig, PlacementConfig, PlacementNode, StorageConfig};
 use es_server::Server;
+use es_server::config::{Config, NodeConfig, PlacementConfig, PlacementNode, StorageConfig};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 use crate::cli::*;
 use crate::client::ClusterClient;
-use crate::commands::{append, init, member, meta, migrate, read, route, status, watch, Ctx};
+use crate::commands::{Ctx, append, init, member, meta, migrate, read, route, status, watch};
 
 /// 启动单节点测试集群（2 分片，raft 已初始化，gRPC 已监听）。
 /// 返回 (gRPC 地址, Server, TempDir)。

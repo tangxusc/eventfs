@@ -65,9 +65,9 @@ fn pre_send_oversize_err<E: std::error::Error>(
 ) -> Option<RPCError<u64, BasicNode, E>> {
     match split_advice(entries, payload_len) {
         SplitAdvice::NoSplit => None,
-        SplitAdvice::ShrinkTo(hint) => {
-            Some(RPCError::PayloadTooLarge(PayloadTooLarge::new_entries_hint(hint)))
-        }
+        SplitAdvice::ShrinkTo(hint) => Some(RPCError::PayloadTooLarge(
+            PayloadTooLarge::new_entries_hint(hint),
+        )),
         SplitAdvice::SingleEntryTooLarge => Some(RPCError::Unreachable(Unreachable::new(
             &std::io::Error::other("单条 AppendEntries 超过 8MB 消息上限"),
         ))),
@@ -79,9 +79,7 @@ fn pre_send_oversize_err<E: std::error::Error>(
 /// 正常路径发送前检查已拦截；此处覆盖估算误差、节点间上限配置不一致等
 /// 场景。对端已拒绝且不知道其上限，用二分收缩：每轮 1 次 RPC（失败会刷新
 /// hint，TTL=10 次计数在成功续传时才限制 hint 寿命），约 log2(条数) 轮收敛。
-fn recv_oversize_err<E: std::error::Error>(
-    entries: usize,
-) -> RPCError<u64, BasicNode, E> {
+fn recv_oversize_err<E: std::error::Error>(entries: usize) -> RPCError<u64, BasicNode, E> {
     if entries <= 1 {
         RPCError::Unreachable(Unreachable::new(&std::io::Error::other(
             "单条 AppendEntries 超过对端消息上限",
@@ -410,12 +408,15 @@ mod tests {
         let req = EsRequest::Append {
             stream_id: "s".to_string(),
             expected_version: ExpectedVersion::Any,
-            events: vec![NewEvent {
-                event_id: uuid::Uuid::new_v4(),
-                event_type: "t".into(),
-                data: vec![0u8; 1024 * 1024],
-                metadata: vec![],
-            }; 6],
+            events: vec![
+                NewEvent {
+                    event_id: uuid::Uuid::new_v4(),
+                    event_type: "t".into(),
+                    data: vec![0u8; 1024 * 1024],
+                    metadata: vec![],
+                };
+                6
+            ],
             hlc: Hlc::now(),
         };
         let payload = bincode::serde::encode_to_vec(&req, bincode::config::standard())

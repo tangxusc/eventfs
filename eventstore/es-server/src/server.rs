@@ -3,6 +3,7 @@
 use anyhow::Result;
 use std::sync::Arc;
 
+use crate::aggregate_service::AggregateStoreService;
 use crate::config::Config;
 use crate::factory;
 use crate::migration_service::MigrationService;
@@ -159,6 +160,9 @@ impl Server {
             self.shard_manager.clone(),
             self.ownership.clone(),
         );
+        let aggregate_service =
+            AggregateStoreService::new(self.shard_manager.clone(), &self.config)
+                .map_err(anyhow::Error::msg)?;
 
         let mut public_server = tonic::transport::Server::builder();
         // tls_config 必须在 add_service 之前
@@ -206,12 +210,19 @@ impl Server {
             es_proto::eventstore::migration_server::MigrationServer::new(migration_service.clone())
                 .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
                 .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE);
+        let aggregate_store =
+            es_proto::eventstore::aggregate_store_server::AggregateStoreServer::new(
+                aggregate_service.clone(),
+            )
+            .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
+            .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE);
         let public_server = public_server
             .add_service(event_store)
             .add_service(persistent_subscriptions)
             .add_service(raft_rpc)
             .add_service(raft_admin)
-            .add_service(migration);
+            .add_service(migration)
+            .add_service(aggregate_store);
 
         match &self.config.node.internal_listen_addr {
             Some(internal_addr) => {
@@ -223,6 +234,9 @@ impl Server {
                     es_proto::eventstore::ownership_internal_server::OwnershipInternalServer::new(
                         migration_service,
                     )
+                    .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
+                    .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE);
+                let aggregate_internal = es_proto::eventstore::aggregate_store_internal_server::AggregateStoreInternalServer::new(aggregate_service)
                     .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
                     .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE);
                 let mut internal_server = tonic::transport::Server::builder();
@@ -247,6 +261,7 @@ impl Server {
                     internal_server
                         .add_service(internal_subscription)
                         .add_service(ownership_internal)
+                        .add_service(aggregate_internal)
                         .serve(internal_addr),
                 )?;
             }

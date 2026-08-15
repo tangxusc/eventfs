@@ -30,6 +30,17 @@ const SM_NEXT_POSITION: u8 = 0x06;
 const SM_OWNERSHIP_CATALOG: u8 = 0x07;
 const SM_OWNERSHIP_FENCE: u8 = 0x08;
 const SM_PERSISTENT_GROUP: u8 = 0x09;
+const SM_AGGREGATE_EVENT: u8 = 0x0A;
+const SM_AGGREGATE_META: u8 = 0x0B;
+const SM_AGGREGATE_PARTITION_INDEX: u8 = 0x0C;
+const SM_AGGREGATE_NEXT_POSITION: u8 = 0x0D;
+const SM_AGGREGATE_STATE: u8 = 0x0E;
+const SM_AGGREGATE_IDEMPOTENCY: u8 = 0x0F;
+const SM_AGGREGATE_PARTITION_FENCE: u8 = 0x10;
+const SM_AGGREGATE_CATALOG: u8 = 0x11;
+const SM_AGGREGATE_GROUP_CATALOG: u8 = 0x12;
+const SM_AGGREGATE_GROUP_PARTITION: u8 = 0x13;
+const SM_AGGREGATE_STATE_MODIFIED: u8 = 0x14;
 
 /// 快照子类别
 const SNAPSHOT_CURRENT: u8 = 0x01;
@@ -197,6 +208,233 @@ pub fn sm_persistent_group(shard_id: u64, group: &str) -> Vec<u8> {
 /// 持久化订阅组扫描前缀。
 pub fn sm_persistent_group_prefix(shard_id: u64) -> Vec<u8> {
     sm_sub_prefix(shard_id, SM_PERSISTENT_GROUP)
+}
+
+fn append_len_prefixed(key: &mut Vec<u8>, bytes: &[u8]) {
+    key.extend_from_slice(&encode_u64_be(bytes.len() as u64));
+    key.extend_from_slice(bytes);
+}
+
+fn aggregate_partition_prefix(
+    shard_id: u64,
+    sub: u8,
+    event_set: &es_core::EventSetId,
+    partition_id: u16,
+) -> Vec<u8> {
+    let event_set = event_set.canonical_name();
+    let mut key = sm_sub_prefix(shard_id, sub);
+    append_len_prefixed(&mut key, event_set.as_bytes());
+    key.extend_from_slice(&partition_id.to_be_bytes());
+    key
+}
+
+fn aggregate_instance_prefix(
+    shard_id: u64,
+    sub: u8,
+    event_set: &es_core::EventSetId,
+    partition_id: u16,
+    aggregate_id: &str,
+) -> Vec<u8> {
+    let mut key = aggregate_partition_prefix(shard_id, sub, event_set, partition_id);
+    append_len_prefixed(&mut key, aggregate_id.as_bytes());
+    key
+}
+
+/// 聚合事件 key：事件集、虚拟分区、实例 ID 和聚合版本共同定位。
+pub fn sm_aggregate_event(
+    shard_id: u64,
+    event_set: &es_core::EventSetId,
+    partition_id: u16,
+    aggregate_id: &str,
+    aggregate_version: u64,
+) -> Vec<u8> {
+    let mut key = sm_aggregate_event_prefix(shard_id, event_set, partition_id, aggregate_id);
+    key.extend_from_slice(&encode_u64_be(aggregate_version));
+    key
+}
+
+/// 单聚合实例的事件扫描前缀。
+pub fn sm_aggregate_event_prefix(
+    shard_id: u64,
+    event_set: &es_core::EventSetId,
+    partition_id: u16,
+    aggregate_id: &str,
+) -> Vec<u8> {
+    aggregate_instance_prefix(
+        shard_id,
+        SM_AGGREGATE_EVENT,
+        event_set,
+        partition_id,
+        aggregate_id,
+    )
+}
+
+/// 单聚合实例的当前版本元数据 key。
+pub fn sm_aggregate_meta(
+    shard_id: u64,
+    event_set: &es_core::EventSetId,
+    partition_id: u16,
+    aggregate_id: &str,
+) -> Vec<u8> {
+    aggregate_instance_prefix(
+        shard_id,
+        SM_AGGREGATE_META,
+        event_set,
+        partition_id,
+        aggregate_id,
+    )
+}
+
+/// 分区内提交位置到聚合事件定位符的索引 key。
+pub fn sm_aggregate_partition_index(
+    shard_id: u64,
+    event_set: &es_core::EventSetId,
+    partition_id: u16,
+    partition_position: u64,
+) -> Vec<u8> {
+    let mut key = sm_aggregate_partition_index_prefix(shard_id, event_set, partition_id);
+    key.extend_from_slice(&encode_u64_be(partition_position));
+    key
+}
+
+/// 单虚拟事件分区的提交位置索引前缀。
+pub fn sm_aggregate_partition_index_prefix(
+    shard_id: u64,
+    event_set: &es_core::EventSetId,
+    partition_id: u16,
+) -> Vec<u8> {
+    aggregate_partition_prefix(
+        shard_id,
+        SM_AGGREGATE_PARTITION_INDEX,
+        event_set,
+        partition_id,
+    )
+}
+
+/// 单虚拟事件分区的下一个提交位置计数器 key。
+pub fn sm_aggregate_next_position(
+    shard_id: u64,
+    event_set: &es_core::EventSetId,
+    partition_id: u16,
+) -> Vec<u8> {
+    aggregate_partition_prefix(
+        shard_id,
+        SM_AGGREGATE_NEXT_POSITION,
+        event_set,
+        partition_id,
+    )
+}
+
+/// 聚合实例业务状态文档 key。
+pub fn sm_aggregate_state(
+    shard_id: u64,
+    event_set: &es_core::EventSetId,
+    partition_id: u16,
+    aggregate_id: &str,
+) -> Vec<u8> {
+    let mut key = aggregate_partition_prefix(shard_id, SM_AGGREGATE_STATE, event_set, partition_id);
+    // aggregate_id 受公共 ASCII 规则约束且 key 到此结束，可直接编码以保留词典序。
+    key.extend_from_slice(aggregate_id.as_bytes());
+    key
+}
+
+/// 聚合实例业务状态最后提交 HLC key。
+///
+/// 与状态内容使用不同命名空间，避免改变已持久化 `AggregateState` 的 bincode 格式。
+pub fn sm_aggregate_state_modified(
+    shard_id: u64,
+    event_set: &es_core::EventSetId,
+    partition_id: u16,
+    aggregate_id: &str,
+) -> Vec<u8> {
+    let mut key = aggregate_partition_prefix(
+        shard_id,
+        SM_AGGREGATE_STATE_MODIFIED,
+        event_set,
+        partition_id,
+    );
+    key.extend_from_slice(aggregate_id.as_bytes());
+    key
+}
+
+/// 单虚拟事件分区的业务状态扫描前缀。
+pub fn sm_aggregate_state_prefix(
+    shard_id: u64,
+    event_set: &es_core::EventSetId,
+    partition_id: u16,
+) -> Vec<u8> {
+    aggregate_partition_prefix(shard_id, SM_AGGREGATE_STATE, event_set, partition_id)
+}
+
+/// 从业务状态 key 解出聚合实例 ID。
+pub fn decode_aggregate_state_key(key: &[u8]) -> Option<String> {
+    const HEAD: usize = 10;
+    if key.len() < HEAD + 8 + 2 + 1 || key.get(9) != Some(&SM_AGGREGATE_STATE) {
+        return None;
+    }
+    let event_set_len = decode_u64_be(&key[HEAD..HEAD + 8]).ok()? as usize;
+    let aggregate_start = HEAD
+        .checked_add(8)?
+        .checked_add(event_set_len)?
+        .checked_add(2)?;
+    if aggregate_start >= key.len() {
+        return None;
+    }
+    String::from_utf8(key[aggregate_start..].to_vec()).ok()
+}
+
+/// 聚合事件的幂等索引 key；作用域限制在事件集和虚拟分区内。
+pub fn sm_aggregate_idempotency(
+    shard_id: u64,
+    event_set: &es_core::EventSetId,
+    partition_id: u16,
+    event_id: &uuid::Uuid,
+) -> Vec<u8> {
+    let mut key =
+        aggregate_partition_prefix(shard_id, SM_AGGREGATE_IDEMPOTENCY, event_set, partition_id);
+    key.extend_from_slice(event_id.as_bytes());
+    key
+}
+
+/// 数据 Shard 上虚拟事件分区的 generation fence key。
+pub fn sm_aggregate_partition_fence(
+    shard_id: u64,
+    event_set: &es_core::EventSetId,
+    partition_id: u16,
+) -> Vec<u8> {
+    aggregate_partition_prefix(
+        shard_id,
+        SM_AGGREGATE_PARTITION_FENCE,
+        event_set,
+        partition_id,
+    )
+}
+
+/// 控制 Shard 上唯一的聚合事件集 catalog key。
+pub fn sm_aggregate_catalog(shard_id: u64) -> Vec<u8> {
+    sm_sub_prefix(shard_id, SM_AGGREGATE_CATALOG)
+}
+
+/// 控制 Shard 上唯一的聚合消费者组 catalog key。
+pub fn sm_aggregate_group_catalog(shard_id: u64) -> Vec<u8> {
+    sm_sub_prefix(shard_id, SM_AGGREGATE_GROUP_CATALOG)
+}
+
+/// 数据 Shard 上单个事件分区的消费者组进度 key。
+pub fn sm_aggregate_group_partition(
+    shard_id: u64,
+    event_set: &es_core::EventSetId,
+    partition_id: u16,
+    group_name: &str,
+) -> Vec<u8> {
+    let mut key = aggregate_partition_prefix(
+        shard_id,
+        SM_AGGREGATE_GROUP_PARTITION,
+        event_set,
+        partition_id,
+    );
+    append_len_prefixed(&mut key, group_name.as_bytes());
+    key
 }
 
 /// 从持久化订阅组 key 解出组名。
@@ -486,6 +724,63 @@ mod tests {
         assert!(!sm_stream_meta(2, "x").starts_with(&pos));
         assert!(sm_position_ptr(2, 0).starts_with(&pos));
         assert!(!sm_position_ptr(2, 0).starts_with(&idem));
+    }
+
+    #[test]
+    fn aggregate_keys_are_partitioned_and_ordered() {
+        let event_set = es_core::EventSetId::new("orders", "order").unwrap();
+        let prefix = sm_aggregate_event_prefix(2, &event_set, 7, "order-1");
+        let zero = sm_aggregate_event(2, &event_set, 7, "order-1", 0);
+        let one = sm_aggregate_event(2, &event_set, 7, "order-1", 1);
+        assert!(zero.starts_with(&prefix));
+        assert!(zero < one);
+        assert!(!sm_aggregate_event(2, &event_set, 8, "order-1", 0).starts_with(&prefix));
+        assert!(!sm_aggregate_event(2, &event_set, 7, "order-10", 0).starts_with(&prefix));
+    }
+
+    #[test]
+    fn aggregate_position_keys_keep_numeric_order() {
+        let event_set = es_core::EventSetId::new("orders", "order").unwrap();
+        let prefix = sm_aggregate_partition_index_prefix(4, &event_set, 255);
+        let low = sm_aggregate_partition_index(4, &event_set, 255, 255);
+        let high = sm_aggregate_partition_index(4, &event_set, 255, 256);
+        assert!(low.starts_with(&prefix));
+        assert!(low < high);
+    }
+
+    #[test]
+    fn aggregate_state_keys_preserve_identifier_order_and_decode() {
+        let event_set = es_core::EventSetId::new("orders", "order").unwrap();
+        let short = sm_aggregate_state(1, &event_set, 7, "a");
+        let long = sm_aggregate_state(1, &event_set, 7, "aa");
+        let next = sm_aggregate_state(1, &event_set, 7, "b");
+        assert!(short < long && long < next);
+        assert_eq!(decode_aggregate_state_key(&long).as_deref(), Some("aa"));
+        assert_eq!(decode_aggregate_state_key(&sm_event(1, "aa", 0)), None);
+        assert_ne!(
+            sm_aggregate_state(1, &event_set, 7, "a"),
+            sm_aggregate_state_modified(1, &event_set, 7, "a")
+        );
+    }
+
+    #[test]
+    fn aggregate_namespaces_do_not_overlap_legacy_keys() {
+        let event_set = es_core::EventSetId::new("orders", "order").unwrap();
+        let keys = [
+            sm_aggregate_event(1, &event_set, 0, "order-1", 0),
+            sm_aggregate_meta(1, &event_set, 0, "order-1"),
+            sm_aggregate_partition_index(1, &event_set, 0, 0),
+            sm_aggregate_next_position(1, &event_set, 0),
+            sm_aggregate_state(1, &event_set, 0, "order-1"),
+            sm_aggregate_idempotency(1, &event_set, 0, &uuid::Uuid::nil()),
+            sm_aggregate_partition_fence(1, &event_set, 0),
+            sm_aggregate_catalog(1),
+        ];
+        let mut unique = std::collections::BTreeSet::new();
+        for key in &keys {
+            assert!(unique.insert(key[9]), "新状态机 tag 必须互不相同");
+            assert_ne!(*key, sm_event(1, "orders/order", 0));
+        }
     }
 
     #[test]

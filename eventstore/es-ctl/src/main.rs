@@ -68,6 +68,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
         },
         Command::Persistent(a) => commands::persistent::run(&ctx, &a.action).await,
+        Command::Aggregate(a) => commands::aggregate::run(&ctx, &a.action).await,
     }
 }
 

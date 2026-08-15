@@ -109,7 +109,10 @@ impl RaftAdmin for RaftAdminService {
             let expected: BTreeSet<u64> = req.expected_voters.iter().copied().collect();
             if current != expected {
                 let fmt = |s: &BTreeSet<u64>| {
-                    s.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",")
+                    s.iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
                 };
                 return Err(Status::failed_precondition(format!(
                     "成员集合已变更：当前 [{}]，期望 [{}]，请重读后重试",

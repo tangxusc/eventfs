@@ -138,6 +138,37 @@ impl RemoteShards {
             .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
             .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE))
     }
+
+    /// 连接远程 Shard leader 的 AggregateStore 内部服务。
+    pub(crate) async fn aggregate_internal_client(
+        &self,
+        shard_id: u64,
+    ) -> Result<
+        es_proto::eventstore::aggregate_store_internal_client::AggregateStoreInternalClient<
+            tonic::transport::Channel,
+        >,
+        Status,
+    > {
+        let (leader_id, _) = self
+            .find_leader(shard_id)
+            .await
+            .ok_or_else(|| Status::unavailable("aggregate store source unavailable"))?;
+        let addr = self
+            .internal_addrs
+            .get(&leader_id)
+            .ok_or_else(|| Status::unavailable("aggregate store source unavailable"))?;
+        let endpoint = tonic::transport::Endpoint::from_shared(addr.clone())
+            .map_err(|_| Status::unavailable("aggregate store source unavailable"))?;
+        let endpoint = es_proto::tls::apply_endpoint_tls(endpoint, self.tls.as_ref())
+            .map_err(|_| Status::unavailable("aggregate store source unavailable"))?;
+        let channel = endpoint
+            .connect()
+            .await
+            .map_err(|_| Status::unavailable("aggregate store source unavailable"))?;
+        Ok(es_proto::eventstore::aggregate_store_internal_client::AggregateStoreInternalClient::new(channel)
+            .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
+            .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE))
+    }
 }
 
 /// 归并用的堆元素：按 (hlc, shard_id, position) 定序

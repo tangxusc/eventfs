@@ -66,7 +66,11 @@ async fn log_index_cross_byte_boundary_ordered() {
     do_append(&mut st, entries).await;
 
     let state = st.get_log_state().await.expect("读日志状态");
-    assert_eq!(state.last_log_id, Some(log_id(1, 65536)), "最大 index 应为 65536");
+    assert_eq!(
+        state.last_log_id,
+        Some(log_id(1, 65536)),
+        "最大 index 应为 65536"
+    );
 
     let got = st.try_get_log_entries(..).await.expect("全量读");
     let got_idxs: Vec<u64> = got.iter().map(|e| e.log_id.index).collect();
@@ -83,14 +87,20 @@ async fn range_read_boundaries() {
     };
 
     // 半开区间
-    assert_eq!(idxs(st.try_get_log_entries(2..5).await.unwrap()), vec![2, 3, 4]);
+    assert_eq!(
+        idxs(st.try_get_log_entries(2..5).await.unwrap()),
+        vec![2, 3, 4]
+    );
     // 闭区间
     assert_eq!(
         idxs(st.try_get_log_entries(2..=5).await.unwrap()),
         vec![2, 3, 4, 5]
     );
     // 起点无界
-    assert_eq!(idxs(st.try_get_log_entries(..3).await.unwrap()), vec![0, 1, 2]);
+    assert_eq!(
+        idxs(st.try_get_log_entries(..3).await.unwrap()),
+        vec![0, 1, 2]
+    );
     // 终点无界
     assert_eq!(
         idxs(st.try_get_log_entries(7..).await.unwrap()),
@@ -117,7 +127,11 @@ async fn truncate_removes_index_and_after() {
     assert_eq!(got_idxs, vec![0, 1, 2, 3], "index >= 4 的必须全部删除");
 
     let state = st.get_log_state().await.expect("读日志状态");
-    assert_eq!(state.last_log_id, Some(log_id(1, 3)), "last_log_id 须回退到 3");
+    assert_eq!(
+        state.last_log_id,
+        Some(log_id(1, 3)),
+        "last_log_id 须回退到 3"
+    );
 }
 
 #[tokio::test]
@@ -210,7 +224,10 @@ async fn reopen_keeps_log_and_vote() {
         let mut st = crate::EsStorage::new(
             0,
             std::sync::Arc::new(tree),
-            crate::snapshot::SnapshotConfig { dir: dir.path().join("snapshots"), ..Default::default() },
+            crate::snapshot::SnapshotConfig {
+                dir: dir.path().join("snapshots"),
+                ..Default::default()
+            },
         )
         .expect("建存储");
         do_append(&mut st, vec![entry(2, 0, "s"), entry(2, 1, "s")]).await;
@@ -225,13 +242,19 @@ async fn reopen_keeps_log_and_vote() {
         .build()
         .expect("重开 tree");
     let mut st = crate::EsStorage::new(
-            0,
-            std::sync::Arc::new(tree),
-            crate::snapshot::SnapshotConfig { dir: dir.path().join("snapshots"), ..Default::default() },
-        )
-        .expect("建存储");
+        0,
+        std::sync::Arc::new(tree),
+        crate::snapshot::SnapshotConfig {
+            dir: dir.path().join("snapshots"),
+            ..Default::default()
+        },
+    )
+    .expect("建存储");
 
     let state = st.get_log_state().await.expect("读日志状态");
     assert_eq!(state.last_log_id, Some(log_id(2, 1)), "重启后日志须仍在");
-    assert_eq!(st.read_vote().await.expect("读 vote"), Some(Vote::new(2, 3)));
+    assert_eq!(
+        st.read_vote().await.expect("读 vote"),
+        Some(Vote::new(2, 3))
+    );
 }

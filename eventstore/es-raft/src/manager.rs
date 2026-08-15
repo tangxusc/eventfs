@@ -59,8 +59,7 @@ impl ShardManager {
         }
 
         // 自动扩展范围：动态扩容后 shard_id 可超过启动值
-        self.num_shards
-            .fetch_max(shard_id + 1, Ordering::Relaxed);
+        self.num_shards.fetch_max(shard_id + 1, Ordering::Relaxed);
 
         shards.insert(shard_id, shard);
         tracing::info!("Registered shard {}", shard_id);

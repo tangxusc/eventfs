@@ -14,7 +14,11 @@ pub fn render_create(
 ) -> String {
     match format {
         Format::Simple => {
-            let verb = if resp.exists { "已存在" } else { "创建成功" };
+            let verb = if resp.exists {
+                "已存在"
+            } else {
+                "创建成功"
+            };
             let leader = if resp.leader_addr.is_empty() {
                 String::new()
             } else {
@@ -61,11 +65,18 @@ mod tests {
 
     #[test]
     fn render_simple_new_stream() {
-        let out = render_create("order-1", &resp(3, "http://127.0.0.1:50052", false), Format::Simple);
+        let out = render_create(
+            "order-1",
+            &resp(3, "http://127.0.0.1:50052", false),
+            Format::Simple,
+        );
         assert!(out.contains("创建成功"), "新流应标创建成功: {out}");
         assert!(out.contains("stream: order-1"), "应含流名: {out}");
         assert!(out.contains("shard: 3"), "应含 shard: {out}");
-        assert!(out.contains("leader_addr: http://127.0.0.1:50052"), "应含地址: {out}");
+        assert!(
+            out.contains("leader_addr: http://127.0.0.1:50052"),
+            "应含地址: {out}"
+        );
     }
 
     #[test]

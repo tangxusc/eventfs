@@ -15,6 +15,7 @@
 - **混合逻辑时钟（HLC）**：leader 提交前分配并随日志下发，各副本 apply 出相同时间戳，为日后的近似全序预留基础
 - **跨分片流订阅**：客户端按一个或多个 stream、或 `$all` 订阅；服务端内部路由和聚合，追平边界不丢事件，公开事件不暴露 shard
 - **持久化拉取订阅**：命名竞争消费者组，control Shard 持久化 checkpoint、Stream lease、重试与 parked；`Fetch` 受条数、字节数和未确认额度背压，`Settle` 支持 Ack/Retry/Park/Skip；迁移 generation 变化时受影响 Stream 从 0 重扫，允许重复但不漏投
+- **AggregateStore 与 Linux FUSE**：每种聚合类型一个事件集，内部固定 256 个虚拟分区；同实例 OCC、状态 revision CAS、显式结算消费者组可通过 gRPC、`esctl aggregate` 或 `eventfs-fuse` 使用
 - **跨分片 ReadAll**：按 HLC 做 k 路归并（保分片内 position 序），服务端按归并消费水位
   驱动逐分片续读游标（`next_positions`，客户端原样透传翻页），支持反向；
   反向读到分片最早事件后游标带 `ended` 读尽标记，**空页即终止**（正反两向一致）
@@ -27,12 +28,13 @@
 
 ## 架构
 
-单个进程在公共 `listen_addr` 端口提供五个 gRPC 服务：
+单个进程在公共 `listen_addr` 端口提供六个 gRPC 服务：
 
 | 服务 | 用途 | 方法 |
 |---|---|---|
 | `EventStore` | 客户端 API | `Append` / `ReadStream` / `ReadAll` / `Subscribe` / `GetStreamMeta` / `CreateStream` |
 | `PersistentSubscriptions` | 持久化拉取订阅 | CRUD / `Fetch` / `Settle` / parked 查询与重放 |
+| `AggregateStore` | 聚合类型事件集 | 事件追加/跟随、状态 CAS、消费者组 Fetch/Settle/Renew、catalog 与分区诊断 |
 | `RaftRpc` | 节点间复制与选举 | `AppendEntries` / `Vote` / `InstallSnapshot` |
 | `RaftAdmin` | 集群管理 | `Initialize` / `AddLearner` / `ChangeMembership` / `GetRaftState` / `ListShards` |
 | `Migration` | 归属投影通知 + 在线迁移原语 | `GetRouteTable` / `PushRouteTable` / `SetStreamShard` / `RecountStreams` / `AppendMigrated` / `DeleteStreamFromShard` / `ReadStreamFromShard` / `GetStreamMetaFromShard` / `ListStreams` |
@@ -227,6 +229,35 @@ let mut client = EventStoreClient::connect_with_tls(
 ).await?;
 ```
 
+### eventfs-fuse（Linux）
+
+`eventfs-fuse` 把 AggregateStore 映射为事件、状态和消费者组文件。需要 Linux 内核
+FUSE、`/dev/fuse` 和 `fusermount3`；守护进程当前前台运行，建议交给 systemd 管理。
+
+```bash
+cargo build -p eventfs-fuse
+mkdir -p /data/eventfs
+./target/debug/eventfs-fuse mount --config eventfs-fuse.example.toml /data/eventfs
+```
+
+另一个终端中：
+
+```bash
+mkdir -p /data/eventfs/orders/order
+printf '%s' '{"spec_version":"1.0","aggregate_id":"order-1","event_type":"created","data":{"amount":100},"expected_version":{"kind":"no_aggregate"}}' \
+  > /data/eventfs/orders/order/events.jsonl
+
+# 每个新读句柄从 Beginning 追平并持续跟随，行为类似 tail -f。
+cat /data/eventfs/orders/order/events.jsonl
+
+printf '%s' '{"balance":100}' > /data/eventfs/orders/order/states/order-1.json
+mkdir /data/eventfs/orders/order/groups/payments
+cat /data/eventfs/orders/order/groups/payments/worker-1.jsonl
+```
+
+消费者输出的 `delivery_id` 用同一路径的写句柄显式 Ack/Retry/Park/Skip。完整文件契约、
+JSON 格式和错误语义见 [docs/eventfs-fuse.md](docs/eventfs-fuse.md)。
+
 ### esctl 命令行工具
 
 `esctl` 是参照 etcdctl 的管理工具（独立二进制，构建：`cargo build --bin esctl`），
@@ -278,7 +309,7 @@ esctl snapshot restore ./data/node1 ./data/node1/snapshots/snap-0-1-100.esnap --
 ## 测试
 
 ```bash
-# 默认套件：496 项通过（另有 16 项真实多进程用例按设计忽略）
+# 默认套件：646 项通过（另有 17 项环境型用例按设计忽略）
 cargo test --workspace
 
 # 真实多进程测试：es-server 14 项
@@ -286,22 +317,22 @@ cargo test -p es-server --test multi_node_test -- --ignored --test-threads=1
 
 # 真实多进程测试：esctl 2 项
 cargo test -p es-ctl --test multi_node_test -- --ignored --test-threads=1
+
+# Linux 真 FUSE 挂载闭环：需要 /dev/fuse 与 fusermount3
+cargo test -p eventfs-fuse --test mount_e2e_test -- --ignored --test-threads=1
 ```
 
 | 套件 | 项数 | 内容 |
 |---|---|---|
-| `es-core` | 51 | HLC 单调性、归属 catalog 命令矩阵与模糊测试、兼容投影、leader 重定向策略 |
+| `es-core` | 87 | HLC、归属与聚合 catalog、实例级 OCC、消费者组 lease/checkpoint、属性与模糊测试 |
 | `es-proto` | 10 | gRPC 代码生成验证、TLS 信任策略、端点归一化 |
-| `es-storage` | 92 | Key 编码排序性质、日志语义、归属提交与 fencing、快照往返、模糊测试（随机 append/delete 不变量） |
+| `es-storage` | 114 | Key 编码排序性质、日志语义、AggregateStore 事务与 fencing、快照往返、模糊测试 |
 | `es-raft` | 34 | ShardManager 注册与寻址、RaftAdmin 参数校验、网络分区、慢节点、消息大小限制（进程内可控网络层） |
-| `es-server` | 143 | 服务器启动、归属 interface、bootstrap、watcher 调和、端到端读写/订阅/跨分片读取 |
-| `es-server/multi_node_test` | 14 | 3 节点真实进程集群，含并发首次归属与控制 Shard 无 quorum（`--ignored` 启用） |
-| `es-client` | 40 | SDK 单测 + stub 集成 + 进程内 e2e（重定向重试、正反向翻页、订阅含 catch-up 窗口、元数据） |
-| `es-ctl` | 126 | 参数解析、leader 提示、分片探测、输出渲染及迁移/订阅/管理面 e2e |
-| `es-ctl/e2e_test` | 29 | 进程内全链路：读写/订阅/管理面/TLS/成员管理/翻页/CAS + 在线迁移场景矩阵（单流/批量/干跑/重跑幂等/孤儿自动定位/切换中断自愈） |
-| `es-ctl/client_failover_test` | 4 | 端点故障转移（写重试、leader 未知退避、轮询起点分散负载） |
-| `es-ctl/snapshot_test` | 4 | 快照 list/restore 端到端（离线 LOCK 约束） |
-| `es-ctl/multi_node_test` | 2 | esctl 组建三节点真实进程集群（`--ignored` 启用） |
+| `es-server` | 170 | 服务器启动、AggregateStore、归属 interface、bootstrap、watcher、端到端读写/订阅/跨分片读取 |
+| `es-client` | 53 | SDK 单测、stub 集成与进程内 e2e（AggregateStore、重定向、翻页、订阅与持久消费） |
+| `es-ctl` | 142 | 参数解析、AggregateStore 管理、故障转移、快照及进程内全链路 e2e |
+| `eventfs-fuse` | 36 | 路径/JSON 模糊测试、句柄状态机、errno、Backend 契约、Linux fuser Adapter 与 gRPC e2e |
+| 忽略项 | 17 | `es-server` 真实多进程 14 项、`esctl` 真实多进程 2 项、真 FUSE 挂载 1 项 |
 
 多节点测试标为 `#[ignore]`：每项要拉起 3 个进程。串行运行以免争抢端口：
 
@@ -316,7 +347,14 @@ cargo test -p es-ctl --test multi_node_test -- --ignored --test-threads=1
 cargo +nightly llvm-cov --workspace --branch --summary-only
 ```
 
-2026-08-14 验收结果：行 `92.01%`、分支 `80.09%`、区域 `90.57%`、函数 `83.26%`。
+2026-08-15 完整 Linux workspace 验收：默认测试 646 项通过、17 项忽略。最近一次
+可采信覆盖率基线为行 `89.90%`、分支 `80.08%`、函数 `83.03%`、区域
+`87.36%`，行和分支均达到 80% 门槛。本轮 Linux 插桩测试全部通过，但 profile
+由 Rust 1.88 生成，宿主 LLVM 23 无法合并 raw format 10，因此没有用不兼容工具
+覆盖该基线。17 项忽略项包括
+14 项真实 `es-server` 多进程测试、2 项真实 `esctl` 多进程测试和 1 项真 FUSE
+挂载测试。本轮验收已包含状态真实 `mtime`、旧状态 epoch 回退、损坏时间元数据
+拒绝和 Retry 未耗尽进入 `pending_retries` 的契约断言。
 
 ```bash
 # 存储层基准
@@ -329,6 +367,8 @@ cargo bench -p es-storage
 |---|---|
 | [docs/](docs/README.md) | 文档索引（设计 + 专题） |
 | [docs/design.md](docs/design.md) | 架构设计总览：Key 编码与排序性质证明、写入路径、HLC、放置表、流路由表、gRPC 接口、测试策略 |
+| [docs/eventfs-fuse.md](docs/eventfs-fuse.md) | AggregateStore 与 eventfs-fuse 完整设计和文件契约 |
+| [docs/eventfs-fuse-self-check.md](docs/eventfs-fuse-self-check.md) | eventfs-fuse 设计自检、风险与实施门槛 |
 | [docs/esctl.md](docs/esctl.md) | esctl 完整命令手册（参数、输出格式、leader 发现策略） |
 | [docs/migrate.md](docs/migrate.md) | 在线迁移设计（状态机、幂等原语、切换窗口、断点续传）、esctl migrate / route 用法 |
 | [docs/multi_node_testing.md](docs/multi_node_testing.md) | 多节点与分区测试、集群组建流程、踩坑记录 |
@@ -367,6 +407,7 @@ cargo bench -p es-storage
 **功能**
 - [ ] Projection 机制
 - [x] 持久化拉取订阅（竞争消费者组、额度背压、租约、重试/parked、SDK 与 esctl）
+- [ ] AggregateStore 与 Linux eventfs-fuse（核心数据面和 FUSE 已实现；分区迁移数据面、真挂载 CI 与性能验收待完成）
 
 ## 已知限制
 

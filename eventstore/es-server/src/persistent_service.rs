@@ -348,8 +348,7 @@ impl EsService {
                     .copied()
                     .unwrap_or(1)
                     .max(1);
-                (generation > progress.ownership_generation)
-                    .then(|| (stream.clone(), generation))
+                (generation > progress.ownership_generation).then(|| (stream.clone(), generation))
             })
             .collect();
         if generations.is_empty() {
@@ -686,13 +685,12 @@ impl PersistentSubscriptions for EsService {
             .filter(|stream| !group.progress.contains_key(*stream))
             .cloned()
             .collect();
-        let implicit_all: BTreeSet<String> = if !target_changed
-            && matches!(target, PersistentTarget::All)
-        {
-            added.difference(&reset_streams).cloned().collect()
-        } else {
-            BTreeSet::new()
-        };
+        let implicit_all: BTreeSet<String> =
+            if !target_changed && matches!(target, PersistentTarget::All) {
+                added.difference(&reset_streams).cloned().collect()
+            } else {
+                BTreeSet::new()
+            };
         if added
             .iter()
             .any(|stream| !resets.contains_key(stream) && !implicit_all.contains(stream))

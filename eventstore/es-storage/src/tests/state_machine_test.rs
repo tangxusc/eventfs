@@ -8,6 +8,122 @@ use crate::EsResponse;
 use es_core::{ExpectedVersion, Hlc};
 use es_core::{OwnershipCommand, OwnershipOutcome};
 
+fn aggregate_event_set() -> es_core::EventSetId {
+    es_core::EventSetId::new("orders", "order").expect("合法事件集")
+}
+
+fn aggregate_event(event_id: uuid::Uuid, data: &[u8]) -> es_core::NewAggregateEvent {
+    es_core::NewAggregateEvent {
+        event_id,
+        event_type: "order.changed".into(),
+        data: data.to_vec(),
+        metadata: b"{}".to_vec(),
+    }
+}
+
+fn aggregate_fence_entry(index: u64, generation: u64) -> openraft::Entry<crate::TypeConfig> {
+    request_entry(
+        index,
+        crate::EsRequest::InstallAggregatePartitionFence {
+            event_set: aggregate_event_set(),
+            partition_id: 7,
+            generation,
+        },
+    )
+}
+
+fn aggregate_append_entry(
+    index: u64,
+    aggregate_id: &str,
+    expected_version: es_core::ExpectedAggregateVersion,
+    event: es_core::NewAggregateEvent,
+    generation: u64,
+) -> openraft::Entry<crate::TypeConfig> {
+    request_entry(
+        index,
+        crate::EsRequest::AggregateAppend {
+            event_set: aggregate_event_set(),
+            partition_id: 7,
+            partition_generation: generation,
+            aggregate_id: aggregate_id.into(),
+            expected_version,
+            event,
+            hlc: hlc(2_000 + index),
+        },
+    )
+}
+
+fn aggregate_state_entry(
+    index: u64,
+    aggregate_id: &str,
+    expected_revision: es_core::ExpectedStateRevision,
+    data: &[u8],
+) -> openraft::Entry<crate::TypeConfig> {
+    request_entry(
+        index,
+        crate::EsRequest::PutAggregateState {
+            event_set: aggregate_event_set(),
+            partition_id: 7,
+            partition_generation: 1,
+            aggregate_id: aggregate_id.into(),
+            expected_revision,
+            data: data.to_vec(),
+            hlc: hlc(3_000 + index),
+        },
+    )
+}
+
+fn aggregate_group_definition(operation_id: uuid::Uuid) -> es_core::AggregateGroupDefinition {
+    es_core::AggregateGroupDefinition {
+        event_set: aggregate_event_set(),
+        name: "workers".into(),
+        revision: 0,
+        epoch: 0,
+        start: es_core::AggregateGroupStart::Beginning,
+        partition_starts: (0..es_core::EVENT_PARTITION_COUNT)
+            .map(|partition| (partition, 0))
+            .collect(),
+        settings: es_core::AggregateGroupSettings::default(),
+        create_operation_id: operation_id,
+        last_operation_id: operation_id,
+    }
+}
+
+fn aggregate_group_candidate(
+    delivery_id: uuid::Uuid,
+    position: u64,
+    aggregate_id: &str,
+) -> es_core::AggregateDeliveryCandidate {
+    es_core::AggregateDeliveryCandidate {
+        delivery_id,
+        partition_position: position,
+        aggregate_id: aggregate_id.into(),
+        aggregate_version: position,
+        event_id: uuid::Uuid::new_v4(),
+        payload_bytes: 1,
+        replayed: false,
+    }
+}
+
+fn aggregate_group_entry(
+    index: u64,
+    command: crate::AggregateGroupPartitionCommand,
+) -> openraft::Entry<crate::TypeConfig> {
+    request_entry(
+        index,
+        crate::EsRequest::AggregateGroupPartition {
+            event_set: aggregate_event_set(),
+            partition_id: 7,
+            partition_generation: 1,
+            group_name: "workers".into(),
+            group_epoch: 1,
+            start_position: 0,
+            settings: es_core::AggregateGroupSettings::default(),
+            command,
+        },
+    )
+}
+
 fn persistent_group() -> es_core::PersistentGroup {
     es_core::PersistentGroup::new(
         "orders-workers".into(),
@@ -53,6 +169,667 @@ fn append_entry(
         *h = hlc(1000 + index);
     }
     e
+}
+
+#[tokio::test]
+async fn aggregate_instances_have_independent_versions_and_shared_partition_positions() {
+    let (mut storage, _dir) = new_storage(0);
+    let responses = storage
+        .apply(vec![
+            aggregate_fence_entry(0, 1),
+            aggregate_append_entry(
+                1,
+                "order-1",
+                es_core::ExpectedAggregateVersion::NoAggregate,
+                aggregate_event(uuid::Uuid::new_v4(), b"one-zero"),
+                1,
+            ),
+            aggregate_append_entry(
+                2,
+                "order-2",
+                es_core::ExpectedAggregateVersion::NoAggregate,
+                aggregate_event(uuid::Uuid::new_v4(), b"two-zero"),
+                1,
+            ),
+            aggregate_append_entry(
+                3,
+                "order-1",
+                es_core::ExpectedAggregateVersion::Exact(0),
+                aggregate_event(uuid::Uuid::new_v4(), b"one-one"),
+                1,
+            ),
+        ])
+        .await
+        .expect("应用聚合事件批次");
+
+    assert!(matches!(
+        responses[1],
+        crate::EsResponse::AggregateAppendOk {
+            aggregate_version: 0,
+            partition_position: 0
+        }
+    ));
+    assert!(matches!(
+        responses[2],
+        crate::EsResponse::AggregateAppendOk {
+            aggregate_version: 0,
+            partition_position: 1
+        }
+    ));
+    assert!(matches!(
+        responses[3],
+        crate::EsResponse::AggregateAppendOk {
+            aggregate_version: 1,
+            partition_position: 2
+        }
+    ));
+
+    let first = storage
+        .read_aggregate_events(&aggregate_event_set(), 7, "order-1", 0, 0)
+        .expect("读取实例一");
+    assert_eq!(
+        first
+            .iter()
+            .map(|event| event.aggregate_version)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    let partition = storage
+        .read_aggregate_partition_events(&aggregate_event_set(), 7, 0, 0)
+        .expect("读取分区");
+    assert_eq!(
+        partition
+            .iter()
+            .map(|event| (event.aggregate_id.as_str(), event.aggregate_version))
+            .collect::<Vec<_>>(),
+        vec![("order-1", 0), ("order-2", 0), ("order-1", 1)]
+    );
+}
+
+#[tokio::test]
+async fn aggregate_occ_conflict_does_not_consume_partition_position() {
+    let (mut storage, _dir) = new_storage(0);
+    let responses = storage
+        .apply(vec![
+            aggregate_fence_entry(0, 1),
+            aggregate_append_entry(
+                1,
+                "order-1",
+                es_core::ExpectedAggregateVersion::NoAggregate,
+                aggregate_event(uuid::Uuid::new_v4(), b"first"),
+                1,
+            ),
+            aggregate_append_entry(
+                2,
+                "order-1",
+                es_core::ExpectedAggregateVersion::NoAggregate,
+                aggregate_event(uuid::Uuid::new_v4(), b"conflict"),
+                1,
+            ),
+            aggregate_append_entry(
+                3,
+                "order-2",
+                es_core::ExpectedAggregateVersion::NoAggregate,
+                aggregate_event(uuid::Uuid::new_v4(), b"second"),
+                1,
+            ),
+        ])
+        .await
+        .expect("应用 OCC 批次");
+    assert!(matches!(
+        responses[2],
+        crate::EsResponse::AggregateOptimisticConflict {
+            actual_version: Some(0)
+        }
+    ));
+    assert!(matches!(
+        responses[3],
+        crate::EsResponse::AggregateAppendOk {
+            aggregate_version: 0,
+            partition_position: 1
+        }
+    ));
+}
+
+#[tokio::test]
+async fn aggregate_idempotency_detects_same_batch_and_content_conflict() {
+    let (mut storage, _dir) = new_storage(0);
+    let event_id = uuid::Uuid::new_v4();
+    let original = aggregate_event(event_id, b"original");
+    let responses = storage
+        .apply(vec![
+            aggregate_fence_entry(0, 1),
+            aggregate_append_entry(
+                1,
+                "order-1",
+                es_core::ExpectedAggregateVersion::NoAggregate,
+                original.clone(),
+                1,
+            ),
+            aggregate_append_entry(
+                2,
+                "order-1",
+                es_core::ExpectedAggregateVersion::NoAggregate,
+                original,
+                1,
+            ),
+            aggregate_append_entry(
+                3,
+                "order-1",
+                es_core::ExpectedAggregateVersion::NoAggregate,
+                aggregate_event(event_id, b"changed"),
+                1,
+            ),
+        ])
+        .await
+        .expect("应用幂等批次");
+    assert!(matches!(
+        responses[1],
+        crate::EsResponse::AggregateAppendOk {
+            aggregate_version: 0,
+            partition_position: 0
+        }
+    ));
+    assert_eq!(format!("{:?}", responses[1]), format!("{:?}", responses[2]));
+    assert!(matches!(
+        responses[3],
+        crate::EsResponse::AggregateIdempotencyConflict
+    ));
+    assert_eq!(
+        storage
+            .read_aggregate_events(&aggregate_event_set(), 7, "order-1", 0, 0)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn aggregate_partition_fence_rejects_missing_and_stale_generation() {
+    let (mut storage, _dir) = new_storage(0);
+    let responses = storage
+        .apply(vec![
+            aggregate_append_entry(
+                0,
+                "order-1",
+                es_core::ExpectedAggregateVersion::Any,
+                aggregate_event(uuid::Uuid::new_v4(), b"missing"),
+                1,
+            ),
+            aggregate_fence_entry(1, 2),
+            aggregate_append_entry(
+                2,
+                "order-1",
+                es_core::ExpectedAggregateVersion::Any,
+                aggregate_event(uuid::Uuid::new_v4(), b"stale"),
+                1,
+            ),
+        ])
+        .await
+        .expect("应用 fence 批次");
+    assert!(matches!(
+        responses[0],
+        crate::EsResponse::AggregatePartitionFenced {
+            current_generation: 0
+        }
+    ));
+    assert!(matches!(
+        responses[2],
+        crate::EsResponse::AggregatePartitionFenced {
+            current_generation: 2
+        }
+    ));
+    assert!(
+        storage
+            .read_aggregate_meta(&aggregate_event_set(), 7, "order-1")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn aggregate_state_requires_instance_and_uses_revision_cas() {
+    let (mut storage, _dir) = new_storage(0);
+    let responses = storage
+        .apply(vec![
+            aggregate_fence_entry(0, 1),
+            aggregate_state_entry(1, "missing", es_core::ExpectedStateRevision::Absent, b"{}"),
+            aggregate_append_entry(
+                2,
+                "order-1",
+                es_core::ExpectedAggregateVersion::NoAggregate,
+                aggregate_event(uuid::Uuid::new_v4(), b"created"),
+                1,
+            ),
+            aggregate_state_entry(
+                3,
+                "order-1",
+                es_core::ExpectedStateRevision::Absent,
+                b"{\"balance\":100}",
+            ),
+            aggregate_state_entry(
+                4,
+                "order-1",
+                es_core::ExpectedStateRevision::Absent,
+                b"{\"balance\":50}",
+            ),
+            aggregate_state_entry(
+                5,
+                "order-1",
+                es_core::ExpectedStateRevision::Exact(0),
+                b"{\"balance\":50}",
+            ),
+        ])
+        .await
+        .expect("应用状态批次");
+    assert!(matches!(responses[1], crate::EsResponse::AggregateNotFound));
+    assert!(matches!(
+        responses[3],
+        crate::EsResponse::AggregateStateStored {
+            state: es_core::AggregateStateDocument { revision: 0, .. }
+        }
+    ));
+    assert!(matches!(
+        responses[4],
+        crate::EsResponse::AggregateStateConflict {
+            actual_revision: Some(0)
+        }
+    ));
+    assert!(matches!(
+        responses[5],
+        crate::EsResponse::AggregateStateStored {
+            state: es_core::AggregateStateDocument { revision: 1, .. }
+        }
+    ));
+    assert_eq!(
+        storage
+            .read_aggregate_state(&aggregate_event_set(), 7, "order-1")
+            .unwrap()
+            .unwrap(),
+        es_core::AggregateState {
+            revision: 1,
+            data: b"{\"balance\":50}".to_vec()
+        }
+    );
+    assert_eq!(
+        storage
+            .read_aggregate_state_document(&aggregate_event_set(), 7, "order-1")
+            .unwrap()
+            .unwrap(),
+        es_core::AggregateStateDocument {
+            revision: 1,
+            data: b"{\"balance\":50}".to_vec(),
+            modified_hlc: hlc(3_005),
+        }
+    );
+}
+
+#[tokio::test]
+async fn aggregate_state_without_modified_metadata_reads_epoch() {
+    let (storage, _dir) = new_storage(0);
+    let state = es_core::AggregateState {
+        revision: 4,
+        data: b"legacy".to_vec(),
+    };
+    storage
+        .set(
+            &crate::key::sm_aggregate_state(0, &aggregate_event_set(), 7, "order-legacy"),
+            &crate::encode::encode(&state).expect("编码旧状态"),
+        )
+        .await
+        .expect("写入旧状态值");
+
+    assert_eq!(
+        storage
+            .read_aggregate_state_document(&aggregate_event_set(), 7, "order-legacy")
+            .expect("读取旧状态")
+            .expect("旧状态存在"),
+        es_core::AggregateStateDocument {
+            revision: 4,
+            data: b"legacy".to_vec(),
+            modified_hlc: hlc(0),
+        }
+    );
+    assert_eq!(
+        storage
+            .list_aggregate_partition_states(&aggregate_event_set(), 7, None, 10)
+            .expect("列出旧状态"),
+        vec![(
+            "order-legacy".to_string(),
+            es_core::AggregateStateDocument {
+                revision: 4,
+                data: b"legacy".to_vec(),
+                modified_hlc: hlc(0),
+            },
+        )]
+    );
+
+    storage
+        .set(
+            &crate::key::sm_aggregate_state_modified(0, &aggregate_event_set(), 7, "order-legacy"),
+            b"truncated-hlc",
+        )
+        .await
+        .expect("写入损坏的状态时间");
+    assert!(
+        storage
+            .read_aggregate_state_document(&aggregate_event_set(), 7, "order-legacy")
+            .is_err(),
+        "单状态读取必须拒绝损坏的时间元数据"
+    );
+    assert!(
+        storage
+            .list_aggregate_partition_states(&aggregate_event_set(), 7, None, 10)
+            .is_err(),
+        "状态列表必须拒绝损坏的时间元数据"
+    );
+}
+
+#[tokio::test]
+async fn aggregate_catalog_same_batch_create_activate_is_persisted() {
+    let (mut storage, _dir) = new_storage(0);
+    let operation_id = uuid::Uuid::new_v4();
+    let placements = (0..es_core::EVENT_PARTITION_COUNT)
+        .map(|partition| (partition, u64::from(partition % 2)))
+        .collect();
+    let responses = storage
+        .apply(vec![
+            request_entry(
+                0,
+                crate::EsRequest::CommitAggregateCatalog {
+                    command: es_core::AggregateCatalogCommand::Create {
+                        event_set: aggregate_event_set(),
+                        operation_id,
+                        seed: [9; 16],
+                        placements,
+                    },
+                },
+            ),
+            request_entry(
+                1,
+                crate::EsRequest::CommitAggregateCatalog {
+                    command: es_core::AggregateCatalogCommand::Activate {
+                        event_set: aggregate_event_set(),
+                        operation_id,
+                    },
+                },
+            ),
+        ])
+        .await
+        .expect("应用 catalog 批次");
+    assert!(matches!(
+        responses[1],
+        crate::EsResponse::AggregateCatalogApplied(es_core::AggregateCatalogApply {
+            revision: 2,
+            outcome: es_core::AggregateCatalogOutcome::EventSet {
+                event_set: es_core::AggregateEventSet {
+                    status: es_core::EventSetStatus::Active,
+                    ..
+                },
+                ..
+            }
+        })
+    ));
+    let catalog = storage.read_aggregate_catalog().expect("读取 catalog");
+    assert_eq!(catalog.revision, 2);
+    assert_eq!(
+        catalog.event_sets[&aggregate_event_set()].status,
+        es_core::EventSetStatus::Active
+    );
+}
+
+#[tokio::test]
+async fn aggregate_group_catalog_and_partition_progress_are_raft_persisted() {
+    let (mut storage, _dir) = new_storage(0);
+    let operation_id = uuid::Uuid::new_v4();
+    let first_id = uuid::Uuid::new_v4();
+    let blocked_same_instance_id = uuid::Uuid::new_v4();
+    let other_id = uuid::Uuid::new_v4();
+    let responses = storage
+        .apply(vec![
+            aggregate_fence_entry(0, 1),
+            request_entry(
+                1,
+                crate::EsRequest::CommitAggregateGroupCatalog {
+                    command: es_core::AggregateGroupCatalogCommand::Create {
+                        definition: aggregate_group_definition(operation_id),
+                        partition_count: es_core::EVENT_PARTITION_COUNT,
+                    },
+                },
+            ),
+            aggregate_group_entry(
+                2,
+                crate::AggregateGroupPartitionCommand::Claim {
+                    consumer_id: "consumer-a".into(),
+                    now_ms: 10,
+                    deadline_ms: 20,
+                    max_claim: 8,
+                    max_bytes: 1024,
+                    candidates: vec![
+                        aggregate_group_candidate(first_id, 0, "order-1"),
+                        aggregate_group_candidate(blocked_same_instance_id, 1, "order-1"),
+                        aggregate_group_candidate(other_id, 2, "order-2"),
+                    ],
+                },
+            ),
+        ])
+        .await
+        .expect("应用组创建与 claim");
+    assert!(matches!(
+        &responses[1],
+        crate::EsResponse::AggregateGroupCatalogApplied(es_core::AggregateGroupCatalogApply {
+            outcome: es_core::AggregateGroupCatalogOutcome::Group(definition),
+            ..
+        }) if definition.revision == 1 && definition.epoch == 1
+    ));
+    assert!(matches!(
+        &responses[2],
+        crate::EsResponse::AggregateGroupClaimed(deliveries)
+            if deliveries.len() == 2
+                && deliveries.iter().all(|delivery| delivery.delivery_id != blocked_same_instance_id)
+    ));
+
+    storage
+        .apply(vec![aggregate_group_entry(
+            3,
+            crate::AggregateGroupPartitionCommand::Settle {
+                consumer_id: "consumer-a".into(),
+                now_ms: 11,
+                settlements: vec![es_core::AggregateSettlement {
+                    delivery_id: other_id,
+                    action: es_core::AggregateSettlementAction::Ack,
+                    reason: String::new(),
+                }],
+            },
+        )])
+        .await
+        .expect("乱序 Ack");
+    let progress = storage
+        .read_aggregate_group_partition(&aggregate_event_set(), 7, "workers")
+        .expect("读取组分区")
+        .expect("组分区已惰性创建");
+    assert_eq!(progress.next_position, 0);
+    assert_eq!(
+        progress.resolved_gaps,
+        std::collections::BTreeSet::from([2])
+    );
+
+    storage
+        .apply(vec![aggregate_group_entry(
+            4,
+            crate::AggregateGroupPartitionCommand::Settle {
+                consumer_id: "consumer-a".into(),
+                now_ms: 12,
+                settlements: vec![es_core::AggregateSettlement {
+                    delivery_id: first_id,
+                    action: es_core::AggregateSettlementAction::Ack,
+                    reason: String::new(),
+                }],
+            },
+        )])
+        .await
+        .expect("补齐低位 Ack");
+    let progress = storage
+        .read_aggregate_group_partition(&aggregate_event_set(), 7, "workers")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        progress.next_position, 1,
+        "位置 1 尚未投递，checkpoint 不能越过"
+    );
+    assert_eq!(
+        progress.resolved_gaps,
+        std::collections::BTreeSet::from([2])
+    );
+    assert_eq!(
+        storage
+            .read_aggregate_group_catalog()
+            .expect("读取组 catalog")
+            .groups
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn aggregate_append_broadcasts_only_after_commit() {
+    let (mut storage, _dir) = new_storage(0);
+    let mut receiver = storage.subscribe_aggregate_events();
+    storage
+        .apply(vec![
+            aggregate_fence_entry(0, 1),
+            aggregate_append_entry(
+                1,
+                "order-1",
+                es_core::ExpectedAggregateVersion::NoAggregate,
+                aggregate_event(uuid::Uuid::new_v4(), b"created"),
+                1,
+            ),
+        ])
+        .await
+        .expect("追加聚合事件");
+    let event = receiver.recv().await.expect("接收聚合事件");
+    assert_eq!(event.aggregate_id, "order-1");
+    assert_eq!(event.aggregate_version, 0);
+    assert_eq!(event.partition_position, 0);
+}
+
+#[tokio::test]
+async fn aggregate_data_and_idempotency_survive_storage_reopen() {
+    let dir = tempfile::tempdir().expect("建临时目录");
+    let path = dir.path().to_path_buf();
+    let snapshots = path.join("snapshots");
+    let event_id = uuid::Uuid::new_v4();
+    let event = aggregate_event(event_id, b"created");
+    let tree = std::sync::Arc::new(
+        surrealkv::TreeBuilder::new()
+            .with_path(path.clone())
+            .build()
+            .expect("打开 tree"),
+    );
+    let mut storage = crate::EsStorage::new(
+        0,
+        tree,
+        crate::snapshot::SnapshotConfig {
+            dir: snapshots.clone(),
+            ..Default::default()
+        },
+    )
+    .expect("创建存储");
+    storage
+        .apply(vec![
+            aggregate_fence_entry(0, 1),
+            aggregate_append_entry(
+                1,
+                "order-1",
+                es_core::ExpectedAggregateVersion::NoAggregate,
+                event.clone(),
+                1,
+            ),
+            aggregate_state_entry(
+                2,
+                "order-1",
+                es_core::ExpectedStateRevision::Absent,
+                b"{\"balance\":100}",
+            ),
+        ])
+        .await
+        .expect("写入聚合数据");
+    storage.close().await.expect("关闭存储");
+    drop(storage);
+
+    let tree = std::sync::Arc::new(
+        surrealkv::TreeBuilder::new()
+            .with_path(path)
+            .build()
+            .expect("重开 tree"),
+    );
+    let mut reopened = crate::EsStorage::new(
+        0,
+        tree,
+        crate::snapshot::SnapshotConfig {
+            dir: snapshots,
+            ..Default::default()
+        },
+    )
+    .expect("重建存储");
+    assert_eq!(
+        reopened
+            .read_aggregate_meta(&aggregate_event_set(), 7, "order-1")
+            .unwrap(),
+        Some(es_core::AggregateMeta { current_version: 0 })
+    );
+    assert_eq!(
+        reopened
+            .read_aggregate_state(&aggregate_event_set(), 7, "order-1")
+            .unwrap()
+            .unwrap()
+            .revision,
+        0
+    );
+    assert_eq!(
+        reopened
+            .read_aggregate_state_document(&aggregate_event_set(), 7, "order-1")
+            .unwrap()
+            .unwrap()
+            .modified_hlc,
+        hlc(3_002)
+    );
+
+    let responses = reopened
+        .apply(vec![
+            aggregate_append_entry(
+                3,
+                "order-1",
+                es_core::ExpectedAggregateVersion::NoAggregate,
+                event,
+                1,
+            ),
+            aggregate_append_entry(
+                4,
+                "order-2",
+                es_core::ExpectedAggregateVersion::NoAggregate,
+                aggregate_event(uuid::Uuid::new_v4(), b"second"),
+                1,
+            ),
+        ])
+        .await
+        .expect("重开后重试并追加");
+    assert!(matches!(
+        responses[0],
+        crate::EsResponse::AggregateAppendOk {
+            aggregate_version: 0,
+            partition_position: 0
+        }
+    ));
+    assert!(matches!(
+        responses[1],
+        crate::EsResponse::AggregateAppendOk {
+            aggregate_version: 0,
+            partition_position: 1
+        }
+    ));
+    reopened.close().await.expect("关闭重开存储");
 }
 
 #[tokio::test]
@@ -186,7 +963,10 @@ async fn persistent_subscription_reconciles_ownership_generation_idempotently() 
         .read_persistent_group("orders-workers")
         .expect("读取对账后的组")
         .expect("组存在");
-    assert_eq!(stored.progress["orders/1"], es_core::StreamProgress::new(0, 2));
+    assert_eq!(
+        stored.progress["orders/1"],
+        es_core::StreamProgress::new(0, 2)
+    );
     assert!(stored.deliveries.is_empty());
     assert_eq!(stored.revision, 2, "相同 generation 重放必须幂等");
 }
@@ -842,6 +1622,47 @@ async fn snapshot_roundtrip_preserves_persistent_subscription() {
         .expect("读取快照中的组")
         .expect("快照应包含组");
     assert_eq!(restored, persistent_group());
+}
+
+#[tokio::test]
+async fn snapshot_roundtrip_preserves_aggregate_state_modified_time() {
+    use openraft::RaftSnapshotBuilder;
+
+    let (mut src, _src_dir) = new_storage(0);
+    src.apply(vec![
+        aggregate_fence_entry(0, 1),
+        aggregate_append_entry(
+            1,
+            "order-1",
+            es_core::ExpectedAggregateVersion::NoAggregate,
+            aggregate_event(uuid::Uuid::new_v4(), b"created"),
+            1,
+        ),
+        aggregate_state_entry(
+            2,
+            "order-1",
+            es_core::ExpectedStateRevision::Absent,
+            br#"{"balance":50}"#,
+        ),
+    ])
+    .await
+    .expect("写入聚合状态");
+    let snapshot = src.build_snapshot().await.expect("构建快照");
+
+    let (mut dst, _dst_dir) = new_storage(0);
+    dst.install_snapshot(&snapshot.meta, snapshot.snapshot)
+        .await
+        .expect("安装快照");
+    assert_eq!(
+        dst.read_aggregate_state_document(&aggregate_event_set(), 7, "order-1")
+            .expect("读取快照状态")
+            .expect("快照包含状态"),
+        es_core::AggregateStateDocument {
+            revision: 0,
+            data: br#"{"balance":50}"#.to_vec(),
+            modified_hlc: hlc(3_002),
+        }
+    );
 }
 
 #[tokio::test]

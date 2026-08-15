@@ -112,6 +112,44 @@ esctl persistent replay <GROUP>
 `retry` 保留 checkpoint，`park`/`skip`/`ack` 解决主队列位置；parked 重放可能晚于更新事件，
 响应以 `replayed=true` 标识。组更新和删除使用 revision CAS，reset 必须逐 Stream 显式给起点。
 
+### AggregateStore
+
+```bash
+esctl aggregate capabilities
+esctl aggregate create <BUSINESS_SPACE> <AGGREGATE_TYPE> [--operation-id <UUID>]
+esctl aggregate list
+esctl aggregate get <BUSINESS_SPACE> <AGGREGATE_TYPE>
+esctl aggregate append <BUSINESS_SPACE> <AGGREGATE_TYPE> <AGGREGATE_ID> \
+  --event-type <TYPE> (--data <JSON> | --data-file <PATH>) \
+  [--expected-version any|no-aggregate|exists|<N>] [--event-id <UUID>]
+esctl aggregate follow <BUSINESS_SPACE> <AGGREGATE_TYPE> [--now | --cursor <HEX>] [--once]
+
+esctl aggregate state list <BUSINESS_SPACE> <AGGREGATE_TYPE> [--page-size <N>] [--page-token <HEX>]
+esctl aggregate state get <BUSINESS_SPACE> <AGGREGATE_TYPE> <AGGREGATE_ID>
+esctl aggregate state put <BUSINESS_SPACE> <AGGREGATE_TYPE> <AGGREGATE_ID> \
+  (--data <JSON> | --data-file <PATH>) --expected-revision absent|<N>
+
+esctl aggregate group create <BUSINESS_SPACE> <AGGREGATE_TYPE> <GROUP> [--now]
+esctl aggregate group update <BUSINESS_SPACE> <AGGREGATE_TYPE> <GROUP> \
+  --expected-revision <REV> [--reset-beginning | --reset-now]
+esctl aggregate group delete <BUSINESS_SPACE> <AGGREGATE_TYPE> <GROUP> \
+  --expected-revision <REV>
+esctl aggregate group list <BUSINESS_SPACE> <AGGREGATE_TYPE>
+esctl aggregate group fetch <BUSINESS_SPACE> <AGGREGATE_TYPE> <GROUP> \
+  --consumer <ID> [--max-events <N>] [--max-bytes <N>] [--wait-ms <N>]
+esctl aggregate group settle <BUSINESS_SPACE> <AGGREGATE_TYPE> <GROUP> \
+  --consumer <ID> --delivery <HEX> --action ack|retry|park|skip [--reason <TEXT>]
+
+esctl aggregate status
+esctl aggregate partitions <BUSINESS_SPACE> <AGGREGATE_TYPE>
+```
+
+事件集只按 `(business_space, aggregate_type)` 建立，聚合实例 ID 位于事件内容或状态路径中。
+同一实例使用 `aggregate_version` 做 OCC，不同实例不共享版本。`follow` 的 cursor 和消费者组
+`delivery` 都是不透明十六进制 token，只能原样回传。组 settings 更新只增加 revision；只有
+`--reset-beginning` 或 `--reset-now` 才提升 epoch 并使旧 delivery 失效。模糊重试 create、update
+或 delete 时应显式复用同一个 `--operation-id`。
+
 ### 管理面
 
 ```

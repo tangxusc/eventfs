@@ -66,7 +66,10 @@ mod tests {
     fn stream_meta_new_and_default_version_zero() {
         assert_eq!(StreamMeta::new().current_version, 0);
         assert_eq!(StreamMeta::default().current_version, 0);
-        assert_eq!(StreamMeta::default().current_version, StreamMeta::new().current_version);
+        assert_eq!(
+            StreamMeta::default().current_version,
+            StreamMeta::new().current_version
+        );
     }
 
     #[test]

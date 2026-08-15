@@ -14,7 +14,7 @@ mod tests;
 
 pub use key::*;
 pub use raft_type::{
-    EsRequest, EsResponse, PersistentSubscriptionCommand, PersistentSubscriptionResponse,
-    TypeConfig,
+    AggregateGroupPartitionCommand, EsRequest, EsResponse, PersistentSubscriptionCommand,
+    PersistentSubscriptionResponse, TypeConfig,
 };
 pub use storage::EsStorage;

@@ -74,6 +74,11 @@ impl ClusterClient {
         &self.endpoints
     }
 
+    /// 当前 HTTPS 客户端信任策略，供同进程的专用 SDK 复用。
+    pub fn tls(&self) -> Option<&TlsClientConfig> {
+        self.tls.as_ref()
+    }
+
     /// 从轮询游标开始的端点顺序（每次调用起点后移一位，负载分散）。
     /// pub(crate)：init 等命令需按此顺序逐端点尝试。
     pub(crate) fn rotated_endpoints(&self) -> Vec<String> {

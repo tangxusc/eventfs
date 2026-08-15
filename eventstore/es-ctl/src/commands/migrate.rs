@@ -19,7 +19,7 @@
 
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 
 use es_proto::eventstore::migration_client::MigrationClient;
 use es_proto::eventstore::*;

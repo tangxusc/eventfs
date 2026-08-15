@@ -8,6 +8,7 @@ use crate::client::ClusterClient;
 use crate::output;
 use crate::shards::{ShardScope, resolve_shard_scope};
 
+pub mod aggregate;
 pub mod append;
 pub mod create_stream;
 pub mod init;

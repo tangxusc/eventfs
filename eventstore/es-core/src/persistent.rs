@@ -830,27 +830,33 @@ mod tests {
             assert!(settings.validate().is_err());
         }
 
-        assert!(PersistentGroup::new(
-            "all".into(),
-            PersistentTarget::All,
-            PersistentSettings::default(),
-            BTreeMap::new(),
-        )
-        .is_ok());
-        assert!(PersistentGroup::new(
-            "empty".into(),
-            PersistentTarget::Streams(BTreeSet::new()),
-            PersistentSettings::default(),
-            BTreeMap::new(),
-        )
-        .is_err());
-        assert!(PersistentGroup::new(
-            "missing-progress".into(),
-            PersistentTarget::Streams(BTreeSet::from(["s".into()])),
-            PersistentSettings::default(),
-            BTreeMap::new(),
-        )
-        .is_err());
+        assert!(
+            PersistentGroup::new(
+                "all".into(),
+                PersistentTarget::All,
+                PersistentSettings::default(),
+                BTreeMap::new(),
+            )
+            .is_ok()
+        );
+        assert!(
+            PersistentGroup::new(
+                "empty".into(),
+                PersistentTarget::Streams(BTreeSet::new()),
+                PersistentSettings::default(),
+                BTreeMap::new(),
+            )
+            .is_err()
+        );
+        assert!(
+            PersistentGroup::new(
+                "missing-progress".into(),
+                PersistentTarget::Streams(BTreeSet::from(["s".into()])),
+                PersistentSettings::default(),
+                BTreeMap::new(),
+            )
+            .is_err()
+        );
 
         for name in ["", &"x".repeat(129), "contains/slash"] {
             assert!(validate_group_name(name).is_err());
@@ -875,10 +881,7 @@ mod tests {
             BTreeMap::new(),
         )
         .unwrap();
-        assert!(all.ensure_streams(BTreeMap::from([(
-            "new".into(),
-            StreamProgress::new(0, 1),
-        )])));
+        assert!(all.ensure_streams(BTreeMap::from([("new".into(), StreamProgress::new(0, 1),)])));
     }
 
     #[test]
@@ -932,14 +935,21 @@ mod tests {
         let mut replayed = candidate(1);
         replayed.replayed = true;
         assert!(filtered.claim("a", 1, 2, vec![replayed]).is_empty());
-        filtered.progress.get_mut("s").unwrap().resolved_gaps.insert(1);
+        filtered
+            .progress
+            .get_mut("s")
+            .unwrap()
+            .resolved_gaps
+            .insert(1);
         assert!(filtered.claim("a", 1, 2, vec![candidate(1)]).is_empty());
 
         let mut duplicate_version = group();
         duplicate_version.claim("a", 1, 10, vec![candidate(0)]);
-        assert!(duplicate_version
-            .claim("a", 1, 10, vec![candidate(0)])
-            .is_empty());
+        assert!(
+            duplicate_version
+                .claim("a", 1, 10, vec![candidate(0)])
+                .is_empty()
+        );
     }
 
     #[test]

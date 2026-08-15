@@ -107,7 +107,11 @@ pub async fn run_all(ctx: &Ctx, args: &ReadAllArgs) -> Result<()> {
     let count = events.len();
     if args.max_count > 0 && count as u64 >= args.max_count {
         // 反向读尽的分片（ended=true）不再有更早事件，从续读提示中剔除
-        let active: Vec<ShardPosition> = next_positions.iter().filter(|sp| !sp.ended).cloned().collect();
+        let active: Vec<ShardPosition> = next_positions
+            .iter()
+            .filter(|sp| !sp.ended)
+            .cloned()
+            .collect();
         if !active.is_empty() {
             let next: Vec<(u64, u64)> = active
                 .iter()
@@ -119,7 +123,8 @@ pub async fn run_all(ctx: &Ctx, args: &ReadAllArgs) -> Result<()> {
                     let mut value: serde_json::Value =
                         serde_json::from_str(&commands::render_events(ctx.format, &events))
                             .context("解析 JSON")?;
-                    let next_text: Vec<String> = next.iter().map(|(s, p)| format!("{s}:{p}")).collect();
+                    let next_text: Vec<String> =
+                        next.iter().map(|(s, p)| format!("{s}:{p}")).collect();
                     if let serde_json::Value::Object(ref mut obj) = value {
                         obj.insert("next_from_positions".into(), serde_json::json!(next_text));
                     }

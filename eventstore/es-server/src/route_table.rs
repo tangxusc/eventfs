@@ -10,8 +10,8 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use es_core::route::RouteTable;
 use es_core::Owner;
+use es_core::route::RouteTable;
 use es_proto::eventstore::migration_client::MigrationClient;
 use es_proto::eventstore::{GetRouteTableRequest, PushRouteTableRequest};
 use es_proto::tls::TlsClientConfig;
@@ -471,7 +471,7 @@ mod tests {
         mgr.allocate("e").await.expect("e"); // shard 0: 5
         mgr.allocate("f").await.expect("f"); // shard 0: 6
         mgr.allocate("g").await.expect("g"); // shard 0: 7
-                                             // shard 0 有 7 个，shard 1/2 有 0 个 → 下一个去 shard 1
+        // shard 0 有 7 个，shard 1/2 有 0 个 → 下一个去 shard 1
         let (shard, _) = mgr.allocate("h").await.expect("h");
         assert_eq!(shard, 1);
     }

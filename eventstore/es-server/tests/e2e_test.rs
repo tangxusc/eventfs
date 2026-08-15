@@ -3,6 +3,11 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+use es_proto::eventstore::aggregate_store_client::AggregateStoreClient;
+use es_proto::eventstore::aggregate_store_internal_server::{
+    AggregateStoreInternal, AggregateStoreInternalServer,
+};
+use es_proto::eventstore::aggregate_store_server::AggregateStoreServer;
 use es_proto::eventstore::event_store_server::EventStoreServer;
 use es_proto::eventstore::internal_subscription_client::InternalSubscriptionClient;
 use es_proto::eventstore::internal_subscription_server::InternalSubscriptionServer;
@@ -16,6 +21,7 @@ use es_server::Server;
 use es_server::config::{
     Config, NodeConfig, PeerConfig, PlacementConfig, PlacementNode, StorageConfig,
 };
+use tokio_stream::StreamExt;
 
 async fn wait_shard_leader(server: &Server, shard_id: u64) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -107,10 +113,16 @@ async fn start_test_server() -> (
         &config,
     )
     .expect("创建服务");
+    let aggregate_service = es_server::aggregate_service::AggregateStoreService::new(
+        server.shard_manager().clone(),
+        &config,
+    )
+    .expect("创建聚合服务");
     let handle = tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
             .add_service(EventStoreServer::new(service.clone()))
             .add_service(PersistentSubscriptionsServer::new(service))
+            .add_service(AggregateStoreServer::new(aggregate_service))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await;
     });
@@ -281,6 +293,16 @@ async fn start_two_shard_servers() -> (
         second.shard_manager().clone(),
         second.ownership().clone(),
     );
+    let first_aggregate = es_server::aggregate_service::AggregateStoreService::new(
+        first.shard_manager().clone(),
+        &first_config,
+    )
+    .expect("节点一聚合服务");
+    let second_aggregate = es_server::aggregate_service::AggregateStoreService::new(
+        second.shard_manager().clone(),
+        &second_config,
+    )
+    .expect("节点二聚合服务");
     let first_handle = tokio::spawn(async move {
         let _ = tokio::try_join!(
             tonic::transport::Server::builder()
@@ -288,12 +310,14 @@ async fn start_two_shard_servers() -> (
                 .add_service(PersistentSubscriptionsServer::new(first_service.clone()))
                 .add_service(RaftAdminServer::new(first_admin))
                 .add_service(MigrationServer::new(first_migration.clone()))
+                .add_service(AggregateStoreServer::new(first_aggregate.clone()))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
                     first_listener
                 )),
             tonic::transport::Server::builder()
                 .add_service(InternalSubscriptionServer::new(first_service))
                 .add_service(OwnershipInternalServer::new(first_migration))
+                .add_service(AggregateStoreInternalServer::new(first_aggregate))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
                     first_internal_listener
                 )),
@@ -306,12 +330,14 @@ async fn start_two_shard_servers() -> (
                 .add_service(PersistentSubscriptionsServer::new(second_service.clone()))
                 .add_service(RaftAdminServer::new(second_admin))
                 .add_service(MigrationServer::new(second_migration.clone()))
+                .add_service(AggregateStoreServer::new(second_aggregate.clone()))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
                     second_listener
                 )),
             tonic::transport::Server::builder()
                 .add_service(InternalSubscriptionServer::new(second_service))
                 .add_service(OwnershipInternalServer::new(second_migration))
+                .add_service(AggregateStoreInternalServer::new(second_aggregate))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
                     second_internal_listener
                 )),
@@ -443,7 +469,10 @@ fn persistent_streams_target(stream_ids: &[&str]) -> PersistentSubscriptionTarge
     PersistentSubscriptionTarget {
         target: Some(persistent_subscription_target::Target::Streams(
             SubscribeStreams {
-                stream_ids: stream_ids.iter().map(|stream| (*stream).to_string()).collect(),
+                stream_ids: stream_ids
+                    .iter()
+                    .map(|stream| (*stream).to_string())
+                    .collect(),
             },
         )),
     }
@@ -512,6 +541,1814 @@ async fn wait_route_projection(server: &Server, stream: &str, expected_shard: u6
         Some(expected_shard),
         "兼容路由投影未在时限内收敛: stream={stream}"
     );
+}
+
+fn aggregate_event_set() -> Option<AggregateEventSetRef> {
+    Some(AggregateEventSetRef {
+        business_space: "orders".into(),
+        aggregate_type: "order".into(),
+    })
+}
+
+fn aggregate_event(data: &[u8]) -> NewAggregateEvent {
+    NewAggregateEvent {
+        event_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+        event_type: "order.changed".into(),
+        data: data.to_vec(),
+        metadata: Vec::new(),
+    }
+}
+
+fn aggregate_no_instance() -> Option<ExpectedAggregateVersion> {
+    Some(ExpectedAggregateVersion {
+        kind: Some(expected_aggregate_version::Kind::NoAggregate(Empty {})),
+    })
+}
+
+fn aggregate_exact(version: u64) -> Option<ExpectedAggregateVersion> {
+    Some(ExpectedAggregateVersion {
+        kind: Some(expected_aggregate_version::Kind::Exact(version)),
+    })
+}
+
+fn aggregate_group_settings(
+    ack_timeout_ms: u64,
+    max_retries: u32,
+) -> Option<AggregateGroupSettings> {
+    Some(AggregateGroupSettings {
+        max_unacked_per_consumer: 8,
+        max_unacked_per_group: 16,
+        ack_timeout_ms,
+        max_retries,
+        retry_min_ms: 1,
+        retry_max_ms: 1,
+    })
+}
+
+fn assert_grpc_code<T>(
+    result: Result<tonic::Response<T>, tonic::Status>,
+    expected: tonic::Code,
+    context: &str,
+) {
+    match result {
+        Ok(_) => panic!("{context}: 请求意外成功"),
+        Err(status) => assert_eq!(status.code(), expected, "{context}: {status}"),
+    }
+}
+
+#[tokio::test]
+async fn aggregate_public_api_validates_catalog_events_cursors_and_states() {
+    let (addr, handle, server, _dir) = start_test_server().await;
+    let mut client = AggregateStoreClient::connect(addr)
+        .await
+        .expect("连接聚合服务");
+    let capabilities = client
+        .get_aggregate_store_capabilities(GetAggregateStoreCapabilitiesRequest {})
+        .await
+        .expect("读取服务限制")
+        .into_inner();
+
+    assert_grpc_code(
+        client
+            .create_event_set(CreateEventSetRequest {
+                event_set: None,
+                operation_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+            })
+            .await,
+        tonic::Code::InvalidArgument,
+        "缺失事件集",
+    );
+    assert_grpc_code(
+        client
+            .create_event_set(CreateEventSetRequest {
+                event_set: aggregate_event_set(),
+                operation_id: vec![0; 15],
+            })
+            .await,
+        tonic::Code::InvalidArgument,
+        "非法创建 operation_id",
+    );
+
+    let operation_id = uuid::Uuid::new_v4().as_bytes().to_vec();
+    client
+        .create_event_set(CreateEventSetRequest {
+            event_set: aggregate_event_set(),
+            operation_id: operation_id.clone(),
+        })
+        .await
+        .expect("创建事件集");
+    client
+        .create_event_set(CreateEventSetRequest {
+            event_set: aggregate_event_set(),
+            operation_id,
+        })
+        .await
+        .expect("相同 operation_id 幂等创建");
+    assert_grpc_code(
+        client
+            .create_event_set(CreateEventSetRequest {
+                event_set: aggregate_event_set(),
+                operation_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+            })
+            .await,
+        tonic::Code::AlreadyExists,
+        "不同 operation_id 重复创建",
+    );
+
+    assert_eq!(
+        client
+            .list_event_sets(ListEventSetsRequest {})
+            .await
+            .expect("列出事件集")
+            .into_inner()
+            .event_sets
+            .len(),
+        1
+    );
+    client
+        .get_event_set(GetEventSetRequest {
+            event_set: aggregate_event_set(),
+        })
+        .await
+        .expect("读取事件集");
+    client
+        .list_aggregate_partitions(ListAggregatePartitionsRequest {
+            event_set: aggregate_event_set(),
+        })
+        .await
+        .expect("列出聚合分区");
+    let status = client
+        .get_aggregate_store_status(GetAggregateStoreStatusRequest {})
+        .await
+        .expect("读取聚合服务状态")
+        .into_inner();
+    assert_eq!(status.active_event_set_count, 1);
+
+    let missing_event_set = Some(AggregateEventSetRef {
+        business_space: "orders".into(),
+        aggregate_type: "missing".into(),
+    });
+    assert_grpc_code(
+        client
+            .get_event_set(GetEventSetRequest {
+                event_set: missing_event_set.clone(),
+            })
+            .await,
+        tonic::Code::NotFound,
+        "读取不存在事件集",
+    );
+    assert_grpc_code(
+        client
+            .list_aggregate_partitions(ListAggregatePartitionsRequest {
+                event_set: missing_event_set,
+            })
+            .await,
+        tonic::Code::NotFound,
+        "列出不存在事件集分区",
+    );
+
+    let append =
+        |aggregate_id: &str, event: Option<NewAggregateEvent>| AppendAggregateEventRequest {
+            event_set: aggregate_event_set(),
+            aggregate_id: aggregate_id.into(),
+            expected_version: aggregate_no_instance(),
+            event,
+        };
+    assert_grpc_code(
+        client
+            .append_aggregate_event(append("", Some(aggregate_event(b"{}"))))
+            .await,
+        tonic::Code::InvalidArgument,
+        "空 aggregate_id",
+    );
+    assert_grpc_code(
+        client.append_aggregate_event(append("order-1", None)).await,
+        tonic::Code::InvalidArgument,
+        "缺失事件",
+    );
+    let mut oversized = aggregate_event(b"{}");
+    oversized.data = vec![0; capabilities.max_event_bytes as usize + 1];
+    assert_grpc_code(
+        client
+            .append_aggregate_event(append("order-1", Some(oversized)))
+            .await,
+        tonic::Code::FailedPrecondition,
+        "事件 payload 超限",
+    );
+    let mut invalid_event_id = aggregate_event(b"{}");
+    invalid_event_id.event_id = vec![0; 15];
+    assert_grpc_code(
+        client
+            .append_aggregate_event(append("order-1", Some(invalid_event_id)))
+            .await,
+        tonic::Code::InvalidArgument,
+        "非法 event_id",
+    );
+    let mut empty_event_type = aggregate_event(b"{}");
+    empty_event_type.event_type.clear();
+    assert_grpc_code(
+        client
+            .append_aggregate_event(append("order-1", Some(empty_event_type)))
+            .await,
+        tonic::Code::InvalidArgument,
+        "空 event_type",
+    );
+
+    for aggregate_id in ["order-1", "order-2"] {
+        client
+            .append_aggregate_event(append(aggregate_id, Some(aggregate_event(b"{}"))))
+            .await
+            .expect("追加分页测试事件");
+        client
+            .put_aggregate_state(PutAggregateStateRequest {
+                event_set: aggregate_event_set(),
+                aggregate_id: aggregate_id.into(),
+                expected_revision: Some(ExpectedStateRevision {
+                    kind: Some(expected_state_revision::Kind::Absent(Empty {})),
+                }),
+                data: aggregate_id.as_bytes().to_vec(),
+            })
+            .await
+            .expect("写入分页测试状态");
+    }
+    assert_grpc_code(
+        client
+            .put_aggregate_state(PutAggregateStateRequest {
+                event_set: aggregate_event_set(),
+                aggregate_id: "order-1".into(),
+                expected_revision: None,
+                data: b"{}".to_vec(),
+            })
+            .await,
+        tonic::Code::InvalidArgument,
+        "缺失状态 expected_revision",
+    );
+    assert_grpc_code(
+        client
+            .put_aggregate_state(PutAggregateStateRequest {
+                event_set: aggregate_event_set(),
+                aggregate_id: "order-1".into(),
+                expected_revision: Some(ExpectedStateRevision {
+                    kind: Some(expected_state_revision::Kind::Exact(0)),
+                }),
+                data: vec![0; capabilities.max_state_bytes as usize + 1],
+            })
+            .await,
+        tonic::Code::FailedPrecondition,
+        "状态 payload 超限",
+    );
+    assert_grpc_code(
+        client
+            .get_aggregate_state(GetAggregateStateRequest {
+                event_set: aggregate_event_set(),
+                aggregate_id: "order-404".into(),
+            })
+            .await,
+        tonic::Code::NotFound,
+        "读取不存在状态",
+    );
+
+    client
+        .list_aggregate_states(ListAggregateStatesRequest {
+            event_set: aggregate_event_set(),
+            page_size: 0,
+            page_token: Vec::new(),
+        })
+        .await
+        .expect("使用默认状态分页大小");
+    let first_page = client
+        .list_aggregate_states(ListAggregateStatesRequest {
+            event_set: aggregate_event_set(),
+            page_size: 1,
+            page_token: Vec::new(),
+        })
+        .await
+        .expect("读取首个状态分页")
+        .into_inner();
+    assert_eq!(first_page.states.len(), 1);
+    assert!(!first_page.next_page_token.is_empty());
+    client
+        .list_aggregate_states(ListAggregateStatesRequest {
+            event_set: aggregate_event_set(),
+            page_size: u32::MAX,
+            page_token: first_page.next_page_token.clone(),
+        })
+        .await
+        .expect("状态分页大小按上限截断");
+    let mut invalid_page_token = first_page.next_page_token;
+    invalid_page_token[0] = invalid_page_token[0].wrapping_add(1);
+    assert_grpc_code(
+        client
+            .list_aggregate_states(ListAggregateStatesRequest {
+                event_set: aggregate_event_set(),
+                page_size: 1,
+                page_token: invalid_page_token,
+            })
+            .await,
+        tonic::Code::InvalidArgument,
+        "状态分页 token 版本非法",
+    );
+
+    let mut stream = client
+        .read_aggregate_events(ReadAggregateEventsRequest {
+            event_set: aggregate_event_set(),
+            start: Some(AggregateReadStart {
+                kind: Some(aggregate_read_start::Kind::Beginning(Empty {})),
+            }),
+        })
+        .await
+        .expect("读取聚合事件")
+        .into_inner();
+    let cursor = stream
+        .message()
+        .await
+        .expect("读取首帧")
+        .expect("首帧存在")
+        .cursor;
+    drop(stream);
+    let mut invalid_cursor = cursor;
+    invalid_cursor[0] = invalid_cursor[0].wrapping_add(1);
+    assert_grpc_code(
+        client
+            .read_aggregate_events(ReadAggregateEventsRequest {
+                event_set: aggregate_event_set(),
+                start: Some(AggregateReadStart {
+                    kind: Some(aggregate_read_start::Kind::Cursor(invalid_cursor)),
+                }),
+            })
+            .await,
+        tonic::Code::InvalidArgument,
+        "聚合游标版本非法",
+    );
+    assert_grpc_code(
+        client
+            .read_aggregate_events(ReadAggregateEventsRequest {
+                event_set: aggregate_event_set(),
+                start: Some(AggregateReadStart {
+                    kind: Some(aggregate_read_start::Kind::Cursor(vec![255])),
+                }),
+            })
+            .await,
+        tonic::Code::Internal,
+        "损坏聚合游标",
+    );
+
+    handle.abort();
+    let _ = handle.await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn aggregate_group_public_api_validates_limits_tokens_and_revisions() {
+    let (addr, handle, server, _dir) = start_test_server().await;
+    let mut client = AggregateStoreClient::connect(addr)
+        .await
+        .expect("连接聚合服务");
+    client
+        .create_event_set(CreateEventSetRequest {
+            event_set: aggregate_event_set(),
+            operation_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+        })
+        .await
+        .expect("创建事件集");
+    client
+        .append_aggregate_event(AppendAggregateEventRequest {
+            event_set: aggregate_event_set(),
+            aggregate_id: "order-1".into(),
+            expected_version: aggregate_no_instance(),
+            event: Some(aggregate_event(b"{}")),
+        })
+        .await
+        .expect("追加组测试事件");
+
+    assert_grpc_code(
+        client
+            .create_aggregate_group(CreateAggregateGroupRequest {
+                event_set: aggregate_event_set(),
+                name: String::new(),
+                start: None,
+                settings: None,
+                operation_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+            })
+            .await,
+        tonic::Code::InvalidArgument,
+        "空消费者组名",
+    );
+    assert_grpc_code(
+        client
+            .create_aggregate_group(CreateAggregateGroupRequest {
+                event_set: aggregate_event_set(),
+                name: "workers".into(),
+                start: None,
+                settings: None,
+                operation_id: vec![0; 15],
+            })
+            .await,
+        tonic::Code::InvalidArgument,
+        "非法消费者组 operation_id",
+    );
+    let mut invalid_settings = aggregate_group_settings(1000, 3).unwrap();
+    invalid_settings.max_unacked_per_consumer = 0;
+    assert_grpc_code(
+        client
+            .create_aggregate_group(CreateAggregateGroupRequest {
+                event_set: aggregate_event_set(),
+                name: "workers".into(),
+                start: None,
+                settings: Some(invalid_settings),
+                operation_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+            })
+            .await,
+        tonic::Code::InvalidArgument,
+        "非法消费者组 settings",
+    );
+
+    let created = client
+        .create_aggregate_group(CreateAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "workers".into(),
+            start: None,
+            settings: aggregate_group_settings(1000, 3),
+            operation_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+        })
+        .await
+        .expect("创建消费者组")
+        .into_inner();
+    assert_grpc_code(
+        client
+            .create_aggregate_group(CreateAggregateGroupRequest {
+                event_set: aggregate_event_set(),
+                name: "workers".into(),
+                start: None,
+                settings: None,
+                operation_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+            })
+            .await,
+        tonic::Code::AlreadyExists,
+        "重复创建消费者组",
+    );
+    client
+        .get_aggregate_group(GetAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "workers".into(),
+        })
+        .await
+        .expect("读取消费者组");
+    assert_eq!(
+        client
+            .list_aggregate_groups(ListAggregateGroupsRequest {
+                event_set: aggregate_event_set(),
+            })
+            .await
+            .expect("列出消费者组")
+            .into_inner()
+            .groups
+            .len(),
+        1
+    );
+    assert_grpc_code(
+        client
+            .get_aggregate_group(GetAggregateGroupRequest {
+                event_set: aggregate_event_set(),
+                name: "missing".into(),
+            })
+            .await,
+        tonic::Code::NotFound,
+        "读取不存在消费者组",
+    );
+    assert_grpc_code(
+        client
+            .fetch_aggregate_group(FetchAggregateGroupRequest {
+                event_set: aggregate_event_set(),
+                name: "workers".into(),
+                consumer_id: String::new(),
+                max_events: 0,
+                max_bytes: 0,
+                wait_ms: 0,
+            })
+            .await,
+        tonic::Code::InvalidArgument,
+        "空消费者 ID",
+    );
+
+    let fetched = client
+        .fetch_aggregate_group(FetchAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "workers".into(),
+            consumer_id: "consumer-a".into(),
+            max_events: u32::MAX,
+            max_bytes: u64::MAX,
+            wait_ms: u64::MAX,
+        })
+        .await
+        .expect("Fetch 配额按上限截断")
+        .into_inner();
+    assert_eq!(fetched.deliveries.len(), 1);
+    let old_delivery_id = fetched.deliveries[0].delivery_id.clone();
+
+    assert_grpc_code(
+        client
+            .update_aggregate_group(UpdateAggregateGroupRequest {
+                event_set: aggregate_event_set(),
+                name: "workers".into(),
+                expected_revision: created.revision,
+                start: None,
+                settings: None,
+                operation_id: vec![0; 15],
+            })
+            .await,
+        tonic::Code::InvalidArgument,
+        "非法更新 operation_id",
+    );
+    assert_grpc_code(
+        client
+            .update_aggregate_group(UpdateAggregateGroupRequest {
+                event_set: aggregate_event_set(),
+                name: "workers".into(),
+                expected_revision: created.revision + 9,
+                start: None,
+                settings: None,
+                operation_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+            })
+            .await,
+        tonic::Code::Aborted,
+        "更新 revision 冲突",
+    );
+    let reset = client
+        .update_aggregate_group(UpdateAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "workers".into(),
+            expected_revision: created.revision,
+            start: Some(AggregateGroupStart {
+                kind: Some(aggregate_group_start::Kind::Beginning(Empty {})),
+            }),
+            settings: None,
+            operation_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+        })
+        .await
+        .expect("重置消费者组")
+        .into_inner();
+    assert!(reset.epoch > created.epoch);
+
+    let stale_settlement = client
+        .settle_aggregate_group(SettleAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "workers".into(),
+            consumer_id: "consumer-a".into(),
+            settlements: vec![AggregateGroupSettlement {
+                delivery_id: old_delivery_id.clone(),
+                action: AggregateGroupSettlementAction::AggregateGroupSettlementAck as i32,
+                reason: String::new(),
+            }],
+        })
+        .await
+        .expect("旧 epoch settle 返回逐项状态")
+        .into_inner();
+    assert_eq!(
+        stale_settlement.results[0].status,
+        AggregateGroupSettlementStatus::AggregateGroupSettlementStaleLease as i32
+    );
+    let stale_renewal = client
+        .renew_aggregate_group(RenewAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "workers".into(),
+            consumer_id: "consumer-a".into(),
+            delivery_ids: vec![old_delivery_id],
+        })
+        .await
+        .expect("旧 epoch renew 返回逐项状态")
+        .into_inner();
+    assert_eq!(
+        stale_renewal.results[0].status,
+        AggregateGroupSettlementStatus::AggregateGroupSettlementStaleLease as i32
+    );
+
+    let current = client
+        .fetch_aggregate_group(FetchAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "workers".into(),
+            consumer_id: "consumer-b".into(),
+            max_events: 0,
+            max_bytes: 0,
+            wait_ms: 0,
+        })
+        .await
+        .expect("使用默认 Fetch 配额")
+        .into_inner();
+    let current_delivery_id = current.deliveries[0].delivery_id.clone();
+    assert_grpc_code(
+        client
+            .settle_aggregate_group(SettleAggregateGroupRequest {
+                event_set: aggregate_event_set(),
+                name: "workers".into(),
+                consumer_id: "consumer-b".into(),
+                settlements: vec![AggregateGroupSettlement {
+                    delivery_id: current_delivery_id,
+                    action: 99,
+                    reason: String::new(),
+                }],
+            })
+            .await,
+        tonic::Code::InvalidArgument,
+        "非法 settle action",
+    );
+    assert_grpc_code(
+        client
+            .settle_aggregate_group(SettleAggregateGroupRequest {
+                event_set: aggregate_event_set(),
+                name: "workers".into(),
+                consumer_id: String::new(),
+                settlements: Vec::new(),
+            })
+            .await,
+        tonic::Code::InvalidArgument,
+        "settle 空消费者 ID",
+    );
+    assert_grpc_code(
+        client
+            .renew_aggregate_group(RenewAggregateGroupRequest {
+                event_set: aggregate_event_set(),
+                name: "workers".into(),
+                consumer_id: "consumer-b".into(),
+                delivery_ids: vec![vec![255]],
+            })
+            .await,
+        tonic::Code::Internal,
+        "损坏 delivery token",
+    );
+
+    assert_grpc_code(
+        client
+            .delete_aggregate_group(DeleteAggregateGroupRequest {
+                event_set: aggregate_event_set(),
+                name: "workers".into(),
+                expected_revision: reset.revision,
+                operation_id: vec![0; 15],
+            })
+            .await,
+        tonic::Code::InvalidArgument,
+        "非法删除 operation_id",
+    );
+    assert_grpc_code(
+        client
+            .delete_aggregate_group(DeleteAggregateGroupRequest {
+                event_set: aggregate_event_set(),
+                name: "workers".into(),
+                expected_revision: reset.revision + 1,
+                operation_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+            })
+            .await,
+        tonic::Code::Aborted,
+        "删除 revision 冲突",
+    );
+    client
+        .delete_aggregate_group(DeleteAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "workers".into(),
+            expected_revision: reset.revision,
+            operation_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+        })
+        .await
+        .expect("删除消费者组");
+
+    handle.abort();
+    let _ = handle.await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn aggregate_internal_api_rejects_invalid_control_and_partition_requests() {
+    let (_addr, handle, server, _dir) = start_test_server().await;
+    let service = es_server::aggregate_service::AggregateStoreService::new(
+        server.shard_manager().clone(),
+        server.config(),
+    )
+    .expect("创建内部聚合服务");
+
+    assert_grpc_code(
+        service
+            .get_aggregate_catalog_internal(tonic::Request::new(
+                GetAggregateCatalogInternalRequest {
+                    control_shard_id: 1,
+                },
+            ))
+            .await,
+        tonic::Code::InvalidArgument,
+        "catalog control shard 不匹配",
+    );
+    assert!(
+        service
+            .get_aggregate_catalog_internal(tonic::Request::new(
+                GetAggregateCatalogInternalRequest {
+                    control_shard_id: 0,
+                },
+            ))
+            .await
+            .expect("读取内部 catalog")
+            .into_inner()
+            .payload
+            .len()
+            > 0
+    );
+    assert_grpc_code(
+        service
+            .commit_aggregate_catalog_internal(tonic::Request::new(
+                CommitAggregateCatalogInternalRequest {
+                    control_shard_id: 1,
+                    payload: Vec::new(),
+                },
+            ))
+            .await,
+        tonic::Code::InvalidArgument,
+        "提交 catalog control shard 不匹配",
+    );
+    assert_grpc_code(
+        service
+            .commit_aggregate_catalog_internal(tonic::Request::new(
+                CommitAggregateCatalogInternalRequest {
+                    control_shard_id: 0,
+                    payload: vec![255],
+                },
+            ))
+            .await,
+        tonic::Code::Internal,
+        "损坏 catalog command",
+    );
+    let mut trailing_catalog_command = bincode::serde::encode_to_vec(
+        es_core::AggregateCatalogCommand::Activate {
+            event_set: es_core::EventSetId::new("orders", "order").expect("事件集身份"),
+            operation_id: uuid::Uuid::new_v4(),
+        },
+        bincode::config::standard(),
+    )
+    .expect("编码 catalog command");
+    trailing_catalog_command.push(0);
+    assert_grpc_code(
+        service
+            .commit_aggregate_catalog_internal(tonic::Request::new(
+                CommitAggregateCatalogInternalRequest {
+                    control_shard_id: 0,
+                    payload: trailing_catalog_command,
+                },
+            ))
+            .await,
+        tonic::Code::InvalidArgument,
+        "catalog command 尾随字节",
+    );
+
+    assert_grpc_code(
+        service
+            .install_aggregate_partition_fence_internal(tonic::Request::new(
+                InstallAggregatePartitionFenceInternalRequest {
+                    shard_id: 0,
+                    event_set: None,
+                    partition_id: 0,
+                    generation: 1,
+                },
+            ))
+            .await,
+        tonic::Code::InvalidArgument,
+        "安装 fence 缺失事件集",
+    );
+    assert_grpc_code(
+        service
+            .install_aggregate_partition_fence_internal(tonic::Request::new(
+                InstallAggregatePartitionFenceInternalRequest {
+                    shard_id: 0,
+                    event_set: aggregate_event_set(),
+                    partition_id: u32::from(u16::MAX) + 1,
+                    generation: 1,
+                },
+            ))
+            .await,
+        tonic::Code::InvalidArgument,
+        "安装 fence 分区越界",
+    );
+
+    let mut invalid_subscription = service
+        .subscribe_aggregate_partitions_internal(tonic::Request::new(
+            SubscribeAggregatePartitionsInternalRequest {
+                shard_id: 0,
+                event_set: aggregate_event_set(),
+                cursors: vec![AggregatePartitionCursor {
+                    partition_id: u32::from(u16::MAX) + 1,
+                    next_position: 0,
+                }],
+                from_now: false,
+            },
+        ))
+        .await
+        .expect("内部订阅建立后异步报告非法 cursor")
+        .into_inner();
+    assert_eq!(
+        invalid_subscription
+            .next()
+            .await
+            .expect("内部订阅返回错误 frame")
+            .expect_err("越界 partition cursor 必须失败")
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+
+    assert_grpc_code(
+        service
+            .list_aggregate_partition_states_internal(tonic::Request::new(
+                ListAggregatePartitionStatesInternalRequest {
+                    shard_id: 0,
+                    event_set: aggregate_event_set(),
+                    cursors: vec![AggregateStatePartitionCursor {
+                        partition_id: u32::from(u16::MAX) + 1,
+                        after_aggregate_id: String::new(),
+                    }],
+                    limit_per_partition: 1,
+                },
+            ))
+            .await,
+        tonic::Code::InvalidArgument,
+        "内部状态 cursor 越界",
+    );
+    let states = service
+        .list_aggregate_partition_states_internal(tonic::Request::new(
+            ListAggregatePartitionStatesInternalRequest {
+                shard_id: 0,
+                event_set: aggregate_event_set(),
+                cursors: vec![
+                    AggregateStatePartitionCursor {
+                        partition_id: 0,
+                        after_aggregate_id: String::new(),
+                    },
+                    AggregateStatePartitionCursor {
+                        partition_id: 1,
+                        after_aggregate_id: "order-1".into(),
+                    },
+                ],
+                limit_per_partition: 1,
+            },
+        ))
+        .await
+        .expect("内部状态列表支持空和排他起点")
+        .into_inner();
+    assert!(states.states.is_empty());
+
+    assert_grpc_code(
+        service
+            .get_aggregate_group_catalog_internal(tonic::Request::new(
+                GetAggregateGroupCatalogInternalRequest {
+                    control_shard_id: 1,
+                },
+            ))
+            .await,
+        tonic::Code::InvalidArgument,
+        "组 catalog control shard 不匹配",
+    );
+    assert!(
+        service
+            .get_aggregate_group_catalog_internal(tonic::Request::new(
+                GetAggregateGroupCatalogInternalRequest {
+                    control_shard_id: 0,
+                },
+            ))
+            .await
+            .expect("读取内部组 catalog")
+            .into_inner()
+            .payload
+            .len()
+            > 0
+    );
+    assert_grpc_code(
+        service
+            .commit_aggregate_group_catalog_internal(tonic::Request::new(
+                CommitAggregateGroupCatalogInternalRequest {
+                    control_shard_id: 1,
+                    payload: Vec::new(),
+                },
+            ))
+            .await,
+        tonic::Code::InvalidArgument,
+        "提交组 catalog control shard 不匹配",
+    );
+    assert_grpc_code(
+        service
+            .fetch_aggregate_group_partition_internal(tonic::Request::new(
+                FetchAggregateGroupPartitionInternalRequest {
+                    shard_id: 0,
+                    payload: vec![255],
+                },
+            ))
+            .await,
+        tonic::Code::Internal,
+        "损坏内部 Fetch payload",
+    );
+    assert_grpc_code(
+        service
+            .apply_aggregate_group_partition_internal(tonic::Request::new(
+                ApplyAggregateGroupPartitionInternalRequest {
+                    shard_id: 0,
+                    payload: vec![255],
+                },
+            ))
+            .await,
+        tonic::Code::Internal,
+        "损坏内部 Apply payload",
+    );
+    let non_group_request = bincode::serde::encode_to_vec(
+        es_storage::EsRequest::DeleteStream {
+            stream_id: "legacy".into(),
+        },
+        bincode::config::standard(),
+    )
+    .expect("编码非组请求");
+    assert_grpc_code(
+        service
+            .apply_aggregate_group_partition_internal(tonic::Request::new(
+                ApplyAggregateGroupPartitionInternalRequest {
+                    shard_id: 0,
+                    payload: non_group_request,
+                },
+            ))
+            .await,
+        tonic::Code::InvalidArgument,
+        "内部 Apply 拒绝非组命令",
+    );
+
+    handle.abort();
+    let _ = handle.await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn aggregate_store_versions_occ_and_state_cas_are_instance_scoped() {
+    let (addr, handle, server, _dir) = start_test_server().await;
+    let mut client = AggregateStoreClient::connect(addr)
+        .await
+        .expect("连接聚合服务");
+
+    let capabilities = client
+        .get_aggregate_store_capabilities(GetAggregateStoreCapabilitiesRequest {})
+        .await
+        .expect("读取聚合能力")
+        .into_inner();
+    assert_eq!(capabilities.partition_count, 256);
+    assert!(capabilities.state_revision_cas);
+
+    let created = client
+        .create_event_set(CreateEventSetRequest {
+            event_set: aggregate_event_set(),
+            operation_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+        })
+        .await
+        .expect("创建事件集")
+        .into_inner();
+    assert_eq!(created.partition_count, 256);
+    assert_eq!(
+        created.status,
+        AggregateEventSetStatus::AggregateEventSetActive as i32
+    );
+
+    for aggregate_id in ["order-1", "order-2"] {
+        let appended = client
+            .append_aggregate_event(AppendAggregateEventRequest {
+                event_set: aggregate_event_set(),
+                aggregate_id: aggregate_id.into(),
+                expected_version: aggregate_no_instance(),
+                event: Some(aggregate_event(br#"{"op":"create"}"#)),
+            })
+            .await
+            .unwrap_or_else(|error| panic!("{aggregate_id} 首事件追加失败: {error}"))
+            .into_inner();
+        assert_eq!(appended.aggregate_version, 0, "实例版本必须彼此独立");
+    }
+
+    let conflict = client
+        .append_aggregate_event(AppendAggregateEventRequest {
+            event_set: aggregate_event_set(),
+            aggregate_id: "order-1".into(),
+            expected_version: aggregate_exact(9),
+            event: Some(aggregate_event(br#"{"op":"pay"}"#)),
+        })
+        .await
+        .expect_err("错误实例版本必须触发 OCC 冲突");
+    assert_eq!(conflict.code(), tonic::Code::Aborted);
+
+    let stored = client
+        .put_aggregate_state(PutAggregateStateRequest {
+            event_set: aggregate_event_set(),
+            aggregate_id: "order-1".into(),
+            expected_revision: Some(ExpectedStateRevision {
+                kind: Some(expected_state_revision::Kind::Absent(Empty {})),
+            }),
+            data: br#"{"balance":50}"#.to_vec(),
+        })
+        .await
+        .expect("首次写入聚合状态")
+        .into_inner();
+    assert_eq!(stored.revision, 0);
+    assert!(stored.modified_unix_millis > 0);
+
+    let state_conflict = client
+        .put_aggregate_state(PutAggregateStateRequest {
+            event_set: aggregate_event_set(),
+            aggregate_id: "order-1".into(),
+            expected_revision: Some(ExpectedStateRevision {
+                kind: Some(expected_state_revision::Kind::Absent(Empty {})),
+            }),
+            data: br#"{"balance":25}"#.to_vec(),
+        })
+        .await
+        .expect_err("重复 absent 写入必须触发状态 CAS 冲突");
+    assert_eq!(state_conflict.code(), tonic::Code::Aborted);
+
+    let loaded = client
+        .get_aggregate_state(GetAggregateStateRequest {
+            event_set: aggregate_event_set(),
+            aggregate_id: "order-1".into(),
+        })
+        .await
+        .expect("读取聚合状态")
+        .into_inner();
+    assert_eq!(loaded.revision, 0);
+    assert_eq!(loaded.data, br#"{"balance":50}"#);
+    assert_eq!(loaded.modified_unix_millis, stored.modified_unix_millis);
+
+    let listed = client
+        .list_aggregate_states(ListAggregateStatesRequest {
+            event_set: aggregate_event_set(),
+            page_size: 10,
+            page_token: Vec::new(),
+        })
+        .await
+        .expect("列出聚合状态")
+        .into_inner();
+    let listed = listed
+        .states
+        .into_iter()
+        .find(|state| state.aggregate_id == "order-1")
+        .expect("列表包含 order-1");
+    assert_eq!(listed.revision, stored.revision);
+    assert_eq!(listed.modified_unix_millis, stored.modified_unix_millis);
+
+    handle.abort();
+    let _ = handle.await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn aggregate_group_enforces_instance_order_and_explicit_settlement() {
+    let (addr, handle, server, _dir) = start_test_server().await;
+    let mut client = AggregateStoreClient::connect(addr)
+        .await
+        .expect("连接聚合服务");
+    client
+        .create_event_set(CreateEventSetRequest {
+            event_set: aggregate_event_set(),
+            operation_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+        })
+        .await
+        .expect("创建事件集");
+    for (aggregate_id, expected) in [
+        ("order-1", aggregate_no_instance()),
+        ("order-1", aggregate_exact(0)),
+        ("order-2", aggregate_no_instance()),
+    ] {
+        client
+            .append_aggregate_event(AppendAggregateEventRequest {
+                event_set: aggregate_event_set(),
+                aggregate_id: aggregate_id.into(),
+                expected_version: expected,
+                event: Some(aggregate_event(aggregate_id.as_bytes())),
+            })
+            .await
+            .expect("追加组测试事件");
+    }
+    let group = client
+        .create_aggregate_group(CreateAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "workers".into(),
+            start: Some(AggregateGroupStart {
+                kind: Some(aggregate_group_start::Kind::Beginning(Empty {})),
+            }),
+            settings: None,
+            operation_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+        })
+        .await
+        .expect("创建聚合消费者组")
+        .into_inner();
+    assert_eq!(group.revision, 1);
+    assert_eq!(group.epoch, 1);
+
+    let first = client
+        .fetch_aggregate_group(FetchAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "workers".into(),
+            consumer_id: "consumer-a".into(),
+            max_events: 10,
+            max_bytes: 1024,
+            wait_ms: 0,
+        })
+        .await
+        .expect("首次 Fetch")
+        .into_inner();
+    assert_eq!(first.deliveries.len(), 2, "每个实例最多一个未结算 delivery");
+    let order_1 = first
+        .deliveries
+        .iter()
+        .find(|delivery| delivery.event.as_ref().unwrap().aggregate_id == "order-1")
+        .expect("order-1 首事件");
+    let order_2 = first
+        .deliveries
+        .iter()
+        .find(|delivery| delivery.event.as_ref().unwrap().aggregate_id == "order-2")
+        .expect("order-2 首事件");
+    assert_eq!(order_1.event.as_ref().unwrap().aggregate_version, 0);
+
+    let renewed = client
+        .renew_aggregate_group(RenewAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "workers".into(),
+            consumer_id: "consumer-a".into(),
+            delivery_ids: vec![order_1.delivery_id.clone()],
+        })
+        .await
+        .expect("续租 order-1")
+        .into_inner();
+    assert_eq!(renewed.results.len(), 1);
+    assert_eq!(
+        renewed.results[0].status,
+        AggregateGroupSettlementStatus::AggregateGroupSettlementApplied as i32
+    );
+
+    client
+        .settle_aggregate_group(SettleAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "workers".into(),
+            consumer_id: "consumer-a".into(),
+            settlements: vec![AggregateGroupSettlement {
+                delivery_id: order_2.delivery_id.clone(),
+                action: AggregateGroupSettlementAction::AggregateGroupSettlementAck as i32,
+                reason: String::new(),
+            }],
+        })
+        .await
+        .expect("先 Ack order-2");
+    let blocked = client
+        .fetch_aggregate_group(FetchAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "workers".into(),
+            consumer_id: "consumer-b".into(),
+            max_events: 10,
+            max_bytes: 1024,
+            wait_ms: 0,
+        })
+        .await
+        .expect("order-1 未 Ack 时再次 Fetch")
+        .into_inner();
+    assert!(
+        blocked.deliveries.is_empty(),
+        "order-1 version 1 必须被前序租约阻塞"
+    );
+
+    client
+        .settle_aggregate_group(SettleAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "workers".into(),
+            consumer_id: "consumer-a".into(),
+            settlements: vec![AggregateGroupSettlement {
+                delivery_id: order_1.delivery_id.clone(),
+                action: AggregateGroupSettlementAction::AggregateGroupSettlementAck as i32,
+                reason: String::new(),
+            }],
+        })
+        .await
+        .expect("Ack order-1 首事件");
+    let next = client
+        .fetch_aggregate_group(FetchAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "workers".into(),
+            consumer_id: "consumer-b".into(),
+            max_events: 10,
+            max_bytes: 1024,
+            wait_ms: 0,
+        })
+        .await
+        .expect("前序 Ack 后 Fetch")
+        .into_inner();
+    assert_eq!(next.deliveries.len(), 1);
+    assert_eq!(
+        next.deliveries[0].event.as_ref().unwrap().aggregate_id,
+        "order-1"
+    );
+    assert_eq!(
+        next.deliveries[0].event.as_ref().unwrap().aggregate_version,
+        1
+    );
+
+    handle.abort();
+    let _ = handle.await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn aggregate_group_fetch_skips_blocked_candidate_before_available_instance() {
+    let (addr, handle, server, _dir) = start_test_server().await;
+    let mut client = AggregateStoreClient::connect(addr)
+        .await
+        .expect("连接聚合服务");
+    let operation_id = uuid::Uuid::new_v4();
+    client
+        .create_event_set(CreateEventSetRequest {
+            event_set: aggregate_event_set(),
+            operation_id: operation_id.as_bytes().to_vec(),
+        })
+        .await
+        .expect("创建事件集");
+
+    let first_id = "blocked-0".to_string();
+    let partition = es_core::EventPartitionHash::Xxh3V1
+        .partition(
+            operation_id.as_bytes(),
+            &first_id,
+            es_core::EVENT_PARTITION_COUNT,
+        )
+        .expect("计算首实例分区");
+    let second_id = (1..10_000)
+        .map(|index| format!("available-{index}"))
+        .find(|candidate| {
+            es_core::EventPartitionHash::Xxh3V1
+                .partition(
+                    operation_id.as_bytes(),
+                    candidate,
+                    es_core::EVENT_PARTITION_COUNT,
+                )
+                .expect("计算候选实例分区")
+                == partition
+        })
+        .expect("有限候选中必须找到同分区实例");
+    for aggregate_id in [&first_id, &second_id] {
+        client
+            .append_aggregate_event(AppendAggregateEventRequest {
+                event_set: aggregate_event_set(),
+                aggregate_id: aggregate_id.clone(),
+                expected_version: aggregate_no_instance(),
+                event: Some(aggregate_event(aggregate_id.as_bytes())),
+            })
+            .await
+            .expect("追加同分区测试事件");
+    }
+    client
+        .create_aggregate_group(CreateAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "scan-window".into(),
+            start: Some(AggregateGroupStart {
+                kind: Some(aggregate_group_start::Kind::Beginning(Empty {})),
+            }),
+            settings: None,
+            operation_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+        })
+        .await
+        .expect("创建消费者组");
+
+    let first = client
+        .fetch_aggregate_group(FetchAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "scan-window".into(),
+            consumer_id: "consumer-a".into(),
+            max_events: 1,
+            max_bytes: 1024,
+            wait_ms: 0,
+        })
+        .await
+        .expect("领取首实例")
+        .into_inner();
+    assert_eq!(first.deliveries.len(), 1);
+    assert_eq!(
+        first.deliveries[0].event.as_ref().unwrap().aggregate_id,
+        first_id
+    );
+
+    let second = client
+        .fetch_aggregate_group(FetchAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "scan-window".into(),
+            consumer_id: "consumer-b".into(),
+            max_events: 1,
+            max_bytes: 1024,
+            wait_ms: 0,
+        })
+        .await
+        .expect("越过被占用实例领取后续实例")
+        .into_inner();
+    assert_eq!(second.deliveries.len(), 1);
+    assert_eq!(
+        second.deliveries[0].event.as_ref().unwrap().aggregate_id,
+        second_id
+    );
+
+    handle.abort();
+    let _ = handle.await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn aggregate_group_update_reset_and_delete_operation_are_consistent() {
+    let (addr, handle, server, _dir) = start_test_server().await;
+    let mut client = AggregateStoreClient::connect(addr)
+        .await
+        .expect("连接聚合服务");
+    client
+        .create_event_set(CreateEventSetRequest {
+            event_set: aggregate_event_set(),
+            operation_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+        })
+        .await
+        .expect("创建事件集");
+    for (expected, data) in [
+        (aggregate_no_instance(), b"v0".as_slice()),
+        (aggregate_exact(0), b"v1".as_slice()),
+    ] {
+        client
+            .append_aggregate_event(AppendAggregateEventRequest {
+                event_set: aggregate_event_set(),
+                aggregate_id: "order-update".into(),
+                expected_version: expected,
+                event: Some(aggregate_event(data)),
+            })
+            .await
+            .expect("追加更新测试事件");
+    }
+    client
+        .create_aggregate_group(CreateAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "update-reset".into(),
+            start: Some(AggregateGroupStart {
+                kind: Some(aggregate_group_start::Kind::Beginning(Empty {})),
+            }),
+            settings: aggregate_group_settings(1_000, 2),
+            operation_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+        })
+        .await
+        .expect("创建消费者组");
+    let delivery = client
+        .fetch_aggregate_group(FetchAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "update-reset".into(),
+            consumer_id: "consumer-a".into(),
+            max_events: 1,
+            max_bytes: 1024,
+            wait_ms: 0,
+        })
+        .await
+        .expect("领取更新前 delivery")
+        .into_inner()
+        .deliveries
+        .remove(0);
+
+    let update_operation = uuid::Uuid::new_v4();
+    let update_request = || UpdateAggregateGroupRequest {
+        event_set: aggregate_event_set(),
+        name: "update-reset".into(),
+        expected_revision: 1,
+        start: None,
+        settings: aggregate_group_settings(2_000, 2),
+        operation_id: update_operation.as_bytes().to_vec(),
+    };
+    let updated = client
+        .update_aggregate_group(update_request())
+        .await
+        .expect("只更新 settings")
+        .into_inner();
+    assert_eq!((updated.revision, updated.epoch), (2, 1));
+    let retried = client
+        .update_aggregate_group(update_request())
+        .await
+        .expect("幂等重试 settings 更新")
+        .into_inner();
+    assert_eq!((retried.revision, retried.epoch), (2, 1));
+
+    let active = client
+        .fetch_aggregate_group(FetchAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "update-reset".into(),
+            consumer_id: "consumer-a".into(),
+            max_events: 1,
+            max_bytes: 1024,
+            wait_ms: 0,
+        })
+        .await
+        .expect("settings 更新后保持现有进度")
+        .into_inner();
+    assert!(
+        active.deliveries.is_empty(),
+        "同实例旧 delivery 仍应占用租约"
+    );
+
+    let reset = client
+        .update_aggregate_group(UpdateAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "update-reset".into(),
+            expected_revision: 2,
+            start: Some(AggregateGroupStart {
+                kind: Some(aggregate_group_start::Kind::Now(Empty {})),
+            }),
+            settings: None,
+            operation_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+        })
+        .await
+        .expect("显式 reset 到 Now")
+        .into_inner();
+    assert_eq!((reset.revision, reset.epoch), (3, 2));
+    let stale = client
+        .settle_aggregate_group(SettleAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "update-reset".into(),
+            consumer_id: "consumer-a".into(),
+            settlements: vec![AggregateGroupSettlement {
+                delivery_id: delivery.delivery_id,
+                action: AggregateGroupSettlementAction::AggregateGroupSettlementAck as i32,
+                reason: String::new(),
+            }],
+        })
+        .await
+        .expect("reset 后结算旧 token")
+        .into_inner();
+    assert_eq!(
+        stale.results[0].status,
+        AggregateGroupSettlementStatus::AggregateGroupSettlementStaleLease as i32
+    );
+
+    let delete_operation = uuid::Uuid::new_v4();
+    let delete_request = || DeleteAggregateGroupRequest {
+        event_set: aggregate_event_set(),
+        name: "update-reset".into(),
+        expected_revision: 3,
+        operation_id: delete_operation.as_bytes().to_vec(),
+    };
+    client
+        .delete_aggregate_group(delete_request())
+        .await
+        .expect("删除消费者组");
+    client
+        .delete_aggregate_group(delete_request())
+        .await
+        .expect("相同 operation ID 删除重试必须成功");
+    let missing = client
+        .get_aggregate_group(GetAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "update-reset".into(),
+        })
+        .await
+        .expect_err("删除后组不可见");
+    assert_eq!(missing.code(), tonic::Code::NotFound);
+
+    handle.abort();
+    let _ = handle.await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn aggregate_group_timeout_retry_and_park_unlock_next_instance_version() {
+    let (addr, handle, server, _dir) = start_test_server().await;
+    let mut client = AggregateStoreClient::connect(addr)
+        .await
+        .expect("连接聚合服务");
+    client
+        .create_event_set(CreateEventSetRequest {
+            event_set: aggregate_event_set(),
+            operation_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+        })
+        .await
+        .expect("创建事件集");
+    for version in 0..3 {
+        client
+            .append_aggregate_event(AppendAggregateEventRequest {
+                event_set: aggregate_event_set(),
+                aggregate_id: "order-retry".into(),
+                expected_version: if version == 0 {
+                    aggregate_no_instance()
+                } else {
+                    aggregate_exact(version - 1)
+                },
+                event: Some(aggregate_event(format!("v{version}").as_bytes())),
+            })
+            .await
+            .expect("追加重试测试事件");
+    }
+    client
+        .create_aggregate_group(CreateAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "retry-park".into(),
+            start: Some(AggregateGroupStart {
+                kind: Some(aggregate_group_start::Kind::Beginning(Empty {})),
+            }),
+            settings: aggregate_group_settings(20, 1),
+            operation_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+        })
+        .await
+        .expect("创建重试消费者组");
+    let first = client
+        .fetch_aggregate_group(FetchAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "retry-park".into(),
+            consumer_id: "consumer-a".into(),
+            max_events: 1,
+            max_bytes: 1024,
+            wait_ms: 0,
+        })
+        .await
+        .expect("首次领取")
+        .into_inner();
+    assert_eq!(first.deliveries[0].attempt, 0);
+
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let _ = client
+        .fetch_aggregate_group(FetchAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "retry-park".into(),
+            consumer_id: "consumer-b".into(),
+            max_events: 1,
+            max_bytes: 1024,
+            wait_ms: 0,
+        })
+        .await
+        .expect("触发租约过期");
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    let retried = client
+        .fetch_aggregate_group(FetchAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "retry-park".into(),
+            consumer_id: "consumer-b".into(),
+            max_events: 1,
+            max_bytes: 1024,
+            wait_ms: 0,
+        })
+        .await
+        .expect("领取超时重投")
+        .into_inner();
+    assert_eq!(retried.deliveries.len(), 1);
+    assert_eq!(retried.deliveries[0].attempt, 1);
+    assert_eq!(
+        retried.deliveries[0]
+            .event
+            .as_ref()
+            .unwrap()
+            .aggregate_version,
+        0
+    );
+
+    client
+        .settle_aggregate_group(SettleAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "retry-park".into(),
+            consumer_id: "consumer-b".into(),
+            settlements: vec![AggregateGroupSettlement {
+                delivery_id: retried.deliveries[0].delivery_id.clone(),
+                action: AggregateGroupSettlementAction::AggregateGroupSettlementRetry as i32,
+                reason: "retry exhausted".into(),
+            }],
+        })
+        .await
+        .expect("重试耗尽后 Park");
+    let second = client
+        .fetch_aggregate_group(FetchAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "retry-park".into(),
+            consumer_id: "consumer-c".into(),
+            max_events: 1,
+            max_bytes: 1024,
+            wait_ms: 0,
+        })
+        .await
+        .expect("领取 Park 后下一版本")
+        .into_inner();
+    assert_eq!(
+        second.deliveries[0]
+            .event
+            .as_ref()
+            .unwrap()
+            .aggregate_version,
+        1
+    );
+    client
+        .settle_aggregate_group(SettleAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "retry-park".into(),
+            consumer_id: "consumer-c".into(),
+            settlements: vec![AggregateGroupSettlement {
+                delivery_id: second.deliveries[0].delivery_id.clone(),
+                action: AggregateGroupSettlementAction::AggregateGroupSettlementPark as i32,
+                reason: "explicit park".into(),
+            }],
+        })
+        .await
+        .expect("显式 Park");
+    let third = client
+        .fetch_aggregate_group(FetchAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "retry-park".into(),
+            consumer_id: "consumer-d".into(),
+            max_events: 1,
+            max_bytes: 1024,
+            wait_ms: 0,
+        })
+        .await
+        .expect("领取显式 Park 后下一版本")
+        .into_inner();
+    assert_eq!(
+        third.deliveries[0]
+            .event
+            .as_ref()
+            .unwrap()
+            .aggregate_version,
+        2
+    );
+
+    handle.abort();
+    let _ = handle.await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn aggregate_store_catalog_and_follow_span_multiple_nodes() {
+    let (first_addr, first_handle, second_handle, first, second, _first_dir, _second_dir) =
+        start_two_shard_servers().await;
+    let second_addr = first.config().node.peers[0].addr.clone();
+    let mut first_client = AggregateStoreClient::connect(first_addr.clone())
+        .await
+        .expect("连接节点一聚合服务");
+    first_client
+        .create_event_set(CreateEventSetRequest {
+            event_set: aggregate_event_set(),
+            operation_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+        })
+        .await
+        .expect("经非控制节点创建跨节点事件集");
+
+    let event_set = es_core::EventSetId::new("orders", "order").expect("事件集身份");
+    let catalog = second
+        .shard_manager()
+        .get_shard(0)
+        .await
+        .expect("控制分片")
+        .storage
+        .read_aggregate_catalog()
+        .expect("读取 catalog");
+    let definition = catalog
+        .event_sets
+        .get(&event_set)
+        .expect("事件集已写入 catalog");
+    let mut aggregate_by_shard = std::collections::BTreeMap::new();
+    for index in 0..10_000 {
+        let aggregate_id = format!("order-{index}");
+        let partition_id = definition
+            .partition_for(&aggregate_id)
+            .expect("计算聚合分区");
+        let shard_id = definition.placements[&partition_id].shard_id;
+        aggregate_by_shard.entry(shard_id).or_insert(aggregate_id);
+        if aggregate_by_shard.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(
+        aggregate_by_shard.len(),
+        2,
+        "测试身份必须覆盖两个物理 Shard"
+    );
+
+    let mut second_client = AggregateStoreClient::connect(second_addr)
+        .await
+        .expect("连接节点二聚合服务");
+    for (&shard_id, aggregate_id) in &aggregate_by_shard {
+        let client = if shard_id == 1 {
+            &mut first_client
+        } else {
+            &mut second_client
+        };
+        let response = client
+            .append_aggregate_event(AppendAggregateEventRequest {
+                event_set: aggregate_event_set(),
+                aggregate_id: aggregate_id.clone(),
+                expected_version: aggregate_no_instance(),
+                event: Some(aggregate_event(aggregate_id.as_bytes())),
+            })
+            .await
+            .unwrap_or_else(|error| panic!("Shard {shard_id} 聚合追加失败: {error}"))
+            .into_inner();
+        assert_eq!(response.aggregate_version, 0);
+    }
+
+    let mut stream = first_client
+        .read_aggregate_events(ReadAggregateEventsRequest {
+            event_set: aggregate_event_set(),
+            start: Some(AggregateReadStart {
+                kind: Some(aggregate_read_start::Kind::Beginning(Empty {})),
+            }),
+        })
+        .await
+        .expect("从节点一跨 Shard follow")
+        .into_inner();
+    let mut seen = std::collections::BTreeSet::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let frame = tokio::time::timeout_at(deadline, stream.message())
+            .await
+            .expect("等待跨 Shard follow 超时")
+            .expect("读取跨 Shard frame")
+            .expect("follow 不应提前结束");
+        match frame.payload {
+            Some(read_aggregate_events_response::Payload::Event(event)) => {
+                seen.insert(event.aggregate_id);
+            }
+            Some(read_aggregate_events_response::Payload::CaughtUp(_)) => break,
+            Some(read_aggregate_events_response::Payload::Degraded(degraded)) => {
+                panic!("两节点在线时不应降级: {degraded:?}")
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        seen,
+        aggregate_by_shard.values().cloned().collect(),
+        "公共 follow 必须合并所有物理 Shard，且不暴露分区"
+    );
+
+    first_client
+        .create_aggregate_group(CreateAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "cross-node".into(),
+            start: Some(AggregateGroupStart {
+                kind: Some(aggregate_group_start::Kind::Beginning(Empty {})),
+            }),
+            settings: aggregate_group_settings(1_000, 2),
+            operation_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+        })
+        .await
+        .expect("经非控制节点创建消费者组");
+    let fetched = first_client
+        .fetch_aggregate_group(FetchAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "cross-node".into(),
+            consumer_id: "consumer-cross".into(),
+            max_events: 10,
+            max_bytes: 4096,
+            wait_ms: 0,
+        })
+        .await
+        .expect("跨节点 Fetch")
+        .into_inner();
+    assert_eq!(fetched.deliveries.len(), 2);
+    assert_eq!(
+        fetched
+            .deliveries
+            .iter()
+            .map(|delivery| delivery.event.as_ref().unwrap().aggregate_id.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        aggregate_by_shard.values().cloned().collect()
+    );
+    let renewed = first_client
+        .renew_aggregate_group(RenewAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "cross-node".into(),
+            consumer_id: "consumer-cross".into(),
+            delivery_ids: fetched
+                .deliveries
+                .iter()
+                .map(|delivery| delivery.delivery_id.clone())
+                .collect(),
+        })
+        .await
+        .expect("跨节点 Renew")
+        .into_inner();
+    assert!(renewed.results.iter().all(|result| {
+        result.status == AggregateGroupSettlementStatus::AggregateGroupSettlementApplied as i32
+            && result.deadline_ms > 0
+    }));
+    let settled = first_client
+        .settle_aggregate_group(SettleAggregateGroupRequest {
+            event_set: aggregate_event_set(),
+            name: "cross-node".into(),
+            consumer_id: "consumer-cross".into(),
+            settlements: fetched
+                .deliveries
+                .iter()
+                .map(|delivery| AggregateGroupSettlement {
+                    delivery_id: delivery.delivery_id.clone(),
+                    action: AggregateGroupSettlementAction::AggregateGroupSettlementAck as i32,
+                    reason: String::new(),
+                })
+                .collect(),
+        })
+        .await
+        .expect("跨节点 Settle")
+        .into_inner();
+    assert!(settled.results.iter().all(|result| {
+        result.status == AggregateGroupSettlementStatus::AggregateGroupSettlementApplied as i32
+    }));
+
+    first_handle.abort();
+    second_handle.abort();
+    let _ = first_handle.await;
+    let _ = second_handle.await;
+    first.shutdown().await;
+    second.shutdown().await;
 }
 
 #[tokio::test]

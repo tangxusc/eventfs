@@ -33,6 +33,330 @@ service PersistentSubscriptions {
   rpc ReplayParkedPersistentSubscription(ReplayParkedPersistentSubscriptionRequest) returns (ReplayParkedPersistentSubscriptionResponse);
 }
 
+// 聚合类型事件集 API；与 EventStore Stream 数据和版本语义完全隔离。
+service AggregateStore {
+  rpc GetAggregateStoreCapabilities(GetAggregateStoreCapabilitiesRequest) returns (AggregateStoreCapabilities);
+  rpc CreateEventSet(CreateEventSetRequest) returns (AggregateEventSetInfo);
+  rpc ListEventSets(ListEventSetsRequest) returns (ListEventSetsResponse);
+  rpc GetEventSet(GetEventSetRequest) returns (AggregateEventSetInfo);
+  rpc AppendAggregateEvent(AppendAggregateEventRequest) returns (AppendAggregateEventResponse);
+  // 从 Beginning、Now 或 opaque cursor 追平后持续跟随。
+  rpc ReadAggregateEvents(ReadAggregateEventsRequest) returns (stream ReadAggregateEventsResponse);
+  rpc ListAggregateStates(ListAggregateStatesRequest) returns (ListAggregateStatesResponse);
+  rpc GetAggregateState(GetAggregateStateRequest) returns (GetAggregateStateResponse);
+  rpc PutAggregateState(PutAggregateStateRequest) returns (PutAggregateStateResponse);
+  rpc GetAggregateStoreStatus(GetAggregateStoreStatusRequest) returns (AggregateStoreStatus);
+  rpc ListAggregatePartitions(ListAggregatePartitionsRequest) returns (ListAggregatePartitionsResponse);
+  rpc CreateAggregateGroup(CreateAggregateGroupRequest) returns (AggregateGroupInfo);
+  rpc UpdateAggregateGroup(UpdateAggregateGroupRequest) returns (AggregateGroupInfo);
+  rpc DeleteAggregateGroup(DeleteAggregateGroupRequest) returns (Empty);
+  rpc GetAggregateGroup(GetAggregateGroupRequest) returns (AggregateGroupInfo);
+  rpc ListAggregateGroups(ListAggregateGroupsRequest) returns (ListAggregateGroupsResponse);
+  rpc FetchAggregateGroup(FetchAggregateGroupRequest) returns (FetchAggregateGroupResponse);
+  rpc SettleAggregateGroup(SettleAggregateGroupRequest) returns (SettleAggregateGroupResponse);
+  rpc RenewAggregateGroup(RenewAggregateGroupRequest) returns (RenewAggregateGroupResponse);
+}
+
+message AggregateEventSetRef {
+  string business_space = 1;
+  string aggregate_type = 2;
+}
+
+enum AggregateEventSetStatus {
+  AGGREGATE_EVENT_SET_CREATING = 0;
+  AGGREGATE_EVENT_SET_ACTIVE = 1;
+}
+
+message AggregateEventSetInfo {
+  AggregateEventSetRef event_set = 1;
+  uint32 partition_count = 2;
+  string hash_algorithm = 3;
+  AggregateEventSetStatus status = 4;
+  uint64 catalog_revision = 5;
+}
+
+message GetAggregateStoreCapabilitiesRequest {}
+
+message AggregateStoreCapabilities {
+  string api_version = 1;
+  uint32 partition_count = 2;
+  uint64 max_event_bytes = 3;
+  uint64 max_state_bytes = 4;
+  bool state_revision_cas = 5;
+  bool explicit_group_settlement = 6;
+  bool state_modified_time = 7;
+}
+
+message CreateEventSetRequest {
+  AggregateEventSetRef event_set = 1;
+  // 16 字节 UUID；中断重试必须复用。
+  bytes operation_id = 2;
+}
+
+message ListEventSetsRequest {}
+message ListEventSetsResponse { repeated AggregateEventSetInfo event_sets = 1; }
+message GetEventSetRequest { AggregateEventSetRef event_set = 1; }
+
+message ExpectedAggregateVersion {
+  oneof kind {
+    Empty any = 1;
+    Empty no_aggregate = 2;
+    Empty aggregate_exists = 3;
+    uint64 exact = 4;
+  }
+}
+
+message NewAggregateEvent {
+  bytes event_id = 1;
+  string event_type = 2;
+  bytes data = 3;
+  bytes metadata = 4;
+}
+
+message AggregateEvent {
+  string aggregate_id = 1;
+  uint64 aggregate_version = 2;
+  bytes event_id = 3;
+  string event_type = 4;
+  bytes data = 5;
+  bytes metadata = 6;
+  Hlc hlc = 7;
+}
+
+message AppendAggregateEventRequest {
+  AggregateEventSetRef event_set = 1;
+  string aggregate_id = 2;
+  ExpectedAggregateVersion expected_version = 3;
+  NewAggregateEvent event = 4;
+}
+
+message AppendAggregateEventResponse { uint64 aggregate_version = 1; }
+
+message AggregateReadStart {
+  oneof kind {
+    Empty beginning = 1;
+    Empty now = 2;
+    bytes cursor = 3;
+  }
+}
+
+message ReadAggregateEventsRequest {
+  AggregateEventSetRef event_set = 1;
+  AggregateReadStart start = 2;
+}
+
+message AggregateReadDegraded {
+  uint32 unavailable_source_count = 1;
+  bool retrying = 2;
+}
+
+message ReadAggregateEventsResponse {
+  oneof payload {
+    AggregateEvent event = 1;
+    Empty caught_up = 2;
+    AggregateReadDegraded degraded = 3;
+    Empty recovered = 4;
+  }
+  // 消费完当前 frame 后的 opaque 续读位置。
+  bytes cursor = 5;
+}
+
+message ListAggregateStatesRequest {
+  AggregateEventSetRef event_set = 1;
+  uint32 page_size = 2;
+  bytes page_token = 3;
+}
+
+message AggregateStateInfo {
+  string aggregate_id = 1;
+  uint64 revision = 2;
+  uint64 modified_unix_millis = 3;
+}
+
+message ListAggregateStatesResponse {
+  repeated AggregateStateInfo states = 1;
+  bytes next_page_token = 2;
+}
+
+message GetAggregateStateRequest {
+  AggregateEventSetRef event_set = 1;
+  string aggregate_id = 2;
+}
+
+message GetAggregateStateResponse {
+  uint64 revision = 1;
+  bytes data = 2;
+  uint64 modified_unix_millis = 3;
+}
+
+message ExpectedStateRevision {
+  oneof kind {
+    Empty absent = 1;
+    uint64 exact = 2;
+  }
+}
+
+message PutAggregateStateRequest {
+  AggregateEventSetRef event_set = 1;
+  string aggregate_id = 2;
+  ExpectedStateRevision expected_revision = 3;
+  bytes data = 4;
+}
+
+message PutAggregateStateResponse {
+  uint64 revision = 1;
+  uint64 modified_unix_millis = 2;
+}
+message GetAggregateStoreStatusRequest {}
+
+message AggregateStoreStatus {
+  uint64 catalog_revision = 1;
+  uint32 event_set_count = 2;
+  uint32 creating_event_set_count = 3;
+  uint32 active_event_set_count = 4;
+}
+
+message ListAggregatePartitionsRequest { AggregateEventSetRef event_set = 1; }
+
+message AggregatePartitionInfo {
+  uint32 partition_id = 1;
+  uint64 shard_id = 2;
+  uint64 generation = 3;
+  bool moving = 4;
+  uint64 target_shard_id = 5;
+}
+
+message ListAggregatePartitionsResponse { repeated AggregatePartitionInfo partitions = 1; }
+
+message AggregateGroupStart {
+  oneof kind {
+    Empty beginning = 1;
+    Empty now = 2;
+  }
+}
+
+message AggregateGroupSettings {
+  uint32 max_unacked_per_consumer = 1;
+  uint32 max_unacked_per_group = 2;
+  uint64 ack_timeout_ms = 3;
+  uint32 max_retries = 4;
+  uint64 retry_min_ms = 5;
+  uint64 retry_max_ms = 6;
+}
+
+message AggregateGroupInfo {
+  AggregateEventSetRef event_set = 1;
+  string name = 2;
+  uint64 revision = 3;
+  uint64 epoch = 4;
+  AggregateGroupStart start = 5;
+  AggregateGroupSettings settings = 6;
+}
+
+message CreateAggregateGroupRequest {
+  AggregateEventSetRef event_set = 1;
+  string name = 2;
+  AggregateGroupStart start = 3;
+  AggregateGroupSettings settings = 4;
+  bytes operation_id = 5;
+}
+
+message UpdateAggregateGroupRequest {
+  AggregateEventSetRef event_set = 1;
+  string name = 2;
+  uint64 expected_revision = 3;
+  AggregateGroupStart start = 4;
+  AggregateGroupSettings settings = 5;
+  bytes operation_id = 6;
+}
+
+message DeleteAggregateGroupRequest {
+  AggregateEventSetRef event_set = 1;
+  string name = 2;
+  uint64 expected_revision = 3;
+  bytes operation_id = 4;
+}
+
+message GetAggregateGroupRequest {
+  AggregateEventSetRef event_set = 1;
+  string name = 2;
+}
+
+message ListAggregateGroupsRequest { AggregateEventSetRef event_set = 1; }
+message ListAggregateGroupsResponse { repeated AggregateGroupInfo groups = 1; }
+
+message AggregateGroupDelivery {
+  bytes delivery_id = 1;
+  AggregateEvent event = 2;
+  uint32 attempt = 3;
+  uint64 deadline_ms = 4;
+  bool replayed = 5;
+}
+
+message FetchAggregateGroupRequest {
+  AggregateEventSetRef event_set = 1;
+  string name = 2;
+  string consumer_id = 3;
+  uint32 max_events = 4;
+  uint64 max_bytes = 5;
+  uint64 wait_ms = 6;
+}
+
+message FetchAggregateGroupResponse {
+  repeated AggregateGroupDelivery deliveries = 1;
+  bool caught_up = 2;
+  bool throttled = 3;
+}
+
+enum AggregateGroupSettlementAction {
+  AGGREGATE_GROUP_SETTLEMENT_ACK = 0;
+  AGGREGATE_GROUP_SETTLEMENT_RETRY = 1;
+  AGGREGATE_GROUP_SETTLEMENT_PARK = 2;
+  AGGREGATE_GROUP_SETTLEMENT_SKIP = 3;
+}
+
+message AggregateGroupSettlement {
+  bytes delivery_id = 1;
+  AggregateGroupSettlementAction action = 2;
+  string reason = 3;
+}
+
+enum AggregateGroupSettlementStatus {
+  AGGREGATE_GROUP_SETTLEMENT_APPLIED = 0;
+  AGGREGATE_GROUP_SETTLEMENT_ALREADY_SETTLED = 1;
+  AGGREGATE_GROUP_SETTLEMENT_STALE_LEASE = 2;
+  AGGREGATE_GROUP_SETTLEMENT_WRONG_CONSUMER = 3;
+}
+
+message AggregateGroupSettlementResult {
+  bytes delivery_id = 1;
+  AggregateGroupSettlementStatus status = 2;
+  // Renew 成功后的服务端租约截止时间；Settle 或未续租时为 0。
+  uint64 deadline_ms = 3;
+}
+
+message SettleAggregateGroupRequest {
+  AggregateEventSetRef event_set = 1;
+  string name = 2;
+  string consumer_id = 3;
+  repeated AggregateGroupSettlement settlements = 4;
+}
+
+message SettleAggregateGroupResponse {
+  repeated AggregateGroupSettlementResult results = 1;
+}
+
+message RenewAggregateGroupRequest {
+  AggregateEventSetRef event_set = 1;
+  string name = 2;
+  string consumer_id = 3;
+  repeated bytes delivery_ids = 4;
+}
+
+message RenewAggregateGroupResponse {
+  repeated AggregateGroupSettlementResult results = 1;
+}
+
 // 创建流请求
 message CreateStreamRequest {
   string stream_id = 1;
@@ -362,6 +686,114 @@ service OwnershipInternal {
   rpc CommitOwnership(CommitOwnershipRequest) returns (CommitOwnershipResponse);
   rpc InstallOwnershipFence(InstallOwnershipFenceRequest) returns (InstallOwnershipFenceResponse);
 }
+
+// AggregateStore 的节点间显式 Shard 协议，只注册到内部监听端口。
+service AggregateStoreInternal {
+  rpc GetAggregateCatalogInternal(GetAggregateCatalogInternalRequest) returns (GetAggregateCatalogInternalResponse);
+  rpc CommitAggregateCatalogInternal(CommitAggregateCatalogInternalRequest) returns (CommitAggregateCatalogInternalResponse);
+  rpc InstallAggregatePartitionFenceInternal(InstallAggregatePartitionFenceInternalRequest) returns (InstallAggregatePartitionFenceInternalResponse);
+  rpc SubscribeAggregatePartitionsInternal(SubscribeAggregatePartitionsInternalRequest) returns (stream SubscribeAggregatePartitionsInternalResponse);
+  rpc ListAggregatePartitionStatesInternal(ListAggregatePartitionStatesInternalRequest) returns (ListAggregatePartitionStatesInternalResponse);
+  rpc GetAggregateGroupCatalogInternal(GetAggregateGroupCatalogInternalRequest) returns (GetAggregateGroupCatalogInternalResponse);
+  rpc CommitAggregateGroupCatalogInternal(CommitAggregateGroupCatalogInternalRequest) returns (CommitAggregateGroupCatalogInternalResponse);
+  rpc FetchAggregateGroupPartitionInternal(FetchAggregateGroupPartitionInternalRequest) returns (FetchAggregateGroupPartitionInternalResponse);
+  rpc ApplyAggregateGroupPartitionInternal(ApplyAggregateGroupPartitionInternalRequest) returns (ApplyAggregateGroupPartitionInternalResponse);
+}
+
+message GetAggregateCatalogInternalRequest { uint64 control_shard_id = 1; }
+message GetAggregateCatalogInternalResponse { bytes payload = 1; }
+
+message CommitAggregateCatalogInternalRequest {
+  uint64 control_shard_id = 1;
+  bytes payload = 2; // bincode 编码的 AggregateCatalogCommand
+}
+
+message CommitAggregateCatalogInternalResponse {
+  bytes payload = 1; // bincode 编码的 AggregateCatalogApply
+}
+
+message InstallAggregatePartitionFenceInternalRequest {
+  uint64 shard_id = 1;
+  AggregateEventSetRef event_set = 2;
+  uint32 partition_id = 3;
+  uint64 generation = 4;
+}
+
+message InstallAggregatePartitionFenceInternalResponse { uint64 generation = 1; }
+
+message AggregatePartitionCursor {
+  uint32 partition_id = 1;
+  uint64 next_position = 2;
+}
+
+message SubscribeAggregatePartitionsInternalRequest {
+  uint64 shard_id = 1;
+  AggregateEventSetRef event_set = 2;
+  repeated AggregatePartitionCursor cursors = 3;
+  bool from_now = 4;
+}
+
+message InternalAggregateEvent {
+  uint32 partition_id = 1;
+  uint64 partition_position = 2;
+  AggregateEvent event = 3;
+}
+
+message InternalAggregateCaughtUp {
+  repeated AggregatePartitionCursor cursors = 1;
+}
+
+message SubscribeAggregatePartitionsInternalResponse {
+  oneof payload {
+    InternalAggregateEvent event = 1;
+    InternalAggregateCaughtUp caught_up = 2;
+  }
+}
+
+message AggregateStatePartitionCursor {
+  uint32 partition_id = 1;
+  // 排他起点；空字符串表示从头读取。
+  string after_aggregate_id = 2;
+}
+
+message ListAggregatePartitionStatesInternalRequest {
+  uint64 shard_id = 1;
+  AggregateEventSetRef event_set = 2;
+  repeated AggregateStatePartitionCursor cursors = 3;
+  uint32 limit_per_partition = 4;
+}
+
+message InternalAggregateStateInfo {
+  uint32 partition_id = 1;
+  string aggregate_id = 2;
+  uint64 revision = 3;
+  uint64 modified_unix_millis = 4;
+}
+
+message ListAggregatePartitionStatesInternalResponse {
+  repeated InternalAggregateStateInfo states = 1;
+}
+
+message GetAggregateGroupCatalogInternalRequest { uint64 control_shard_id = 1; }
+message GetAggregateGroupCatalogInternalResponse { bytes payload = 1; }
+
+message CommitAggregateGroupCatalogInternalRequest {
+  uint64 control_shard_id = 1;
+  bytes payload = 2;
+}
+message CommitAggregateGroupCatalogInternalResponse { bytes payload = 1; }
+
+message FetchAggregateGroupPartitionInternalRequest {
+  uint64 shard_id = 1;
+  bytes payload = 2;
+}
+message FetchAggregateGroupPartitionInternalResponse { bytes payload = 1; }
+
+message ApplyAggregateGroupPartitionInternalRequest {
+  uint64 shard_id = 1;
+  bytes payload = 2;
+}
+message ApplyAggregateGroupPartitionInternalResponse { bytes payload = 1; }
 
 message InternalSubscribeRequest {
   uint64 shard_id = 1;

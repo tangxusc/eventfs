@@ -177,11 +177,8 @@ pub async fn run_remove(ctx: &Ctx, args: &MemberRemoveArgs) -> Result<()> {
                         .await?
                         .into_inner();
                     let current: BTreeSet<u64> = state.voter_ids.iter().copied().collect();
-                    let remain: Vec<u64> = current
-                        .iter()
-                        .copied()
-                        .filter(|v| *v != node_id)
-                        .collect();
+                    let remain: Vec<u64> =
+                        current.iter().copied().filter(|v| *v != node_id).collect();
                     let req = ChangeMembershipRequest {
                         shard_id,
                         voter_ids: remain,

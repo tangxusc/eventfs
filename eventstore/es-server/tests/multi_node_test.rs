@@ -854,9 +854,11 @@ async fn sdk_append_redirects_to_leader() {
     sdk.append(
         "sdk-redirect".to_string(),
         es_client::ExpectedVersionBuilder::any(),
-        vec![es_client::EventBuilder::new("E")
-            .data(b"x".to_vec())
-            .build()],
+        vec![
+            es_client::EventBuilder::new("E")
+                .data(b"x".to_vec())
+                .build(),
+        ],
     )
     .await
     .expect("经 leader_addr 重定向后 append 成功");

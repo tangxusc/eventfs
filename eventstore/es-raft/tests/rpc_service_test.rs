@@ -9,8 +9,8 @@ use tonic::{Code, Request};
 
 use es_proto::eventstore::raft_rpc_server::RaftRpc;
 use es_proto::eventstore::*;
-use es_raft::rpc_service::RaftRpcService;
 use es_raft::ShardManager;
+use es_raft::rpc_service::RaftRpcService;
 
 #[tokio::test]
 async fn three_methods_unregistered_not_found() {
@@ -82,5 +82,9 @@ async fn garbage_payload_decode_invalid_argument() {
         .await
         .expect_err("垃圾 payload 应报错");
     assert_eq!(err.code(), Code::InvalidArgument);
-    assert!(err.message().contains("反序列化 VoteRequest"), "{}", err.message());
+    assert!(
+        err.message().contains("反序列化 VoteRequest"),
+        "{}",
+        err.message()
+    );
 }

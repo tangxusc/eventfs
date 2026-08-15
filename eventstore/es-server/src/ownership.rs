@@ -949,9 +949,11 @@ mod tests {
         while let Some(result) = tasks.join_next().await {
             targets.push(result.expect("并发任务完成"));
         }
-        assert!(targets
-            .iter()
-            .all(|target| target.shard_id() == targets[0].shard_id()));
+        assert!(
+            targets
+                .iter()
+                .all(|target| target.shard_id() == targets[0].shard_id())
+        );
         assert_eq!(
             targets.iter().filter(|target| target.created_now()).count(),
             1,

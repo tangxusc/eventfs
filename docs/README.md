@@ -8,6 +8,8 @@ EventFS v2 —— 基于 Rust + openraft 的分布式事件存储。本目录收
 | 文档 | 内容 |
 |---|---|
 | [design.md](design.md) | 架构设计总览：Key 编码与排序性质证明、写入路径、乐观并发、幂等、HLC、流路由表（显式分配）、gRPC 接口、测试策略、本期不实现清单 |
+| [eventfs-fuse.md](eventfs-fuse.md) | AggregateStore 与 eventfs-fuse 设计：事件集分区、文件契约、状态 CAS、消费者组、故障语义与验收 |
+| [eventfs-fuse-self-check.md](eventfs-fuse-self-check.md) | eventfs-fuse 设计自检：需求覆盖、不变量、替代方案、风险与实施门槛 |
 
 ## 专题文档
 

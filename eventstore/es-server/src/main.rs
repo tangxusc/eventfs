@@ -2,8 +2,8 @@
 
 use anyhow::Result;
 use clap::Parser;
-use std::sync::Arc;
 use es_server::{Config, Server};
+use std::sync::Arc;
 
 /// EventStore 服务器命令行参数
 #[derive(Parser, Debug)]
@@ -57,7 +57,11 @@ async fn main() -> Result<()> {
     tracing::info!("Listen address: {}", config.node.listen_addr);
     tracing::info!(
         "TLS: {}",
-        if config.tls.is_some() { "https" } else { "disabled" }
+        if config.tls.is_some() {
+            "https"
+        } else {
+            "disabled"
+        }
     );
     tracing::info!("Data directory: {:?}", config.storage.data_dir);
     tracing::info!(
@@ -94,9 +98,7 @@ async fn main() -> Result<()> {
 
     // 启动服务（监听阻塞）
     let serve_server = server.clone();
-    let serve = tokio::spawn(async move {
-        serve_server.serve().await
-    });
+    let serve = tokio::spawn(async move { serve_server.serve().await });
 
     // 优雅关闭：Ctrl-C / SIGTERM → 停 watcher → 逐 shard 停 Raft 并关闭存储
     // （flush WAL + 释放 surrealkv LOCK，否则重启报 "already locked"）

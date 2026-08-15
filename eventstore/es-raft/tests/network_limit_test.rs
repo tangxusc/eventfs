@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use openraft::error::RPCError;
 use openraft::network::{RPCOption, RaftNetwork};
-use openraft::raft::{AppendEntriesRequest, AppendEntriesResponse, VoteRequest};
+use openraft::raft::{AppendEntriesRequest, AppendEntriesResponse};
 use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId, Vote};
 use tokio::net::TcpListener;
 
@@ -65,13 +65,12 @@ impl RaftRpc for StubService {
             )),
             StubMode::Echo(count) => {
                 count.fetch_add(1, Ordering::SeqCst);
-                let req: AppendEntriesRequest<TypeConfig> =
-                    bincode::serde::decode_from_slice(
-                        &request.get_ref().payload,
-                        bincode::config::standard(),
-                    )
-                    .expect("解码请求")
-                    .0;
+                let req: AppendEntriesRequest<TypeConfig> = bincode::serde::decode_from_slice(
+                    &request.get_ref().payload,
+                    bincode::config::standard(),
+                )
+                .expect("解码请求")
+                .0;
                 // 响应必须基于请求的 term/vote,否则上层逻辑异常
                 let resp = AppendEntriesResponse::<u64>::Success;
                 let payload = bincode::serde::encode_to_vec(&resp, bincode::config::standard())
@@ -171,11 +170,7 @@ async fn oversized_payload_rejected_before_rpc() {
         matches!(err, RPCError::PayloadTooLarge(_)),
         "应返回 PayloadTooLarge,实际 {err:?}"
     );
-    assert_eq!(
-        count.load(Ordering::SeqCst),
-        0,
-        "超限请求不应发出 RPC"
-    );
+    assert_eq!(count.load(Ordering::SeqCst), 0, "超限请求不应发出 RPC");
 }
 
 /// 单条超限 → Unreachable(不构造 hint=1,避免 openraft 死循环)

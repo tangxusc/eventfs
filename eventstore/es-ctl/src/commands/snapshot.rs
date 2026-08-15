@@ -145,8 +145,16 @@ pub async fn list(format: Format, args: &crate::cli::SnapshotListArgs) -> Result
                 "{}",
                 output::render_table(
                     &[
-                        "FILE", "SHARD", "TERM", "INDEX", "SNAPSHOT_ID", "COMPRESS",
-                        "PAYLOAD_B", "SIZE_B", "MTIME", "STATUS"
+                        "FILE",
+                        "SHARD",
+                        "TERM",
+                        "INDEX",
+                        "SNAPSHOT_ID",
+                        "COMPRESS",
+                        "PAYLOAD_B",
+                        "SIZE_B",
+                        "MTIME",
+                        "STATUS"
                     ],
                     &rows
                 )
@@ -266,8 +274,10 @@ pub async fn run_restore(format: Format, args: &SnapshotRestoreArgs) -> Result<(
 
     match format {
         Format::Simple => {
-            println!("恢复完成：分片 {} 回到快照点 term={} index={}（{} 条事件）",
-                report.shard_id, report.term, report.index, report.events);
+            println!(
+                "恢复完成：分片 {} 回到快照点 term={} index={}（{} 条事件）",
+                report.shard_id, report.term, report.index, report.events
+            );
             println!("  快照文件： {}", report.snapshot_file.display());
             println!("  耗时：     {:.1}s", elapsed.as_secs_f64());
             println!("提示：选举状态（vote）已保留，重启后节点以快照点直接恢复；");
@@ -279,7 +289,10 @@ pub async fn run_restore(format: Format, args: &SnapshotRestoreArgs) -> Result<(
                 vec!["term".into(), report.term.to_string()],
                 vec!["index".into(), report.index.to_string()],
                 vec!["events".into(), report.events.to_string()],
-                vec!["snapshot_file".into(), report.snapshot_file.display().to_string()],
+                vec![
+                    "snapshot_file".into(),
+                    report.snapshot_file.display().to_string(),
+                ],
                 vec!["elapsed_ms".into(), elapsed.as_millis().to_string()],
             ];
             println!(

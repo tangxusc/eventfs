@@ -17,8 +17,10 @@ async fn log_range_keys_excluded_end_le_start_none() {
 async fn log_range_keys_excluded_start_max_none() {
     let (st, _d) = new_storage(0);
     // Excluded(u64::MAX) 起点：checked_add 溢出 → 区间空
-    let range: (std::ops::Bound<u64>, std::ops::Bound<u64>) =
-        (std::ops::Bound::Excluded(u64::MAX), std::ops::Bound::Unbounded);
+    let range: (std::ops::Bound<u64>, std::ops::Bound<u64>) = (
+        std::ops::Bound::Excluded(u64::MAX),
+        std::ops::Bound::Unbounded,
+    );
     assert!(st.log_range_keys(&range).is_none());
 }
 
@@ -39,7 +41,10 @@ async fn log_range_keys_unbounded_bounds() {
     // 左闭右开语义：上界 = 日志区后继（恰好是 vote key），排除日志区之后的一切
     assert_eq!(end, key::raft_log_upper(0));
     assert_eq!(end, key::raft_vote(0), "日志区上界应恰好是 vote key");
-    assert!(key::raft_log_entry(0, u64::MAX) < end, "最大日志 key 应小于上界");
+    assert!(
+        key::raft_log_entry(0, u64::MAX) < end,
+        "最大日志 key 应小于上界"
+    );
 }
 
 #[tokio::test]

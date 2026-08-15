@@ -3,10 +3,10 @@
 use std::time::Duration;
 use tokio::time::timeout;
 
+use es_server::Server;
 use es_server::config::{
     Config, NodeConfig, PlacementConfig, PlacementNode, StorageConfig, TlsConfig,
 };
-use es_server::Server;
 
 #[test]
 fn config_validation_rejects_invalid_runtime_configuration() {
@@ -207,6 +207,50 @@ async fn server_serves_public_and_internal_listeners() {
         internal_error.code(),
         tonic::Code::Unimplemented,
         "内部端口必须注册归属控制协议"
+    );
+
+    let mut aggregate =
+        es_proto::eventstore::aggregate_store_client::AggregateStoreClient::connect(format!(
+            "http://{public_addr}"
+        ))
+        .await
+        .expect("连接公共聚合端口");
+    let capabilities = aggregate
+        .get_aggregate_store_capabilities(
+            es_proto::eventstore::GetAggregateStoreCapabilitiesRequest {},
+        )
+        .await
+        .expect("公共端口必须注册 AggregateStore")
+        .into_inner();
+    assert_eq!(capabilities.partition_count, 256);
+
+    let catalog_request = es_proto::eventstore::GetAggregateCatalogInternalRequest {
+        control_shard_id: 0,
+    };
+    let mut public_internal = es_proto::eventstore::aggregate_store_internal_client::AggregateStoreInternalClient::connect(
+        format!("http://{public_addr}"),
+    )
+    .await
+    .expect("连接公共端口检查内部协议隔离");
+    let public_internal_error = public_internal
+        .get_aggregate_catalog_internal(catalog_request.clone())
+        .await
+        .expect_err("公共端口不得暴露 AggregateStoreInternal");
+    assert_eq!(public_internal_error.code(), tonic::Code::Unimplemented);
+
+    let mut aggregate_internal = es_proto::eventstore::aggregate_store_internal_client::AggregateStoreInternalClient::connect(
+        format!("http://{internal_addr}"),
+    )
+    .await
+    .expect("连接内部聚合端口");
+    let aggregate_internal_error = aggregate_internal
+        .get_aggregate_catalog_internal(catalog_request)
+        .await
+        .expect_err("未组建 Raft 时应返回业务错误");
+    assert_ne!(
+        aggregate_internal_error.code(),
+        tonic::Code::Unimplemented,
+        "内部端口必须注册 AggregateStoreInternal"
     );
 
     serving.abort();

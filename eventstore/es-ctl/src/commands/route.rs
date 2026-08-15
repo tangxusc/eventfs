@@ -100,13 +100,9 @@ async fn run_check(ctx: &Ctx) -> Result<()> {
             let rows: Vec<Vec<String>> = orphans
                 .iter()
                 .map(|(s, shard)| vec![s.clone(), shard.to_string(), "孤儿".into()])
-                .chain(
-                    phantom
-                        .iter()
-                        .map(|(s, actual, owner)| {
-                            vec![s.clone(), actual.to_string(), format!("虚挂(指向 {owner})")]
-                        }),
-                )
+                .chain(phantom.iter().map(|(s, actual, owner)| {
+                    vec![s.clone(), actual.to_string(), format!("虚挂(指向 {owner})")]
+                }))
                 .collect();
             let out = if rows.is_empty() {
                 format!("路由表与各分片存储一致（{} 个流）", table.streams.len())

@@ -30,7 +30,11 @@ mod tests {
             .map(|i| route(&format!("stream-{i}"), 16))
             .collect();
         // 100 个流按 16 分片分布，至少触及 10 个分片（概率性，极低概率失败但可重跑）
-        assert!(shards.len() >= 10, "实际分布 {} 个分片，疑似坍缩", shards.len());
+        assert!(
+            shards.len() >= 10,
+            "实际分布 {} 个分片，疑似坍缩",
+            shards.len()
+        );
     }
 
     #[test]

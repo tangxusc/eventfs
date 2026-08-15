@@ -3,8 +3,8 @@
 use openraft::storage::{LogFlushed, RaftLogStorage};
 use openraft::{LogId, LogState, StorageError, StorageIOError, Vote};
 
-use super::storage::read_logs_err;
 use super::EsStorage;
+use super::storage::read_logs_err;
 use crate::key;
 use crate::raft_type::TypeConfig;
 
@@ -15,9 +15,7 @@ fn to_bytes<T: serde::Serialize>(v: &T) -> std::result::Result<Vec<u8>, std::io:
     crate::encode::encode(v).map_err(std::io::Error::other)
 }
 
-fn from_bytes<T: serde::de::DeserializeOwned>(
-    b: &[u8],
-) -> std::result::Result<T, std::io::Error> {
+fn from_bytes<T: serde::de::DeserializeOwned>(b: &[u8]) -> std::result::Result<T, std::io::Error> {
     crate::encode::decode(b).map_err(std::io::Error::other)
 }
 
@@ -72,17 +70,18 @@ impl RaftLogStorage<TypeConfig> for EsStorage {
         let k = key::raft_vote(self.shard_id());
         let v = to_bytes(vote).map_err(|e| StorageIOError::write_vote(&e))?;
         // openraft 要求 save_vote 返回前 vote 必须已落盘，commit 已保证
-        self.set(&k, &v).await.map_err(|e| {
-            StorageIOError::write_vote(&std::io::Error::other(e.to_string()))
-        })?;
+        self.set(&k, &v)
+            .await
+            .map_err(|e| StorageIOError::write_vote(&std::io::Error::other(e.to_string())))?;
         Ok(())
     }
 
     async fn read_vote(&mut self) -> std::result::Result<Option<Vote<u64>>, StorageError<u64>> {
         let k = key::raft_vote(self.shard_id());
-        match self.get(&k).map_err(|e| {
-            StorageIOError::read_vote(&std::io::Error::other(e.to_string()))
-        })? {
+        match self
+            .get(&k)
+            .map_err(|e| StorageIOError::read_vote(&std::io::Error::other(e.to_string())))?
+        {
             None => Ok(None),
             Some(bytes) => {
                 let vote: Vote<u64> =
@@ -130,9 +129,9 @@ impl RaftLogStorage<TypeConfig> for EsStorage {
         let end = key::raft_log_upper(self.shard_id());
 
         let keys = self.collect_keys(start, end).map_err(read_logs_err)?;
-        self.delete_batch(&keys).await.map_err(|e| {
-            StorageIOError::write_logs(&std::io::Error::other(e.to_string()))
-        })?;
+        self.delete_batch(&keys)
+            .await
+            .map_err(|e| StorageIOError::write_logs(&std::io::Error::other(e.to_string())))?;
         Ok(())
     }
 
@@ -156,9 +155,9 @@ impl RaftLogStorage<TypeConfig> for EsStorage {
         };
 
         let keys = self.collect_keys(start, end).map_err(read_logs_err)?;
-        self.delete_batch(&keys).await.map_err(|e| {
-            StorageIOError::write_logs(&std::io::Error::other(e.to_string()))
-        })?;
+        self.delete_batch(&keys)
+            .await
+            .map_err(|e| StorageIOError::write_logs(&std::io::Error::other(e.to_string())))?;
         Ok(())
     }
 
@@ -179,9 +178,8 @@ impl EsStorage {
         match self.get(&k)? {
             None => Ok(None),
             Some(bytes) => {
-                let log_id: Option<LogId<u64>> = from_bytes(&bytes).map_err(|e| {
-                    es_core::Error::Serde(format!("last_purged 反序列化失败: {e}"))
-                })?;
+                let log_id: Option<LogId<u64>> = from_bytes(&bytes)
+                    .map_err(|e| es_core::Error::Serde(format!("last_purged 反序列化失败: {e}")))?;
                 match log_id {
                     Some(id) => Ok(Some(id)),
                     None => Err(es_core::Error::Serde(format!(

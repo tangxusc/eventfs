@@ -549,21 +549,27 @@ mod tests {
             (1, 2, 3, 4, 5, 6)
         );
 
-        assert!(create_settings(&PersistentSettingsArgs {
-            max_unacked_per_group: Some(2),
-            ..Default::default()
-        })
-        .is_some());
-        assert!(create_settings(&PersistentSettingsArgs {
-            retry_min_ms: Some(5),
-            ..Default::default()
-        })
-        .is_some());
-        assert!(create_settings(&PersistentSettingsArgs {
-            retry_max_ms: Some(6),
-            ..Default::default()
-        })
-        .is_some());
+        assert!(
+            create_settings(&PersistentSettingsArgs {
+                max_unacked_per_group: Some(2),
+                ..Default::default()
+            })
+            .is_some()
+        );
+        assert!(
+            create_settings(&PersistentSettingsArgs {
+                retry_min_ms: Some(5),
+                ..Default::default()
+            })
+            .is_some()
+        );
+        assert!(
+            create_settings(&PersistentSettingsArgs {
+                retry_max_ms: Some(6),
+                ..Default::default()
+            })
+            .is_some()
+        );
     }
 
     fn sample_info(target: Option<PersistentSubscriptionTarget>) -> PersistentSubscriptionInfo {

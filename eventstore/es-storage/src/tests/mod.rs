@@ -44,9 +44,7 @@ pub(crate) fn new_storage_cfg(
 }
 
 /// 在同一个 tree 上建多个分片的存储，用于验证 key 前缀隔离
-pub(crate) fn new_shared_storages(
-    shard_ids: &[u64],
-) -> (Vec<EsStorage>, tempfile::TempDir) {
+pub(crate) fn new_shared_storages(shard_ids: &[u64]) -> (Vec<EsStorage>, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("建临时目录");
     let tree = Arc::new(
         surrealkv::TreeBuilder::new()
@@ -100,7 +98,10 @@ pub(crate) fn entry_with(
             stream_id: stream.to_string(),
             expected_version: expected,
             events,
-            hlc: es_core::Hlc { wall: 0, logical: 0 }, // 默认 0，测试里按需覆盖
+            hlc: es_core::Hlc {
+                wall: 0,
+                logical: 0,
+            }, // 默认 0，测试里按需覆盖
         }),
     }
 }
@@ -112,7 +113,5 @@ pub(crate) fn entry_with(
 /// 回调并等待落盘完成，正是测试需要的语义。
 pub(crate) async fn do_append(st: &mut EsStorage, entries: Vec<Entry<TypeConfig>>) {
     use openraft::storage::RaftLogStorageExt;
-    st.blocking_append(entries)
-        .await
-        .expect("append 必须成功");
+    st.blocking_append(entries).await.expect("append 必须成功");
 }

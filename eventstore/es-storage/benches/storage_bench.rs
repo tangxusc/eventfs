@@ -5,7 +5,7 @@
 //!
 //! 注:写入需要完整 Raft 环境,此处只测读取与快照恢复。
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use es_storage::storage::EsStorage;
 use once_cell::sync::Lazy;
 use std::sync::Arc;
@@ -47,9 +47,5 @@ fn bench_read_empty_stream(c: &mut Criterion) {
     });
 }
 
-
-criterion_group!(
-    benches,
-    bench_read_empty_stream,
-);
+criterion_group!(benches, bench_read_empty_stream,);
 criterion_main!(benches);

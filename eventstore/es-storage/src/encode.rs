@@ -28,9 +28,7 @@ use serde::de::Error as _;
 ///
 /// # 返回
 /// 编码后的字节；序列化失败时返回 [`bincode::error::EncodeError`]。
-pub fn encode<T: serde::Serialize>(
-    v: &T,
-) -> Result<Vec<u8>, bincode::error::EncodeError> {
+pub fn encode<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, bincode::error::EncodeError> {
     bincode::serde::encode_to_vec(v, standard())
 }
 

@@ -135,7 +135,10 @@ async fn register_beyond_initial_range_extends() {
         .await
         .expect("建 Raft");
     let shard = Arc::new(Shard::new(2, raft, Arc::new(store)));
-    manager.register_shard(shard).await.expect("动态 shard 应注册成功");
+    manager
+        .register_shard(shard)
+        .await
+        .expect("动态 shard 应注册成功");
     // 范围自动扩展为 max(shard_id)+1
     assert_eq!(manager.num_shards(), 3);
     assert_eq!(manager.shard_ids().await, vec![2]);

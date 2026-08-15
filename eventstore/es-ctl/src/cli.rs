@@ -230,6 +230,8 @@ pub enum Command {
     Snapshot(SnapshotArgs),
     /// 管理和消费持久化拉取订阅。
     Persistent(PersistentArgs),
+    /// 管理聚合事件集、实例事件与状态。
+    Aggregate(AggregateArgs),
 }
 
 /// `stream=version` 起点参数。
@@ -410,6 +412,335 @@ pub struct PersistentParkedArgs {
 #[derive(Args, Debug)]
 pub struct PersistentReplayArgs {
     pub name: String,
+}
+
+/// 聚合事件集命令（esctl aggregate <action>）。
+#[derive(Args, Debug)]
+pub struct AggregateArgs {
+    #[command(subcommand)]
+    pub action: AggregateAction,
+}
+
+/// 聚合事件集操作。
+#[derive(Subcommand, Debug)]
+pub enum AggregateAction {
+    /// 查询 AggregateStore 协议能力。
+    Capabilities,
+    /// 创建并激活一个聚合事件集。
+    Create(AggregateCreateArgs),
+    /// 枚举全部聚合事件集。
+    List,
+    /// 获取一个聚合事件集。
+    Get(AggregateEventSetArgs),
+    /// 追加一条实例事件。
+    Append(AggregateAppendArgs),
+    /// 从历史或当前时刻持续跟随事件。
+    Follow(AggregateFollowArgs),
+    /// 读取或覆盖聚合实例状态。
+    State(AggregateStateArgs),
+    /// 管理和消费聚合消费者组。
+    Group(AggregateGroupArgs),
+    /// 查询 catalog 状态。
+    Status,
+    /// 查看事件集的物理分区放置。
+    Partitions(AggregateEventSetArgs),
+}
+
+/// 聚合事件集身份。
+#[derive(Args, Debug, Clone)]
+pub struct AggregateEventSetArgs {
+    /// 业务空间，例如 orders。
+    pub business_space: String,
+    /// 聚合类型，例如 order。
+    pub aggregate_type: String,
+}
+
+/// 创建聚合事件集参数。
+#[derive(Args, Debug, Clone)]
+pub struct AggregateCreateArgs {
+    /// 业务空间，例如 orders。
+    pub business_space: String,
+    /// 聚合类型，例如 order。
+    pub aggregate_type: String,
+    /// operation UUID；缺省随机生成，手工重试时应复用。
+    #[arg(long)]
+    pub operation_id: Option<String>,
+}
+
+/// 聚合实例期望版本。
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExpectedAggregateVersionArg {
+    Any,
+    NoAggregate,
+    AggregateExists,
+    Exact(u64),
+}
+
+impl FromStr for ExpectedAggregateVersionArg {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "any" => Ok(Self::Any),
+            "no-aggregate" | "noaggregate" | "nostream" => Ok(Self::NoAggregate),
+            "exists" => Ok(Self::AggregateExists),
+            number => number.parse::<u64>().map(Self::Exact).map_err(|_| {
+                format!("非法聚合期望版本 {value:?}：应为 any、no-aggregate、exists 或数字")
+            }),
+        }
+    }
+}
+
+/// 追加聚合事件参数。
+#[derive(Args, Debug)]
+#[command(group(
+    clap::ArgGroup::new("aggregate_data_source")
+        .required(true)
+        .args(["data", "data_file"])
+))]
+pub struct AggregateAppendArgs {
+    pub business_space: String,
+    pub aggregate_type: String,
+    pub aggregate_id: String,
+    #[arg(long)]
+    pub event_type: String,
+    /// JSON data。
+    #[arg(long)]
+    pub data: Option<String>,
+    /// 从文件读取 JSON data。
+    #[arg(long)]
+    pub data_file: Option<PathBuf>,
+    /// JSON metadata；缺省空对象。
+    #[arg(long)]
+    pub metadata: Option<String>,
+    /// 事件 UUID；缺省随机生成。
+    #[arg(long)]
+    pub event_id: Option<String>,
+    /// any / no-aggregate / exists / 精确数字。
+    #[arg(long, value_parser = ExpectedAggregateVersionArg::from_str, default_value = "any")]
+    pub expected_version: ExpectedAggregateVersionArg,
+}
+
+/// 持续跟随聚合事件参数。
+#[derive(Args, Debug)]
+pub struct AggregateFollowArgs {
+    pub business_space: String,
+    pub aggregate_type: String,
+    /// 从当前各分区 head 开始；缺省从 Beginning。
+    #[arg(long, conflicts_with = "cursor")]
+    pub now: bool,
+    /// 服务端 opaque cursor 的十六进制表示。
+    #[arg(long, conflicts_with = "now")]
+    pub cursor: Option<String>,
+    /// 收到 caught_up 后退出。
+    #[arg(long)]
+    pub once: bool,
+}
+
+/// 聚合状态命令（esctl aggregate state <action>）。
+#[derive(Args, Debug)]
+pub struct AggregateStateArgs {
+    #[command(subcommand)]
+    pub action: AggregateStateAction,
+}
+
+/// 聚合状态操作。
+#[derive(Subcommand, Debug)]
+pub enum AggregateStateAction {
+    /// 分页枚举存在状态的实例。
+    List(AggregateStateListArgs),
+    /// 读取一个实例的状态。
+    Get(AggregateStateGetArgs),
+    /// 以 revision CAS 覆盖一个实例的状态。
+    Put(AggregateStatePutArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct AggregateStateListArgs {
+    pub business_space: String,
+    pub aggregate_type: String,
+    #[arg(long, default_value_t = 100)]
+    pub page_size: u32,
+    /// 上一页 token 的十六进制表示。
+    #[arg(long)]
+    pub page_token: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct AggregateStateGetArgs {
+    pub business_space: String,
+    pub aggregate_type: String,
+    pub aggregate_id: String,
+}
+
+#[derive(Args, Debug)]
+#[command(group(
+    clap::ArgGroup::new("aggregate_state_data_source")
+        .required(true)
+        .args(["data", "data_file"])
+))]
+pub struct AggregateStatePutArgs {
+    pub business_space: String,
+    pub aggregate_type: String,
+    pub aggregate_id: String,
+    /// JSON 状态。
+    #[arg(long)]
+    pub data: Option<String>,
+    /// 从文件读取 JSON 状态。
+    #[arg(long)]
+    pub data_file: Option<PathBuf>,
+    /// absent 或精确 revision。
+    #[arg(long, default_value = "absent")]
+    pub expected_revision: String,
+}
+
+/// 聚合消费者组命令（esctl aggregate group <action>）。
+#[derive(Args, Debug)]
+pub struct AggregateGroupArgs {
+    /// 要执行的消费者组操作。
+    #[command(subcommand)]
+    pub action: AggregateGroupAction,
+}
+
+/// 聚合消费者组操作。
+#[derive(Subcommand, Debug)]
+pub enum AggregateGroupAction {
+    /// 创建消费者组。
+    Create(AggregateGroupCreateArgs),
+    /// 以 revision CAS 更新设置或 reset 起点。
+    Update(AggregateGroupUpdateArgs),
+    /// 以 revision CAS 删除消费者组。
+    Delete(AggregateGroupDeleteArgs),
+    /// 枚举事件集下的消费者组。
+    List(AggregateEventSetArgs),
+    /// 拉取一批待显式结算的 delivery。
+    Fetch(AggregateGroupFetchArgs),
+    /// Ack、Retry、Park 或 Skip 一条 delivery。
+    Settle(AggregateGroupSettleArgs),
+}
+
+/// 可选的聚合消费者组设置。
+#[derive(Args, Debug, Clone, Default)]
+pub struct AggregateGroupSettingsArgs {
+    /// 单消费者最大未确认数。
+    #[arg(long)]
+    pub max_unacked_per_consumer: Option<u32>,
+    /// 整个组最大未确认数。
+    #[arg(long)]
+    pub max_unacked_per_group: Option<u32>,
+    /// delivery 租约时长（毫秒）。
+    #[arg(long)]
+    pub ack_timeout_ms: Option<u64>,
+    /// 自动重试次数上限。
+    #[arg(long)]
+    pub max_retries: Option<u32>,
+    /// 最小重试退避（毫秒）。
+    #[arg(long)]
+    pub retry_min_ms: Option<u64>,
+    /// 最大重试退避（毫秒）。
+    #[arg(long)]
+    pub retry_max_ms: Option<u64>,
+}
+
+/// 创建聚合消费者组参数。
+#[derive(Args, Debug)]
+pub struct AggregateGroupCreateArgs {
+    pub business_space: String,
+    pub aggregate_type: String,
+    pub name: String,
+    /// 从创建时的各分区 head 开始；缺省从 Beginning。
+    #[arg(long)]
+    pub now: bool,
+    /// operation UUID；模糊重试必须复用。
+    #[arg(long)]
+    pub operation_id: Option<String>,
+    #[command(flatten)]
+    pub settings: AggregateGroupSettingsArgs,
+}
+
+/// 更新聚合消费者组参数。
+#[derive(Args, Debug)]
+pub struct AggregateGroupUpdateArgs {
+    pub business_space: String,
+    pub aggregate_type: String,
+    pub name: String,
+    /// 当前组 revision。
+    #[arg(long)]
+    pub expected_revision: u64,
+    /// reset 到各分区位置 0。
+    #[arg(long, conflicts_with = "reset_now")]
+    pub reset_beginning: bool,
+    /// reset 到当前各分区 head。
+    #[arg(long, conflicts_with = "reset_beginning")]
+    pub reset_now: bool,
+    /// operation UUID；模糊重试必须复用。
+    #[arg(long)]
+    pub operation_id: Option<String>,
+    #[command(flatten)]
+    pub settings: AggregateGroupSettingsArgs,
+}
+
+/// 删除聚合消费者组参数。
+#[derive(Args, Debug)]
+pub struct AggregateGroupDeleteArgs {
+    pub business_space: String,
+    pub aggregate_type: String,
+    pub name: String,
+    /// 当前组 revision。
+    #[arg(long)]
+    pub expected_revision: u64,
+    /// operation UUID；模糊重试必须复用。
+    #[arg(long)]
+    pub operation_id: Option<String>,
+}
+
+/// 拉取聚合消费者组参数。
+#[derive(Args, Debug)]
+pub struct AggregateGroupFetchArgs {
+    pub business_space: String,
+    pub aggregate_type: String,
+    pub name: String,
+    /// 消费成员 ID。
+    #[arg(long)]
+    pub consumer: String,
+    /// 最大 delivery 数；0 使用服务端默认。
+    #[arg(long, default_value_t = 100)]
+    pub max_events: u32,
+    /// 最大 payload 字节；0 使用服务端默认。
+    #[arg(long, default_value_t = 4 * 1024 * 1024)]
+    pub max_bytes: u64,
+    /// 长轮询时间（毫秒）。
+    #[arg(long, default_value_t = 15_000)]
+    pub wait_ms: u64,
+}
+
+/// delivery 结算动作。
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum AggregateGroupSettlementActionArg {
+    Ack,
+    Retry,
+    Park,
+    Skip,
+}
+
+/// 结算一条聚合消费者组 delivery 的参数。
+#[derive(Args, Debug)]
+pub struct AggregateGroupSettleArgs {
+    pub business_space: String,
+    pub aggregate_type: String,
+    pub name: String,
+    /// 消费成员 ID。
+    #[arg(long)]
+    pub consumer: String,
+    /// Fetch 返回的十六进制 opaque token。
+    #[arg(long)]
+    pub delivery: String,
+    /// 结算动作。
+    #[arg(long, value_enum)]
+    pub action: AggregateGroupSettlementActionArg,
+    /// Retry/Park 的诊断原因。
+    #[arg(long, default_value = "")]
+    pub reason: String,
 }
 
 /// 快照子命令（esctl snapshot <list|restore>）

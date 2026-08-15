@@ -7,8 +7,8 @@ use std::time::Duration;
 use es_proto::eventstore::event_store_server::EventStoreServer;
 use es_proto::eventstore::raft_admin_server::RaftAdminServer;
 use es_proto::eventstore::raft_rpc_server::RaftRpcServer;
-use es_server::config::{Config, NodeConfig, PlacementConfig, PlacementNode, StorageConfig};
 use es_server::Server;
+use es_server::config::{Config, NodeConfig, PlacementConfig, PlacementNode, StorageConfig};
 
 /// 启动测试服务器（单节点、2 分片、每分片单成员自举）。
 ///
@@ -80,6 +80,9 @@ async fn start_server() -> (
     // 共享 server 的路由表实例（EsService::new 会自建独立实例，内存态不同步）
     let route_table = server.route_table().clone();
     let ownership = server.ownership().clone();
+    let aggregate_service =
+        es_server::aggregate_service::AggregateStoreService::new(sm.clone(), &config)
+            .expect("创建聚合服务");
     let handle = tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
             .add_service(EventStoreServer::new(
@@ -98,6 +101,11 @@ async fn start_server() -> (
             .add_service(
                 es_proto::eventstore::migration_server::MigrationServer::new(
                     es_server::migration_service::MigrationService::new(route_table, sm, ownership),
+                ),
+            )
+            .add_service(
+                es_proto::eventstore::aggregate_store_server::AggregateStoreServer::new(
+                    aggregate_service,
                 ),
             )
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
@@ -201,6 +209,656 @@ fn stdout(output: &Output) -> String {
 /// 标准错误转 UTF-8
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn aggregate_cli_create_append_state_and_follow_roundtrip() {
+    let (addr, handle, server, _dir) = start_server().await;
+
+    let created = esctl(
+        &addr,
+        &["-w", "json", "aggregate", "create", "orders", "order"],
+    );
+    assert!(
+        created.status.success(),
+        "create stderr: {}",
+        stderr(&created)
+    );
+    let created_json: serde_json::Value =
+        serde_json::from_str(stdout(&created).trim()).expect("create JSON");
+    assert_eq!(created_json["event_sets"][0]["partition_count"], 256);
+
+    let appended = esctl(
+        &addr,
+        &[
+            "-w",
+            "json",
+            "aggregate",
+            "append",
+            "orders",
+            "order",
+            "order-1",
+            "--event-type",
+            "order.created",
+            "--data",
+            r#"{"amount":100}"#,
+            "--expected-version",
+            "no-aggregate",
+        ],
+    );
+    assert!(
+        appended.status.success(),
+        "append stderr: {}",
+        stderr(&appended)
+    );
+    let appended_json: serde_json::Value =
+        serde_json::from_str(stdout(&appended).trim()).expect("append JSON");
+    assert_eq!(appended_json["aggregate_version"], 0);
+
+    let state = esctl(
+        &addr,
+        &[
+            "-w",
+            "json",
+            "aggregate",
+            "state",
+            "put",
+            "orders",
+            "order",
+            "order-1",
+            "--data",
+            r#"{"balance":100}"#,
+        ],
+    );
+    assert!(state.status.success(), "state stderr: {}", stderr(&state));
+    let state_json: serde_json::Value =
+        serde_json::from_str(stdout(&state).trim()).expect("state JSON");
+    assert_eq!(state_json["revision"], 0);
+
+    let followed = esctl(
+        &addr,
+        &[
+            "-w",
+            "json",
+            "aggregate",
+            "follow",
+            "orders",
+            "order",
+            "--once",
+        ],
+    );
+    assert!(
+        followed.status.success(),
+        "follow stderr: {}",
+        stderr(&followed)
+    );
+    let frames = stdout(&followed)
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("follow JSONL"))
+        .collect::<Vec<_>>();
+    assert!(frames.iter().any(|frame| frame["type"] == "event"));
+    assert_eq!(frames.last().expect("caught-up frame")["type"], "caught_up");
+
+    handle.abort();
+    let _ = handle.await;
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn aggregate_group_cli_management_fetch_and_settle_roundtrip() {
+    let (addr, handle, server, _dir) = start_server().await;
+    for args in [
+        vec!["aggregate", "create", "billing", "invoice"],
+        vec![
+            "aggregate",
+            "append",
+            "billing",
+            "invoice",
+            "invoice-1",
+            "--event-type",
+            "invoice.created",
+            "--data",
+            r#"{"amount":100}"#,
+            "--expected-version",
+            "no-aggregate",
+        ],
+    ] {
+        let output = esctl(&addr, &args);
+        assert!(output.status.success(), "stderr: {}", stderr(&output));
+    }
+
+    let created = esctl(
+        &addr,
+        &[
+            "-w",
+            "json",
+            "aggregate",
+            "group",
+            "create",
+            "billing",
+            "invoice",
+            "workers",
+            "--ack-timeout-ms",
+            "2000",
+        ],
+    );
+    assert!(
+        created.status.success(),
+        "create group: {}",
+        stderr(&created)
+    );
+    let created_json: serde_json::Value =
+        serde_json::from_str(stdout(&created).trim()).expect("create group JSON");
+    assert_eq!(created_json["groups"][0]["revision"], 1);
+    assert_eq!(created_json["groups"][0]["epoch"], 1);
+
+    let listed = esctl(
+        &addr,
+        &[
+            "-w",
+            "json",
+            "aggregate",
+            "group",
+            "list",
+            "billing",
+            "invoice",
+        ],
+    );
+    assert!(listed.status.success(), "list group: {}", stderr(&listed));
+    let listed_json: serde_json::Value =
+        serde_json::from_str(stdout(&listed).trim()).expect("list group JSON");
+    assert_eq!(listed_json["groups"][0]["name"], "workers");
+
+    let fetched = esctl(
+        &addr,
+        &[
+            "-w",
+            "json",
+            "aggregate",
+            "group",
+            "fetch",
+            "billing",
+            "invoice",
+            "workers",
+            "--consumer",
+            "consumer-a",
+            "--wait-ms",
+            "0",
+        ],
+    );
+    assert!(
+        fetched.status.success(),
+        "fetch group: {}",
+        stderr(&fetched)
+    );
+    let fetched_json: serde_json::Value =
+        serde_json::from_str(stdout(&fetched).trim()).expect("fetch group JSON");
+    let delivery = fetched_json["deliveries"][0]["delivery_id"]
+        .as_str()
+        .expect("opaque delivery token");
+
+    let settled = esctl(
+        &addr,
+        &[
+            "-w",
+            "json",
+            "aggregate",
+            "group",
+            "settle",
+            "billing",
+            "invoice",
+            "workers",
+            "--consumer",
+            "consumer-a",
+            "--delivery",
+            delivery,
+            "--action",
+            "ack",
+        ],
+    );
+    assert!(
+        settled.status.success(),
+        "settle group: {}",
+        stderr(&settled)
+    );
+    let settled_json: serde_json::Value =
+        serde_json::from_str(stdout(&settled).trim()).expect("settle group JSON");
+    assert_eq!(settled_json["status"], "AGGREGATE_GROUP_SETTLEMENT_APPLIED");
+
+    let updated = esctl(
+        &addr,
+        &[
+            "-w",
+            "json",
+            "aggregate",
+            "group",
+            "update",
+            "billing",
+            "invoice",
+            "workers",
+            "--expected-revision",
+            "1",
+            "--max-retries",
+            "9",
+        ],
+    );
+    assert!(
+        updated.status.success(),
+        "update group: {}",
+        stderr(&updated)
+    );
+    let updated_json: serde_json::Value =
+        serde_json::from_str(stdout(&updated).trim()).expect("update group JSON");
+    assert_eq!(updated_json["groups"][0]["revision"], 2);
+    assert_eq!(updated_json["groups"][0]["epoch"], 1);
+
+    let delete_id = uuid::Uuid::new_v4().to_string();
+    for _ in 0..2 {
+        let deleted = esctl(
+            &addr,
+            &[
+                "-w",
+                "json",
+                "aggregate",
+                "group",
+                "delete",
+                "billing",
+                "invoice",
+                "workers",
+                "--expected-revision",
+                "2",
+                "--operation-id",
+                &delete_id,
+            ],
+        );
+        assert!(
+            deleted.status.success(),
+            "delete group: {}",
+            stderr(&deleted)
+        );
+    }
+
+    handle.abort();
+    let _ = handle.await;
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn aggregate_cli_covers_diagnostics_cursors_paging_resets_and_settlement_actions() {
+    let (addr, handle, server, _dir) = start_server().await;
+    let created = esctl(&addr, &["aggregate", "create", "orders", "order"]);
+    assert!(created.status.success(), "create: {}", stderr(&created));
+
+    for args in [
+        vec!["aggregate", "capabilities"],
+        vec!["-w", "table", "aggregate", "list"],
+        vec!["-w", "simple", "aggregate", "get", "orders", "order"],
+        vec!["aggregate", "status"],
+        vec!["-w", "table", "aggregate", "partitions", "orders", "order"],
+    ] {
+        let output = esctl(&addr, &args);
+        assert!(
+            output.status.success(),
+            "args={args:?}: {}",
+            stderr(&output)
+        );
+    }
+
+    for aggregate_id in ["order-1", "order-2"] {
+        let appended = esctl(
+            &addr,
+            &[
+                "aggregate",
+                "append",
+                "orders",
+                "order",
+                aggregate_id,
+                "--event-type",
+                "order.created",
+                "--data",
+                "{}",
+                "--expected-version",
+                "no-aggregate",
+            ],
+        );
+        assert!(
+            appended.status.success(),
+            "append {aggregate_id}: {}",
+            stderr(&appended)
+        );
+        let state = esctl(
+            &addr,
+            &[
+                "aggregate",
+                "state",
+                "put",
+                "orders",
+                "order",
+                aggregate_id,
+                "--data",
+                "{}",
+            ],
+        );
+        assert!(state.status.success(), "state put: {}", stderr(&state));
+    }
+
+    let exact_state = esctl(
+        &addr,
+        &[
+            "aggregate",
+            "state",
+            "put",
+            "orders",
+            "order",
+            "order-1",
+            "--data",
+            r#"{"revision":1}"#,
+            "--expected-revision",
+            "0",
+        ],
+    );
+    assert!(
+        exact_state.status.success(),
+        "exact state: {}",
+        stderr(&exact_state)
+    );
+    let state_get = esctl(
+        &addr,
+        &[
+            "-w",
+            "simple",
+            "aggregate",
+            "state",
+            "get",
+            "orders",
+            "order",
+            "order-1",
+        ],
+    );
+    assert!(
+        state_get.status.success(),
+        "state get: {}",
+        stderr(&state_get)
+    );
+    let first_page = esctl(
+        &addr,
+        &[
+            "-w",
+            "simple",
+            "aggregate",
+            "state",
+            "list",
+            "orders",
+            "order",
+            "--page-size",
+            "1",
+        ],
+    );
+    assert!(
+        first_page.status.success(),
+        "state list: {}",
+        stderr(&first_page)
+    );
+    let first_page_stderr = stderr(&first_page);
+    let page_token = first_page_stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("next_page_token="))
+        .expect("simple 状态分页输出 next_page_token")
+        .to_string();
+    let second_page = esctl(
+        &addr,
+        &[
+            "-w",
+            "table",
+            "aggregate",
+            "state",
+            "list",
+            "orders",
+            "order",
+            "--page-size",
+            "1",
+            "--page-token",
+            &page_token,
+        ],
+    );
+    assert!(
+        second_page.status.success(),
+        "state second page: {}",
+        stderr(&second_page)
+    );
+
+    let beginning = esctl(
+        &addr,
+        &[
+            "-w",
+            "json",
+            "aggregate",
+            "follow",
+            "orders",
+            "order",
+            "--once",
+        ],
+    );
+    assert!(beginning.status.success(), "follow: {}", stderr(&beginning));
+    let cursor = stdout(&beginning)
+        .lines()
+        .last()
+        .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .and_then(|value| value["cursor"].as_str().map(str::to_string))
+        .expect("follow caught_up cursor");
+    for extra in [vec!["--now"], vec!["--cursor", cursor.as_str()]] {
+        let mut args = vec![
+            "-w",
+            "json",
+            "aggregate",
+            "follow",
+            "orders",
+            "order",
+            "--once",
+        ];
+        args.extend(extra);
+        let output = esctl(&addr, &args);
+        assert!(
+            output.status.success(),
+            "follow args={args:?}: {}",
+            stderr(&output)
+        );
+    }
+
+    let now_group = esctl(
+        &addr,
+        &[
+            "aggregate",
+            "group",
+            "create",
+            "orders",
+            "order",
+            "now-workers",
+            "--now",
+        ],
+    );
+    assert!(
+        now_group.status.success(),
+        "now group: {}",
+        stderr(&now_group)
+    );
+    let invalid_update = esctl(
+        &addr,
+        &[
+            "aggregate",
+            "group",
+            "update",
+            "orders",
+            "order",
+            "now-workers",
+            "--expected-revision",
+            "1",
+        ],
+    );
+    assert!(!invalid_update.status.success());
+    assert!(stderr(&invalid_update).contains("至少需要"));
+    let reset_now = esctl(
+        &addr,
+        &[
+            "aggregate",
+            "group",
+            "update",
+            "orders",
+            "order",
+            "now-workers",
+            "--expected-revision",
+            "1",
+            "--reset-now",
+        ],
+    );
+    assert!(
+        reset_now.status.success(),
+        "reset now: {}",
+        stderr(&reset_now)
+    );
+    let reset_beginning = esctl(
+        &addr,
+        &[
+            "aggregate",
+            "group",
+            "update",
+            "orders",
+            "order",
+            "now-workers",
+            "--expected-revision",
+            "2",
+            "--reset-beginning",
+        ],
+    );
+    assert!(
+        reset_beginning.status.success(),
+        "reset beginning: {}",
+        stderr(&reset_beginning)
+    );
+
+    for (index, action) in ["ack", "retry", "park", "skip"].into_iter().enumerate() {
+        let group_name = format!("action-{action}");
+        let created = esctl(
+            &addr,
+            &[
+                "aggregate",
+                "group",
+                "create",
+                "orders",
+                "order",
+                &group_name,
+            ],
+        );
+        assert!(
+            created.status.success(),
+            "group {group_name}: {}",
+            stderr(&created)
+        );
+        let fetched = esctl(
+            &addr,
+            &[
+                "-w",
+                "json",
+                "aggregate",
+                "group",
+                "fetch",
+                "orders",
+                "order",
+                &group_name,
+                "--consumer",
+                "consumer-a",
+                "--max-events",
+                "1",
+                "--wait-ms",
+                "0",
+            ],
+        );
+        assert!(
+            fetched.status.success(),
+            "fetch {group_name}: {}",
+            stderr(&fetched)
+        );
+        let fetched_json: serde_json::Value =
+            serde_json::from_str(stdout(&fetched).trim()).expect("fetch JSON");
+        let delivery = fetched_json["deliveries"][0]["delivery_id"]
+            .as_str()
+            .expect("delivery token");
+        let settled = esctl(
+            &addr,
+            &[
+                "-w",
+                if index == 0 { "json" } else { "simple" },
+                "aggregate",
+                "group",
+                "settle",
+                "orders",
+                "order",
+                &group_name,
+                "--consumer",
+                "consumer-a",
+                "--delivery",
+                delivery,
+                "--action",
+                action,
+                "--reason",
+                "coverage",
+            ],
+        );
+        assert!(
+            settled.status.success(),
+            "settle {action}: {}",
+            stderr(&settled)
+        );
+    }
+
+    for format in ["table", "simple"] {
+        let fetched = esctl(
+            &addr,
+            &[
+                "-w",
+                format,
+                "aggregate",
+                "group",
+                "fetch",
+                "orders",
+                "order",
+                "now-workers",
+                "--consumer",
+                "consumer-b",
+                "--wait-ms",
+                "0",
+            ],
+        );
+        assert!(
+            fetched.status.success(),
+            "fetch {format}: {}",
+            stderr(&fetched)
+        );
+    }
+    let deleted = esctl(
+        &addr,
+        &[
+            "-w",
+            "simple",
+            "aggregate",
+            "group",
+            "delete",
+            "orders",
+            "order",
+            "now-workers",
+            "--expected-revision",
+            "3",
+        ],
+    );
+    assert!(
+        deleted.status.success(),
+        "simple delete: {}",
+        stderr(&deleted)
+    );
+
+    handle.abort();
+    let _ = handle.await;
+    server.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

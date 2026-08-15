@@ -25,6 +25,7 @@ surrealkv = { workspace = true }
 es-proto = { workspace = true }
 es-core = { workspace = true }
 es-storage = { workspace = true }
+es-client = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

@@ -1,9 +1,11 @@
 //! EventStore 客户端 SDK。
 
+pub mod aggregate;
 pub mod builder;
 pub mod client;
 pub mod persistent;
 
+pub use aggregate::{AggregateFollowStream, AggregateStoreClient};
 pub use builder::{EventBuilder, ExpectedVersionBuilder};
 pub use client::{ClientError, EventStoreClient, SubscribeStream, SubscribeTarget};
 pub use persistent::PersistentSubscriptionsClient;

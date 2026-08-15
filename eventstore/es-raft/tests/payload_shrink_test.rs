@@ -148,11 +148,9 @@ impl RaftNetwork<TypeConfig> for SplittingLink {
                 if max == 0 || req.entries.len() > max {
                     self.net.count_rejected().await;
                     if req.entries.len() <= 1 {
-                        return Err(RPCError::Unreachable(
-                            openraft::error::Unreachable::new(&std::io::Error::other(
-                                "单条 AppendEntries 超过消息上限",
-                            )),
-                        ));
+                        return Err(RPCError::Unreachable(openraft::error::Unreachable::new(
+                            &std::io::Error::other("单条 AppendEntries 超过消息上限"),
+                        )));
                     }
                     let hint = ((req.entries.len() as u64) / 2).max(1);
                     return Err(RPCError::PayloadTooLarge(
@@ -163,9 +161,9 @@ impl RaftNetwork<TypeConfig> for SplittingLink {
         }
 
         if self.net.is_cut(self.from, self.to).await {
-            return Err(RPCError::Network(NetworkError::new(&std::io::Error::other(
-                format!("链路 {}→{} 已被切断", self.from, self.to),
-            ))));
+            return Err(RPCError::Network(NetworkError::new(
+                &std::io::Error::other(format!("链路 {}→{} 已被切断", self.from, self.to)),
+            )));
         }
         let raft = self.net.raft_of(self.to).await.ok_or_else(|| {
             RPCError::Network(NetworkError::new(&std::io::Error::other("节点未注册")))
@@ -184,9 +182,9 @@ impl RaftNetwork<TypeConfig> for SplittingLink {
         RPCError<u64, BasicNode, RaftError<u64, InstallSnapshotError>>,
     > {
         if self.net.is_cut(self.from, self.to).await {
-            return Err(RPCError::Network(NetworkError::new(&std::io::Error::other(
-                format!("链路 {}→{} 已被切断", self.from, self.to),
-            ))));
+            return Err(RPCError::Network(NetworkError::new(
+                &std::io::Error::other(format!("链路 {}→{} 已被切断", self.from, self.to)),
+            )));
         }
         let raft = self.net.raft_of(self.to).await.ok_or_else(|| {
             RPCError::Network(NetworkError::new(&std::io::Error::other("节点未注册")))
@@ -202,9 +200,9 @@ impl RaftNetwork<TypeConfig> for SplittingLink {
         _o: RPCOption,
     ) -> Result<VoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
         if self.net.is_cut(self.from, self.to).await {
-            return Err(RPCError::Network(NetworkError::new(&std::io::Error::other(
-                format!("链路 {}→{} 已被切断", self.from, self.to),
-            ))));
+            return Err(RPCError::Network(NetworkError::new(
+                &std::io::Error::other(format!("链路 {}→{} 已被切断", self.from, self.to)),
+            )));
         }
         let raft = self.net.raft_of(self.to).await.ok_or_else(|| {
             RPCError::Network(NetworkError::new(&std::io::Error::other("节点未注册")))

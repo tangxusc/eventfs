@@ -21,7 +21,7 @@ use es_proto::eventstore::*;
 use es_raft::ShardManager;
 
 use crate::ownership::{OwnershipChange, StreamOwnership};
-use crate::route_table::{table_to_proto, RouteTableManager};
+use crate::route_table::{RouteTableManager, table_to_proto};
 use crate::service::client_write_to_status;
 
 /// Migration gRPC 服务
@@ -461,13 +461,16 @@ mod tests {
             operation_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
         })
         .expect("解析孤儿收养");
-        assert!(matches!(
-            change,
-            OwnershipChange::AdoptOrphan {
-                stream,
-                source_shard: 3,
-                target_shard: 8,
-            } if stream == "orders/orphan"
-        ));
+        let OwnershipChange::AdoptOrphan {
+            stream,
+            source_shard,
+            target_shard,
+        } = change
+        else {
+            panic!("generation=0 必须生成孤儿收养变更");
+        };
+        assert_eq!(stream, "orders/orphan");
+        assert_eq!(source_shard, 3);
+        assert_eq!(target_shard, 8);
     }
 }

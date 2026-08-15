@@ -7,16 +7,19 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use es_proto::eventstore::raft_admin_client::RaftAdminClient;
 use es_proto::eventstore::GetRaftStateRequest;
-use es_proto::tls::{apply_endpoint_tls, TlsClientConfig};
+use es_proto::eventstore::raft_admin_client::RaftAdminClient;
+use es_proto::tls::{TlsClientConfig, apply_endpoint_tls};
+use es_server::Server;
 use es_server::config::{
     Config, NodeConfig, PeerConfig, PlacementConfig, PlacementNode, StorageConfig, TlsConfig,
 };
-use es_server::Server;
 
 /// 测试固定用分片 0
 const SHARD: u64 = 0;
+
+/// coverage 插桩下并行启动多个三节点集群会放大选举时序，测试间必须隔离。
+static BOOTSTRAP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// TLS 测试材料：本节点证书/私钥 + 可选的全节点证书拼接（严格校验用 ca）
 #[derive(Clone)]
@@ -251,6 +254,7 @@ fn init_tracing() {
 
 #[tokio::test]
 async fn inprocess_three_node_bootstrap() {
+    let _guard = BOOTSTRAP_TEST_LOCK.lock().await;
     init_tracing();
     eprintln!("\n=== 进程内 3 节点（配置完整 peers，自动组建）===");
     let ports: Vec<u16> = (0..3).map(|_| alloc_port()).collect();
@@ -317,6 +321,7 @@ async fn inprocess_three_node_bootstrap() {
 
 #[tokio::test]
 async fn inprocess_out_of_order_bootstrap() {
+    let _guard = BOOTSTRAP_TEST_LOCK.lock().await;
     eprintln!("\n=== 进程内乱序启动：先起 node2，再起 node1、node3 ===");
     let ports: Vec<u16> = (0..3).map(|_| alloc_port()).collect();
     let internal_ports: Vec<u16> = (0..3).map(|_| alloc_port()).collect();
@@ -429,6 +434,7 @@ async fn start_https_cluster(strict: bool) -> (Vec<TestNode>, u64, String) {
 
 #[tokio::test]
 async fn inprocess_three_node_https_strict_bootstrap() {
+    let _guard = BOOTSTRAP_TEST_LOCK.lock().await;
     init_tracing();
     eprintln!("\n=== 进程内 3 节点全 https（ca_file 严格校验）自动组建 ===");
     let (nodes, leader, ca_all) = start_https_cluster(true).await;
@@ -492,6 +498,7 @@ async fn inprocess_three_node_https_strict_bootstrap() {
 
 #[tokio::test]
 async fn inprocess_three_node_https_skip_bootstrap() {
+    let _guard = BOOTSTRAP_TEST_LOCK.lock().await;
     init_tracing();
     eprintln!("\n=== 进程内 3 节点全 https（无 ca_file，默认跳过校验）自动组建 ===");
     let (nodes, leader, _) = start_https_cluster(false).await;

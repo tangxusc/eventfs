@@ -21,7 +21,12 @@ use crate::key;
 use crate::raft_type::TypeConfig;
 use crate::snapshot;
 use crate::{EsRequest, EsResponse};
-use es_core::{Event, ExpectedVersion, StreamMeta};
+use es_core::{
+    AggregateCatalog, AggregateEvent, AggregateGroupCatalog, AggregateGroupPartition,
+    AggregateMeta, AggregateState, AggregateStateDocument, Event, EventSetId,
+    ExpectedAggregateVersion, ExpectedStateRevision, ExpectedVersion, Hlc, NewAggregateEvent,
+    StreamMeta,
+};
 
 fn sm_read_err(e: impl std::fmt::Display) -> StorageError<u64> {
     StorageIOError::read_state_machine(&std::io::Error::other(e.to_string())).into()
@@ -35,6 +40,17 @@ fn sm_write_err(e: impl std::fmt::Display) -> StorageError<u64> {
 fn decode_event(bytes: &[u8]) -> es_core::Result<Event> {
     crate::encode::decode(bytes)
         .map_err(|e| es_core::Error::Serde(format!("Event 反序列化失败: {e}")))
+}
+
+fn decode_aggregate_event(bytes: &[u8]) -> es_core::Result<AggregateEvent> {
+    crate::encode::decode(bytes)
+        .map_err(|error| es_core::Error::Serde(format!("AggregateEvent 反序列化失败: {error}")))
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct AggregateIdempotencyRecord {
+    fingerprint: u128,
+    result: es_core::AggregateAppendResult,
 }
 
 impl EsStorage {
@@ -310,6 +326,339 @@ impl EsStorage {
         }
         Ok(out)
     }
+
+    /// 读取单个聚合实例的当前事件版本元数据。
+    ///
+    /// - `event_set`、`partition_id`、`aggregate_id`：完整实例定位。
+    /// - 返回：实例不存在时为 `None`，否则返回当前聚合版本。
+    /// - 错误：底层读取或反序列化失败。
+    pub fn read_aggregate_meta(
+        &self,
+        event_set: &EventSetId,
+        partition_id: u16,
+        aggregate_id: &str,
+    ) -> es_core::Result<Option<AggregateMeta>> {
+        let key = key::sm_aggregate_meta(self.shard_id(), event_set, partition_id, aggregate_id);
+        self.get(&key)?
+            .map(|bytes| {
+                crate::encode::decode(&bytes).map_err(|error| {
+                    es_core::Error::Serde(format!("AggregateMeta 反序列化失败: {error}"))
+                })
+            })
+            .transpose()
+    }
+
+    /// 按聚合版本读取单条聚合事件。
+    pub fn read_aggregate_event(
+        &self,
+        event_set: &EventSetId,
+        partition_id: u16,
+        aggregate_id: &str,
+        aggregate_version: u64,
+    ) -> es_core::Result<Option<AggregateEvent>> {
+        let key = key::sm_aggregate_event(
+            self.shard_id(),
+            event_set,
+            partition_id,
+            aggregate_id,
+            aggregate_version,
+        );
+        self.get(&key)?
+            .map(|bytes| decode_aggregate_event(&bytes))
+            .transpose()
+    }
+
+    /// 顺序读取单个聚合实例的事件。
+    ///
+    /// `from_version` 为包含式起点，`limit == 0` 表示不限制数量。
+    pub fn read_aggregate_events(
+        &self,
+        event_set: &EventSetId,
+        partition_id: u16,
+        aggregate_id: &str,
+        from_version: u64,
+        limit: u64,
+    ) -> es_core::Result<Vec<AggregateEvent>> {
+        let prefix =
+            key::sm_aggregate_event_prefix(self.shard_id(), event_set, partition_id, aggregate_id);
+        let start = key::sm_aggregate_event(
+            self.shard_id(),
+            event_set,
+            partition_id,
+            aggregate_id,
+            from_version,
+        );
+        let Some(end) = key::successor(&prefix) else {
+            return Ok(Vec::new());
+        };
+        self.scan_values(start, end, false, limit)?
+            .iter()
+            .map(|bytes| decode_aggregate_event(bytes))
+            .collect()
+    }
+
+    /// 按服务端分配的分区位置读取一个虚拟事件分区。
+    ///
+    /// 事件集和分区由调用方从权威 catalog 获得；返回顺序仅在该分区内稳定。
+    pub fn read_aggregate_partition_events(
+        &self,
+        event_set: &EventSetId,
+        partition_id: u16,
+        from_position: u64,
+        limit: u64,
+    ) -> es_core::Result<Vec<AggregateEvent>> {
+        let shard = self.shard_id();
+        let prefix = key::sm_aggregate_partition_index_prefix(shard, event_set, partition_id);
+        let start =
+            key::sm_aggregate_partition_index(shard, event_set, partition_id, from_position);
+        let end = key::successor(&prefix)
+            .ok_or_else(|| es_core::Error::Internal("聚合分区索引前缀无后继".into()))?;
+        let pointers = self.scan_values(start, end, false, limit)?;
+        let mut events = Vec::with_capacity(pointers.len());
+        for pointer in pointers {
+            let (aggregate_id, aggregate_version): (String, u64) = crate::encode::decode(&pointer)
+                .map_err(|error| {
+                    es_core::Error::Serde(format!("聚合分区索引反序列化失败: {error}"))
+                })?;
+            let event = self
+                .read_aggregate_event(
+                    event_set,
+                    partition_id,
+                    &aggregate_id,
+                    aggregate_version,
+                )?
+                .ok_or_else(|| {
+                    es_core::Error::Storage(format!(
+                        "聚合分区索引指向缺失事件: {event_set}/{partition_id}/{aggregate_id}/{aggregate_version}"
+                    ))
+                })?;
+            events.push(event);
+        }
+        Ok(events)
+    }
+
+    /// 读取聚合实例的业务状态文档。
+    pub fn read_aggregate_state(
+        &self,
+        event_set: &EventSetId,
+        partition_id: u16,
+        aggregate_id: &str,
+    ) -> es_core::Result<Option<AggregateState>> {
+        let key = key::sm_aggregate_state(self.shard_id(), event_set, partition_id, aggregate_id);
+        self.get(&key)?
+            .map(|bytes| {
+                crate::encode::decode(&bytes).map_err(|error| {
+                    es_core::Error::Serde(format!("AggregateState 反序列化失败: {error}"))
+                })
+            })
+            .transpose()
+    }
+
+    /// 在同一存储快照中读取状态内容与最后提交时间。
+    ///
+    /// 旧状态缺少独立时间 key 时返回 Unix epoch 对应的零 HLC。
+    pub fn read_aggregate_state_document(
+        &self,
+        event_set: &EventSetId,
+        partition_id: u16,
+        aggregate_id: &str,
+    ) -> es_core::Result<Option<AggregateStateDocument>> {
+        let state_key =
+            key::sm_aggregate_state(self.shard_id(), event_set, partition_id, aggregate_id);
+        let modified_key = key::sm_aggregate_state_modified(
+            self.shard_id(),
+            event_set,
+            partition_id,
+            aggregate_id,
+        );
+        let txn = self
+            .tree()
+            .begin()
+            .map_err(|error| es_core::Error::Storage(format!("begin 失败: {error}")))?;
+        let Some(state_bytes) = txn
+            .get(state_key)
+            .map_err(|error| es_core::Error::Storage(format!("读取聚合状态失败: {error}")))?
+        else {
+            return Ok(None);
+        };
+        let state: AggregateState = crate::encode::decode(&state_bytes).map_err(|error| {
+            es_core::Error::Serde(format!("AggregateState 反序列化失败: {error}"))
+        })?;
+        let modified_hlc = txn
+            .get(modified_key)
+            .map_err(|error| es_core::Error::Storage(format!("读取状态修改时间失败: {error}")))?
+            .map(|bytes| {
+                crate::encode::decode(&bytes).map_err(|error| {
+                    es_core::Error::Serde(format!("状态修改时间反序列化失败: {error}"))
+                })
+            })
+            .transpose()?
+            .unwrap_or(Hlc {
+                wall: 0,
+                logical: 0,
+            });
+        Ok(Some(AggregateStateDocument {
+            revision: state.revision,
+            data: state.data,
+            modified_hlc,
+        }))
+    }
+
+    /// 按聚合实例 ID 词典序分页读取单个虚拟分区的状态元数据。
+    ///
+    /// - `after_aggregate_id`：排他起点；`None` 从分区首项开始。
+    /// - `limit`：最大返回数，零表示不限量。
+    /// - 返回：`(aggregate_id, state)`，严格按实例 ID 升序。
+    /// - 错误：存储扫描、key 解码或状态反序列化失败。
+    pub fn list_aggregate_partition_states(
+        &self,
+        event_set: &EventSetId,
+        partition_id: u16,
+        after_aggregate_id: Option<&str>,
+        limit: u64,
+    ) -> es_core::Result<Vec<(String, AggregateStateDocument)>> {
+        let prefix = key::sm_aggregate_state_prefix(self.shard_id(), event_set, partition_id);
+        let start = match after_aggregate_id {
+            Some(aggregate_id) => key::upper_including(&key::sm_aggregate_state(
+                self.shard_id(),
+                event_set,
+                partition_id,
+                aggregate_id,
+            )),
+            None => prefix.clone(),
+        };
+        let end = key::successor(&prefix)
+            .ok_or_else(|| es_core::Error::Internal("聚合状态前缀无后继".into()))?;
+        let txn = self
+            .tree()
+            .begin()
+            .map_err(|error| es_core::Error::Storage(format!("begin 失败: {error}")))?;
+        let mut iterator = txn
+            .range(start, end)
+            .map_err(|error| es_core::Error::Storage(format!("range 失败: {error}")))?;
+        let mut encoded_states = Vec::new();
+        iterator
+            .seek_first()
+            .map_err(|error| es_core::Error::Storage(format!("seek_first 失败: {error}")))?;
+        while iterator.valid() && (limit == 0 || encoded_states.len() < limit as usize) {
+            let key_bytes = iterator.key().user_key().to_vec();
+            let value = iterator
+                .value()
+                .map_err(|error| es_core::Error::Storage(format!("value 失败: {error}")))?
+                .to_vec();
+            encoded_states.push((key_bytes, value));
+            if !iterator
+                .next()
+                .map_err(|error| es_core::Error::Storage(format!("next 失败: {error}")))?
+            {
+                break;
+            }
+        }
+        drop(iterator);
+
+        encoded_states
+            .into_iter()
+            .map(|(key_bytes, value)| {
+                let aggregate_id =
+                    key::decode_aggregate_state_key(&key_bytes).ok_or_else(|| {
+                        es_core::Error::Serde(format!("聚合状态 key 损坏: {key_bytes:?}"))
+                    })?;
+                let state: AggregateState = crate::encode::decode(&value).map_err(|error| {
+                    es_core::Error::Serde(format!("AggregateState 反序列化失败: {error}"))
+                })?;
+                let modified_key = key::sm_aggregate_state_modified(
+                    self.shard_id(),
+                    event_set,
+                    partition_id,
+                    &aggregate_id,
+                );
+                let modified_hlc = txn
+                    .get(modified_key)
+                    .map_err(|error| {
+                        es_core::Error::Storage(format!("读取状态修改时间失败: {error}"))
+                    })?
+                    .map(|bytes| {
+                        crate::encode::decode(&bytes).map_err(|error| {
+                            es_core::Error::Serde(format!("状态修改时间反序列化失败: {error}"))
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or(Hlc {
+                        wall: 0,
+                        logical: 0,
+                    });
+                Ok((
+                    aggregate_id,
+                    AggregateStateDocument {
+                        revision: state.revision,
+                        data: state.data,
+                        modified_hlc,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// 读取虚拟事件分区的下一个可用位置，供 `Now` 游标捕获 head。
+    pub fn read_aggregate_partition_head(
+        &self,
+        event_set: &EventSetId,
+        partition_id: u16,
+    ) -> es_core::Result<u64> {
+        let key = key::sm_aggregate_next_position(self.shard_id(), event_set, partition_id);
+        self.get(&key)?
+            .map(|bytes| {
+                crate::encode::decode(&bytes).map_err(|error| {
+                    es_core::Error::Serde(format!("聚合分区 next_position 反序列化失败: {error}"))
+                })
+            })
+            .transpose()
+            .map(|position| position.unwrap_or(0))
+    }
+
+    /// 读取控制 Shard 上的聚合事件集 catalog；尚未创建时返回空 catalog。
+    pub fn read_aggregate_catalog(&self) -> es_core::Result<AggregateCatalog> {
+        let key = key::sm_aggregate_catalog(self.shard_id());
+        self.get(&key)?
+            .map(|bytes| {
+                crate::encode::decode(&bytes).map_err(|error| {
+                    es_core::Error::Serde(format!("AggregateCatalog 反序列化失败: {error}"))
+                })
+            })
+            .transpose()
+            .map(|catalog| catalog.unwrap_or_default())
+    }
+
+    /// 读取控制 Shard 上的聚合消费者组 catalog；尚未创建时返回空 catalog。
+    pub fn read_aggregate_group_catalog(&self) -> es_core::Result<AggregateGroupCatalog> {
+        let key = key::sm_aggregate_group_catalog(self.shard_id());
+        self.get(&key)?
+            .map(|bytes| {
+                crate::encode::decode(&bytes).map_err(|error| {
+                    es_core::Error::Serde(format!("AggregateGroupCatalog 反序列化失败: {error}"))
+                })
+            })
+            .transpose()
+            .map(|catalog| catalog.unwrap_or_default())
+    }
+
+    /// 读取数据 Shard 上单个组分区的 checkpoint、lease 与重试状态。
+    pub fn read_aggregate_group_partition(
+        &self,
+        event_set: &EventSetId,
+        partition_id: u16,
+        group_name: &str,
+    ) -> es_core::Result<Option<AggregateGroupPartition>> {
+        let key =
+            key::sm_aggregate_group_partition(self.shard_id(), event_set, partition_id, group_name);
+        self.get(&key)?
+            .map(|bytes| {
+                crate::encode::decode(&bytes).map_err(|error| {
+                    es_core::Error::Serde(format!("AggregateGroupPartition 反序列化失败: {error}"))
+                })
+            })
+            .transpose()
+    }
 }
 
 /// apply 过程中在单个事务内累积的写入。
@@ -354,6 +703,26 @@ struct ApplyBatch {
     ownership_fences: std::collections::HashMap<String, u64>,
     /// 本批已读取或修改的持久化订阅组；None 表示已删除或不存在。
     persistent_groups: std::collections::BTreeMap<String, Option<es_core::PersistentGroup>>,
+    /// 本批已读取或修改的聚合实例当前版本。
+    aggregate_versions: std::collections::HashMap<(EventSetId, u16, String), Option<u64>>,
+    /// 本批各虚拟事件分区的下一个可用位置。
+    aggregate_partition_positions: std::collections::HashMap<(EventSetId, u16), u64>,
+    /// 本批已读取或修改的业务状态文档。
+    aggregate_states: std::collections::HashMap<(EventSetId, u16, String), Option<AggregateState>>,
+    /// 本批已读取或创建的聚合追加幂等记录。
+    aggregate_idempotency:
+        std::collections::HashMap<(EventSetId, u16, uuid::Uuid), AggregateIdempotencyRecord>,
+    /// 本批已读取或安装的虚拟事件分区 fence。
+    aggregate_partition_fences: std::collections::HashMap<(EventSetId, u16), u64>,
+    /// 本批控制 Shard 的聚合事件集 catalog。
+    aggregate_catalog: Option<AggregateCatalog>,
+    /// 本批控制 Shard 的聚合消费者组 catalog。
+    aggregate_group_catalog: Option<AggregateGroupCatalog>,
+    /// 本批已读取或修改的聚合消费者组分区状态。
+    aggregate_group_partitions:
+        std::collections::HashMap<(EventSetId, u16, String), AggregateGroupPartition>,
+    /// 本批新产生的聚合事件，事务提交后广播。
+    new_aggregate_events: Vec<AggregateEvent>,
 }
 
 impl EsStorage {
@@ -823,6 +1192,545 @@ impl EsStorage {
         })
     }
 
+    fn batch_aggregate_version(
+        &self,
+        batch: &mut ApplyBatch,
+        event_set: &EventSetId,
+        partition_id: u16,
+        aggregate_id: &str,
+    ) -> es_core::Result<Option<u64>> {
+        let identity = (event_set.clone(), partition_id, aggregate_id.to_string());
+        if let Some(version) = batch.aggregate_versions.get(&identity) {
+            return Ok(*version);
+        }
+        let version = self
+            .read_aggregate_meta(event_set, partition_id, aggregate_id)?
+            .map(|meta| meta.current_version);
+        batch.aggregate_versions.insert(identity, version);
+        Ok(version)
+    }
+
+    fn batch_aggregate_state(
+        &self,
+        batch: &mut ApplyBatch,
+        event_set: &EventSetId,
+        partition_id: u16,
+        aggregate_id: &str,
+    ) -> es_core::Result<Option<AggregateState>> {
+        let identity = (event_set.clone(), partition_id, aggregate_id.to_string());
+        if let Some(state) = batch.aggregate_states.get(&identity) {
+            return Ok(state.clone());
+        }
+        let state = self.read_aggregate_state(event_set, partition_id, aggregate_id)?;
+        batch.aggregate_states.insert(identity, state.clone());
+        Ok(state)
+    }
+
+    fn batch_aggregate_partition_position(
+        &self,
+        batch: &mut ApplyBatch,
+        event_set: &EventSetId,
+        partition_id: u16,
+    ) -> es_core::Result<u64> {
+        let identity = (event_set.clone(), partition_id);
+        if let Some(position) = batch.aggregate_partition_positions.get(&identity) {
+            return Ok(*position);
+        }
+        let key = key::sm_aggregate_next_position(self.shard_id(), event_set, partition_id);
+        let position = self
+            .get(&key)?
+            .map(|bytes| {
+                crate::encode::decode(&bytes).map_err(|error| {
+                    es_core::Error::Serde(format!("聚合分区 next_position 反序列化失败: {error}"))
+                })
+            })
+            .transpose()?
+            .unwrap_or(0);
+        batch
+            .aggregate_partition_positions
+            .insert(identity, position);
+        Ok(position)
+    }
+
+    fn batch_aggregate_partition_fence(
+        &self,
+        batch: &mut ApplyBatch,
+        event_set: &EventSetId,
+        partition_id: u16,
+    ) -> es_core::Result<u64> {
+        let identity = (event_set.clone(), partition_id);
+        if let Some(generation) = batch.aggregate_partition_fences.get(&identity) {
+            return Ok(*generation);
+        }
+        let key = key::sm_aggregate_partition_fence(self.shard_id(), event_set, partition_id);
+        let generation = self
+            .get(&key)?
+            .map(|bytes| {
+                crate::encode::decode(&bytes).map_err(|error| {
+                    es_core::Error::Serde(format!("聚合分区 fence 反序列化失败: {error}"))
+                })
+            })
+            .transpose()?
+            .unwrap_or(0);
+        batch
+            .aggregate_partition_fences
+            .insert(identity, generation);
+        Ok(generation)
+    }
+
+    fn check_expected_aggregate_version(
+        expected: ExpectedAggregateVersion,
+        current: Option<u64>,
+    ) -> bool {
+        match expected {
+            ExpectedAggregateVersion::Any => true,
+            ExpectedAggregateVersion::NoAggregate => current.is_none(),
+            ExpectedAggregateVersion::AggregateExists => current.is_some(),
+            ExpectedAggregateVersion::Exact(expected) => current == Some(expected),
+        }
+    }
+
+    fn apply_aggregate_append(
+        &self,
+        batch: &mut ApplyBatch,
+        event_set: &EventSetId,
+        partition_id: u16,
+        partition_generation: u64,
+        aggregate_id: &str,
+        expected_version: ExpectedAggregateVersion,
+        event: &NewAggregateEvent,
+        hlc: es_core::Hlc,
+    ) -> es_core::Result<EsResponse> {
+        if let Err(error) = event_set.validate() {
+            return Ok(EsResponse::AggregateInvalid {
+                reason: error.to_string(),
+            });
+        }
+        if let Err(error) = es_core::validate_aggregate_identifier("aggregate_id", aggregate_id) {
+            return Ok(EsResponse::AggregateInvalid {
+                reason: error.to_string(),
+            });
+        }
+        if event.event_type.is_empty() {
+            return Ok(EsResponse::AggregateInvalid {
+                reason: "event_type 不能为空".into(),
+            });
+        }
+        let shard = self.shard_id();
+        let idempotency_identity = (event_set.clone(), partition_id, event.event_id);
+        let fingerprint =
+            es_core::aggregate_append_fingerprint(event_set, aggregate_id, expected_version, event);
+        let existing = if let Some(record) = batch.aggregate_idempotency.get(&idempotency_identity)
+        {
+            Some(record.clone())
+        } else {
+            let key =
+                key::sm_aggregate_idempotency(shard, event_set, partition_id, &event.event_id);
+            let record: Option<AggregateIdempotencyRecord> = self
+                .get(&key)?
+                .map(|bytes| {
+                    crate::encode::decode(&bytes).map_err(|error| {
+                        es_core::Error::Serde(format!("聚合事件幂等记录反序列化失败: {error}"))
+                    })
+                })
+                .transpose()?;
+            if let Some(record) = &record {
+                batch
+                    .aggregate_idempotency
+                    .insert(idempotency_identity.clone(), record.clone());
+            }
+            record
+        };
+        if let Some(existing) = existing {
+            return if existing.fingerprint == fingerprint {
+                Ok(EsResponse::AggregateAppendOk {
+                    aggregate_version: existing.result.aggregate_version,
+                    partition_position: existing.result.partition_position,
+                })
+            } else {
+                Ok(EsResponse::AggregateIdempotencyConflict)
+            };
+        }
+
+        let current_fence = self.batch_aggregate_partition_fence(batch, event_set, partition_id)?;
+        if current_fence != partition_generation {
+            return Ok(EsResponse::AggregatePartitionFenced {
+                current_generation: current_fence,
+            });
+        }
+
+        let current = self.batch_aggregate_version(batch, event_set, partition_id, aggregate_id)?;
+        if !Self::check_expected_aggregate_version(expected_version, current) {
+            return Ok(EsResponse::AggregateOptimisticConflict {
+                actual_version: current,
+            });
+        }
+        let aggregate_version = match current {
+            None => 0,
+            Some(version) => match version.checked_add(1) {
+                Some(next) => next,
+                None => {
+                    return Ok(EsResponse::AggregateInvalid {
+                        reason: "聚合版本已耗尽".into(),
+                    });
+                }
+            },
+        };
+        let partition_position =
+            self.batch_aggregate_partition_position(batch, event_set, partition_id)?;
+        let Some(next_partition_position) = partition_position.checked_add(1) else {
+            return Ok(EsResponse::AggregateInvalid {
+                reason: "分区位置已耗尽".into(),
+            });
+        };
+
+        let stored = AggregateEvent {
+            event_set: event_set.clone(),
+            partition_id,
+            aggregate_id: aggregate_id.to_string(),
+            aggregate_version,
+            event_id: event.event_id,
+            event_type: event.event_type.clone(),
+            data: event.data.clone(),
+            metadata: event.metadata.clone(),
+            hlc,
+            partition_position,
+        };
+        let bytes = crate::encode::encode(&stored).map_err(|error| {
+            es_core::Error::Serde(format!("AggregateEvent 序列化失败: {error}"))
+        })?;
+        batch.ops.push(ApplyOp::Put(
+            key::sm_aggregate_event(
+                shard,
+                event_set,
+                partition_id,
+                aggregate_id,
+                aggregate_version,
+            ),
+            bytes,
+        ));
+        let pointer = crate::encode::encode(&(aggregate_id, aggregate_version))
+            .map_err(|error| es_core::Error::Serde(format!("聚合分区索引序列化失败: {error}")))?;
+        batch.ops.push(ApplyOp::Put(
+            key::sm_aggregate_partition_index(shard, event_set, partition_id, partition_position),
+            pointer,
+        ));
+        let meta = AggregateMeta {
+            current_version: aggregate_version,
+        };
+        batch.ops.push(ApplyOp::Put(
+            key::sm_aggregate_meta(shard, event_set, partition_id, aggregate_id),
+            crate::encode::encode(&meta).map_err(|error| {
+                es_core::Error::Serde(format!("AggregateMeta 序列化失败: {error}"))
+            })?,
+        ));
+        let result = es_core::AggregateAppendResult {
+            aggregate_version,
+            partition_position,
+        };
+        let idempotency = AggregateIdempotencyRecord {
+            fingerprint,
+            result,
+        };
+        batch.ops.push(ApplyOp::Put(
+            key::sm_aggregate_idempotency(shard, event_set, partition_id, &event.event_id),
+            crate::encode::encode(&idempotency).map_err(|error| {
+                es_core::Error::Serde(format!("聚合事件幂等记录序列化失败: {error}"))
+            })?,
+        ));
+
+        batch.aggregate_versions.insert(
+            (event_set.clone(), partition_id, aggregate_id.to_string()),
+            Some(aggregate_version),
+        );
+        batch
+            .aggregate_partition_positions
+            .insert((event_set.clone(), partition_id), next_partition_position);
+        batch
+            .aggregate_idempotency
+            .insert(idempotency_identity, idempotency);
+        batch.new_aggregate_events.push(stored);
+        Ok(EsResponse::AggregateAppendOk {
+            aggregate_version,
+            partition_position,
+        })
+    }
+
+    fn apply_put_aggregate_state(
+        &self,
+        batch: &mut ApplyBatch,
+        event_set: &EventSetId,
+        partition_id: u16,
+        partition_generation: u64,
+        aggregate_id: &str,
+        expected_revision: ExpectedStateRevision,
+        data: &[u8],
+        hlc: Hlc,
+    ) -> es_core::Result<EsResponse> {
+        if let Err(error) = event_set.validate() {
+            return Ok(EsResponse::AggregateInvalid {
+                reason: error.to_string(),
+            });
+        }
+        if let Err(error) = es_core::validate_aggregate_identifier("aggregate_id", aggregate_id) {
+            return Ok(EsResponse::AggregateInvalid {
+                reason: error.to_string(),
+            });
+        }
+        let current_fence = self.batch_aggregate_partition_fence(batch, event_set, partition_id)?;
+        if current_fence != partition_generation {
+            return Ok(EsResponse::AggregatePartitionFenced {
+                current_generation: current_fence,
+            });
+        }
+        if self
+            .batch_aggregate_version(batch, event_set, partition_id, aggregate_id)?
+            .is_none()
+        {
+            return Ok(EsResponse::AggregateNotFound);
+        }
+        let current = self.batch_aggregate_state(batch, event_set, partition_id, aggregate_id)?;
+        let matches = match expected_revision {
+            ExpectedStateRevision::Absent => current.is_none(),
+            ExpectedStateRevision::Exact(expected) => current
+                .as_ref()
+                .is_some_and(|state| state.revision == expected),
+        };
+        if !matches {
+            return Ok(EsResponse::AggregateStateConflict {
+                actual_revision: current.as_ref().map(|state| state.revision),
+            });
+        }
+        let revision = match current {
+            None => 0,
+            Some(state) => match state.revision.checked_add(1) {
+                Some(next) => next,
+                None => {
+                    return Ok(EsResponse::AggregateInvalid {
+                        reason: "状态 revision 已耗尽".into(),
+                    });
+                }
+            },
+        };
+        let state = AggregateState {
+            revision,
+            data: data.to_vec(),
+        };
+        let key = key::sm_aggregate_state(self.shard_id(), event_set, partition_id, aggregate_id);
+        let bytes = crate::encode::encode(&state).map_err(|error| {
+            es_core::Error::Serde(format!("AggregateState 序列化失败: {error}"))
+        })?;
+        batch.ops.push(ApplyOp::Put(key, bytes));
+        let modified_key = key::sm_aggregate_state_modified(
+            self.shard_id(),
+            event_set,
+            partition_id,
+            aggregate_id,
+        );
+        let modified_bytes = crate::encode::encode(&hlc)
+            .map_err(|error| es_core::Error::Serde(format!("状态修改时间序列化失败: {error}")))?;
+        batch.ops.push(ApplyOp::Put(modified_key, modified_bytes));
+        batch.aggregate_states.insert(
+            (event_set.clone(), partition_id, aggregate_id.to_string()),
+            Some(state.clone()),
+        );
+        Ok(EsResponse::AggregateStateStored {
+            state: AggregateStateDocument {
+                revision: state.revision,
+                data: state.data,
+                modified_hlc: hlc,
+            },
+        })
+    }
+
+    fn apply_aggregate_partition_fence(
+        &self,
+        batch: &mut ApplyBatch,
+        event_set: &EventSetId,
+        partition_id: u16,
+        generation: u64,
+    ) -> es_core::Result<EsResponse> {
+        if let Err(error) = event_set.validate() {
+            return Ok(EsResponse::AggregateInvalid {
+                reason: error.to_string(),
+            });
+        }
+        if generation == 0 {
+            return Ok(EsResponse::AggregateInvalid {
+                reason: "聚合分区 generation 必须大于 0".into(),
+            });
+        }
+        let current = self.batch_aggregate_partition_fence(batch, event_set, partition_id)?;
+        let installed = current.max(generation);
+        if installed != current {
+            let key = key::sm_aggregate_partition_fence(self.shard_id(), event_set, partition_id);
+            let bytes = crate::encode::encode(&installed).map_err(|error| {
+                es_core::Error::Serde(format!("聚合分区 fence 序列化失败: {error}"))
+            })?;
+            batch.ops.push(ApplyOp::Put(key, bytes));
+            batch
+                .aggregate_partition_fences
+                .insert((event_set.clone(), partition_id), installed);
+        }
+        Ok(EsResponse::AggregatePartitionFenceInstalled {
+            generation: installed,
+        })
+    }
+
+    fn apply_aggregate_catalog_command(
+        &self,
+        batch: &mut ApplyBatch,
+        command: es_core::AggregateCatalogCommand,
+    ) -> es_core::Result<EsResponse> {
+        if batch.aggregate_catalog.is_none() {
+            batch.aggregate_catalog = Some(self.read_aggregate_catalog()?);
+        }
+        let catalog = batch.aggregate_catalog.as_mut().expect("上方已初始化");
+        let applied = catalog.apply(command);
+        let changed = matches!(
+            &applied.outcome,
+            es_core::AggregateCatalogOutcome::EventSet { changed: true, .. }
+        );
+        if changed {
+            let bytes = crate::encode::encode(catalog).map_err(|error| {
+                es_core::Error::Serde(format!("AggregateCatalog 序列化失败: {error}"))
+            })?;
+            batch.ops.push(ApplyOp::Put(
+                key::sm_aggregate_catalog(self.shard_id()),
+                bytes,
+            ));
+        }
+        Ok(EsResponse::AggregateCatalogApplied(applied))
+    }
+
+    fn apply_aggregate_group_catalog_command(
+        &self,
+        batch: &mut ApplyBatch,
+        command: es_core::AggregateGroupCatalogCommand,
+    ) -> es_core::Result<EsResponse> {
+        if batch.aggregate_group_catalog.is_none() {
+            batch.aggregate_group_catalog = Some(self.read_aggregate_group_catalog()?);
+        }
+        let catalog = batch
+            .aggregate_group_catalog
+            .as_mut()
+            .expect("上方已初始化");
+        let previous_revision = catalog.revision;
+        let applied = catalog.apply(command);
+        if catalog.revision != previous_revision {
+            let bytes = crate::encode::encode(catalog).map_err(|error| {
+                es_core::Error::Serde(format!("AggregateGroupCatalog 序列化失败: {error}"))
+            })?;
+            batch.ops.push(ApplyOp::Put(
+                key::sm_aggregate_group_catalog(self.shard_id()),
+                bytes,
+            ));
+        }
+        Ok(EsResponse::AggregateGroupCatalogApplied(applied))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_aggregate_group_partition(
+        &self,
+        batch: &mut ApplyBatch,
+        event_set: &EventSetId,
+        partition_id: u16,
+        partition_generation: u64,
+        group_name: &str,
+        group_epoch: u64,
+        start_position: u64,
+        settings: &es_core::AggregateGroupSettings,
+        command: crate::AggregateGroupPartitionCommand,
+    ) -> es_core::Result<EsResponse> {
+        if let Err(error) = event_set.validate() {
+            return Ok(EsResponse::AggregateInvalid {
+                reason: error.to_string(),
+            });
+        }
+        if let Err(error) = es_core::validate_aggregate_identifier("group_name", group_name) {
+            return Ok(EsResponse::AggregateInvalid {
+                reason: error.to_string(),
+            });
+        }
+        if let Err(reason) = settings.validate() {
+            return Ok(EsResponse::AggregateInvalid { reason });
+        }
+        let current_fence = self.batch_aggregate_partition_fence(batch, event_set, partition_id)?;
+        if current_fence != partition_generation {
+            return Ok(EsResponse::AggregatePartitionFenced {
+                current_generation: current_fence,
+            });
+        }
+        let identity = (event_set.clone(), partition_id, group_name.to_string());
+        let mut state = match batch.aggregate_group_partitions.get(&identity) {
+            Some(state) => state.clone(),
+            None => self
+                .read_aggregate_group_partition(event_set, partition_id, group_name)?
+                .unwrap_or_else(|| AggregateGroupPartition::new(group_epoch, start_position)),
+        };
+        if state.epoch > group_epoch {
+            return Ok(EsResponse::AggregateGroupStaleEpoch {
+                current_epoch: state.epoch,
+            });
+        }
+        if state.epoch < group_epoch {
+            state.reset(group_epoch, start_position);
+        }
+        let response = match command {
+            crate::AggregateGroupPartitionCommand::Claim {
+                consumer_id,
+                now_ms,
+                deadline_ms,
+                max_claim,
+                max_bytes,
+                candidates,
+            } => EsResponse::AggregateGroupClaimed(state.claim(
+                &consumer_id,
+                now_ms,
+                deadline_ms,
+                settings,
+                max_claim,
+                max_bytes,
+                candidates,
+            )),
+            crate::AggregateGroupPartitionCommand::Settle {
+                consumer_id,
+                now_ms,
+                settlements,
+            } => EsResponse::AggregateGroupSettled(state.settle(
+                &consumer_id,
+                group_epoch,
+                now_ms,
+                settings,
+                &settlements,
+            )),
+            crate::AggregateGroupPartitionCommand::Renew {
+                consumer_id,
+                deadline_ms,
+                delivery_ids,
+            } => EsResponse::AggregateGroupRenewed(state.renew(
+                &consumer_id,
+                group_epoch,
+                deadline_ms,
+                &delivery_ids,
+            )),
+            crate::AggregateGroupPartitionCommand::Expire { now_ms } => {
+                EsResponse::AggregateGroupExpired(state.expire(now_ms, settings) as u64)
+            }
+        };
+        let key =
+            key::sm_aggregate_group_partition(self.shard_id(), event_set, partition_id, group_name);
+        let bytes = crate::encode::encode(&state).map_err(|error| {
+            es_core::Error::Serde(format!("AggregateGroupPartition 序列化失败: {error}"))
+        })?;
+        batch.ops.retain(|operation| match operation {
+            ApplyOp::Put(existing, _) | ApplyOp::Delete(existing) => *existing != key,
+        });
+        batch.ops.push(ApplyOp::Put(key, bytes));
+        batch.aggregate_group_partitions.insert(identity, state);
+        Ok(response)
+    }
+
     fn batch_ownership_fence(
         &self,
         batch: &mut ApplyBatch,
@@ -980,6 +1888,15 @@ impl RaftStateMachine<TypeConfig> for EsStorage {
             ownership_catalog: None,
             ownership_fences: std::collections::HashMap::new(),
             persistent_groups: std::collections::BTreeMap::new(),
+            aggregate_versions: std::collections::HashMap::new(),
+            aggregate_partition_positions: std::collections::HashMap::new(),
+            aggregate_states: std::collections::HashMap::new(),
+            aggregate_idempotency: std::collections::HashMap::new(),
+            aggregate_partition_fences: std::collections::HashMap::new(),
+            aggregate_catalog: None,
+            aggregate_group_catalog: None,
+            aggregate_group_partitions: std::collections::HashMap::new(),
+            new_aggregate_events: Vec::new(),
         };
 
         let mut responses = Vec::new();
@@ -1063,6 +1980,104 @@ impl RaftStateMachine<TypeConfig> for EsStorage {
                             .map_err(sm_write_err)?;
                         responses.push(resp);
                     }
+                    EsRequest::AggregateAppend {
+                        event_set,
+                        partition_id,
+                        partition_generation,
+                        aggregate_id,
+                        expected_version,
+                        event,
+                        hlc,
+                    } => {
+                        let response = self
+                            .apply_aggregate_append(
+                                &mut batch,
+                                event_set,
+                                *partition_id,
+                                *partition_generation,
+                                aggregate_id,
+                                *expected_version,
+                                event,
+                                *hlc,
+                            )
+                            .map_err(sm_write_err)?;
+                        responses.push(response);
+                    }
+                    EsRequest::PutAggregateState {
+                        event_set,
+                        partition_id,
+                        partition_generation,
+                        aggregate_id,
+                        expected_revision,
+                        data,
+                        hlc,
+                    } => {
+                        let response = self
+                            .apply_put_aggregate_state(
+                                &mut batch,
+                                event_set,
+                                *partition_id,
+                                *partition_generation,
+                                aggregate_id,
+                                *expected_revision,
+                                data,
+                                *hlc,
+                            )
+                            .map_err(sm_write_err)?;
+                        responses.push(response);
+                    }
+                    EsRequest::InstallAggregatePartitionFence {
+                        event_set,
+                        partition_id,
+                        generation,
+                    } => {
+                        let response = self
+                            .apply_aggregate_partition_fence(
+                                &mut batch,
+                                event_set,
+                                *partition_id,
+                                *generation,
+                            )
+                            .map_err(sm_write_err)?;
+                        responses.push(response);
+                    }
+                    EsRequest::CommitAggregateCatalog { command } => {
+                        let response = self
+                            .apply_aggregate_catalog_command(&mut batch, command.clone())
+                            .map_err(sm_write_err)?;
+                        responses.push(response);
+                    }
+                    EsRequest::CommitAggregateGroupCatalog { command } => {
+                        let response = self
+                            .apply_aggregate_group_catalog_command(&mut batch, command.clone())
+                            .map_err(sm_write_err)?;
+                        responses.push(response);
+                    }
+                    EsRequest::AggregateGroupPartition {
+                        event_set,
+                        partition_id,
+                        partition_generation,
+                        group_name,
+                        group_epoch,
+                        start_position,
+                        settings,
+                        command,
+                    } => {
+                        let response = self
+                            .apply_aggregate_group_partition(
+                                &mut batch,
+                                event_set,
+                                *partition_id,
+                                *partition_generation,
+                                group_name,
+                                *group_epoch,
+                                *start_position,
+                                settings,
+                                command.clone(),
+                            )
+                            .map_err(sm_write_err)?;
+                        responses.push(response);
+                    }
                 },
                 EntryPayload::Membership(ref mem) => {
                     membership = Some(StoredMembership::new(Some(entry.log_id), mem.clone()));
@@ -1080,6 +2095,14 @@ impl RaftStateMachine<TypeConfig> for EsStorage {
         batch
             .ops
             .push(ApplyOp::Put(key::sm_next_position(shard), np));
+
+        for ((event_set, partition_id), next_position) in &batch.aggregate_partition_positions {
+            let bytes = crate::encode::encode(next_position).map_err(sm_write_err)?;
+            batch.ops.push(ApplyOp::Put(
+                key::sm_aggregate_next_position(shard, event_set, *partition_id),
+                bytes,
+            ));
+        }
 
         // 已应用状态：与业务数据同事务提交，保证重启后 last_applied 与数据一致
         let mut cache = self.sm_cache().write().await;
@@ -1114,6 +2137,9 @@ impl RaftStateMachine<TypeConfig> for EsStorage {
         for event in batch.new_events {
             // 忽略发送错误（无订阅者时 send 返回 Err，正常情况）
             let _ = self.event_tx().send(event);
+        }
+        for event in batch.new_aggregate_events {
+            let _ = self.aggregate_event_tx().send(event);
         }
 
         Ok(responses)

@@ -1,6 +1,6 @@
 //! 辅助构建器，简化事件创建。
 
-use es_proto::eventstore::{expected_version, ExpectedVersion, NewEvent, Empty};
+use es_proto::eventstore::{Empty, ExpectedVersion, NewEvent, expected_version};
 
 /// 期望版本构建器
 pub struct ExpectedVersionBuilder;
@@ -102,7 +102,10 @@ mod tests {
 
     #[test]
     fn expected_version_four_constructors() {
-        assert!(matches!(ExpectedVersionBuilder::any().kind, Some(Kind::Any(_))));
+        assert!(matches!(
+            ExpectedVersionBuilder::any().kind,
+            Some(Kind::Any(_))
+        ));
         assert!(matches!(
             ExpectedVersionBuilder::no_stream().kind,
             Some(Kind::NoStream(_))
@@ -143,7 +146,9 @@ mod tests {
 
     #[test]
     fn data_json_ok_and_err() {
-        let ok = EventBuilder::new("T").data_json(&vec![1u8, 2]).expect("序列化成功");
+        let ok = EventBuilder::new("T")
+            .data_json(&vec![1u8, 2])
+            .expect("序列化成功");
         assert_eq!(ok.data, b"[1,2]");
         assert!(EventBuilder::new("T").data_json(&BadSerde).is_err());
     }
