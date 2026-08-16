@@ -104,9 +104,7 @@ sha256sum --check SHA256SUMS
 ```
 
 macOS 可使用 `shasum -a 256` 单独核对 `SHA256SUMS` 中记录的摘要。压缩包版本固定为
-`sha-<短提交号>`；程序 `--version` 输出以编译时的 Cargo 版本为准。完整构建与故障
-恢复约定见
-[发布 Action 设计自检](docs/release-action-self-check.md)。
+`sha-<短提交号>`；程序 `--version` 输出以编译时的 Cargo 版本为准。
 
 ### Docker 三节点集群
 
@@ -155,8 +153,7 @@ docker compose exec client ls -la /mnt/eventfs
 不映射。FUSE client 仅映射 `/dev/fuse`、保留 `SYS_ADMIN` capability 并丢弃其他
 capabilities，不使用 `privileged`。挂载点不会映射到 macOS；节点数据和挂载点均不使用
 持久化 volume，执行 `docker compose down` 会随容器删除。
-完整设计与失败恢复方式见
-[Docker 三节点集群设计自检](docs/docker-cluster-self-check.md)。
+完整配置见 [compose.yaml](compose.yaml)。
 
 ### 启动节点
 
@@ -438,7 +435,6 @@ cargo bench -p es-storage
 | [docs/](docs/README.md) | 文档索引（设计 + 专题） |
 | [docs/design.md](docs/design.md) | 架构设计总览：Key 编码与排序性质证明、写入路径、HLC、放置表、流路由表、gRPC 接口、测试策略 |
 | [docs/eventfs-fuse.md](docs/eventfs-fuse.md) | AggregateStore 与 eventfs-fuse 完整设计和文件契约 |
-| [docs/eventfs-fuse-self-check.md](docs/eventfs-fuse-self-check.md) | eventfs-fuse 设计自检、风险与实施门槛 |
 | [docs/esctl.md](docs/esctl.md) | esctl 完整命令手册（参数、输出格式、leader 发现策略） |
 | [docs/migrate.md](docs/migrate.md) | 在线迁移设计（状态机、幂等原语、切换窗口、断点续传）、esctl migrate / route 用法 |
 | [docs/multi_node_testing.md](docs/multi_node_testing.md) | 多节点与分区测试、集群组建流程、踩坑记录 |
