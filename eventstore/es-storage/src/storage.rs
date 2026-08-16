@@ -10,7 +10,7 @@ use tokio::sync::RwLock;
 
 use crate::key;
 use crate::raft_type::TypeConfig;
-use es_core::{AggregateEvent, Error, Event, Result};
+use es_core::{AggregateEvent, Error, Event, OwnershipCatalog, Result};
 
 /// EventStore 存储：单个分片的 Raft 日志与状态机
 ///
@@ -96,6 +96,19 @@ impl EsStorage {
     /// 获取底层 tree
     pub fn tree(&self) -> &Arc<surrealkv::Tree> {
         &self.tree
+    }
+
+    /// 读取本 Shard 状态机中已应用的 Stream 归属 catalog。
+    ///
+    /// 返回 `None` 表示尚未应用过归属命令；返回的快照与后续 Raft apply 相互独立。
+    /// 存储读取或反序列化失败时返回 [`es_core::Error`]。
+    pub fn read_ownership_catalog(&self) -> Result<Option<OwnershipCatalog>> {
+        self.get(&key::sm_ownership_catalog(self.shard_id()))?
+            .map(|bytes| {
+                crate::encode::decode(&bytes)
+                    .map_err(|error| Error::Serde(format!("归属 catalog 反序列化失败: {error}")))
+            })
+            .transpose()
     }
 
     pub(crate) fn sm_cache(&self) -> &Arc<RwLock<SmCache>> {

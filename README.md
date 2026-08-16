@@ -89,10 +89,10 @@ cargo build --bin eventstored
 
 ### Release 产物
 
-推送 `v*` tag 后，GitHub Actions 会在 Linux 与 macOS 的 x86_64、ARM64 原生
-runner 上运行 workspace 默认测试，并编译 release 产物。也可以从 Actions 页面手动
-运行 `Release` workflow；手动运行只生成保留 30 天的 Actions artifact，不创建
-GitHub Release。
+从 Actions 页面手动运行 `Release` workflow 后，GitHub Actions 会在 Linux 与 macOS
+的 x86_64、ARM64 原生 runner 上运行 workspace 默认测试，并编译 release 产物。该
+workflow 仅支持 `workflow_dispatch`，生成保留 30 天的 Actions artifact，不响应 tag
+推送，也不创建 GitHub Release。
 
 每个平台对应一个 `eventfs-<版本>-<target>.tar.gz`：四个平台都包含
 `eventstored`、`esctl`、本 README 和 `config.example.toml`；两个 Linux 包额外包含
@@ -103,9 +103,9 @@ GitHub Release。
 sha256sum --check SHA256SUMS
 ```
 
-macOS 可使用 `shasum -a 256` 单独核对 `SHA256SUMS` 中记录的摘要。tag 仅用于 Release
-和压缩包命名，不强制与 Cargo workspace 版本一致；程序 `--version` 输出以编译时的
-Cargo 版本为准。完整构建与故障恢复约定见
+macOS 可使用 `shasum -a 256` 单独核对 `SHA256SUMS` 中记录的摘要。压缩包版本固定为
+`sha-<短提交号>`；程序 `--version` 输出以编译时的 Cargo 版本为准。完整构建与故障
+恢复约定见
 [发布 Action 设计自检](docs/release-action-self-check.md)。
 
 ### Docker 三节点集群
@@ -380,7 +380,7 @@ esctl snapshot restore ./data/node1 ./data/node1/snapshots/snap-0-1-100.esnap --
 ## 测试
 
 ```bash
-# 默认套件：647 项通过（另有 17 项环境型用例按设计忽略）
+# macOS ARM64 默认套件：634 项通过（16 项按设计忽略）
 cargo test --workspace
 
 # 真实多进程测试：es-server 14 项
@@ -399,11 +399,11 @@ cargo test -p eventfs-fuse --test mount_e2e_test -- --ignored --test-threads=1
 | `es-proto` | 10 | gRPC 代码生成验证、TLS 信任策略、端点归一化 |
 | `es-storage` | 114 | Key 编码排序性质、日志语义、AggregateStore 事务与 fencing、快照往返、模糊测试 |
 | `es-raft` | 34 | ShardManager 注册与寻址、RaftAdmin 参数校验、网络分区、慢节点、消息大小限制（进程内可控网络层） |
-| `es-server` | 171 | 服务器启动、AggregateStore、归属 interface、bootstrap、watcher、端到端读写/订阅/跨分片读取 |
+| `es-server` | 175 | 服务器启动、AggregateStore、归属 interface、bootstrap、watcher、端到端读写/订阅/跨分片读取 |
 | `es-client` | 53 | SDK 单测、stub 集成与进程内 e2e（AggregateStore、重定向、翻页、订阅与持久消费） |
-| `es-ctl` | 142 | 参数解析、AggregateStore 管理、故障转移、快照及进程内全链路 e2e |
-| `eventfs-fuse` | 36 | 路径/JSON 模糊测试、句柄状态机、errno、Backend 契约、Linux fuser Adapter 与 gRPC e2e |
-| 忽略项 | 17 | `es-server` 真实多进程 14 项、`esctl` 真实多进程 2 项、真 FUSE 挂载 1 项 |
+| `es-ctl` | 143 | 参数解析、AggregateStore 管理、故障转移、快照及进程内全链路 e2e |
+| `eventfs-fuse` | 18 | macOS 上的路径/JSON 模糊测试、句柄状态机、errno 与 Backend 契约；Linux 另编译 fuser Adapter 与 gRPC e2e |
+| macOS 忽略项 | 16 | `es-server` 真实多进程 14 项、`esctl` 真实多进程 2 项 |
 
 多节点测试标为 `#[ignore]`：每项要拉起 3 个进程。串行运行以免争抢端口：
 
@@ -418,14 +418,13 @@ cargo test -p es-ctl --test multi_node_test -- --ignored --test-threads=1
 cargo +nightly llvm-cov --workspace --branch --summary-only
 ```
 
-2026-08-15 完整 workspace 验收：默认测试 647 项通过、17 项忽略。最近一次
-可采信覆盖率基线为行 `89.90%`、分支 `80.08%`、函数 `83.03%`、区域
-`87.36%`，行和分支均达到 80% 门槛。本轮 Linux 插桩测试全部通过，但 profile
-由 Rust 1.88 生成，宿主 LLVM 23 无法合并 raw format 10，因此没有用不兼容工具
-覆盖该基线。17 项忽略项包括
+2026-08-16 当前 workspace 验收：macOS ARM64 默认测试 634 项通过、16 项忽略；
+`cargo +nightly llvm-cov` 使用匹配的 LLVM 23 工具重新统计，行覆盖 `90.98%`、分支
+覆盖 `81.40%`、函数覆盖 `82.29%`、区域覆盖 `89.37%`，行和分支均达到 80% 门槛。
+Linux 条件编译项和最终测试项数以同一提交的 Release Action 为准。17 项环境型用例包括
 14 项真实 `es-server` 多进程测试、2 项真实 `esctl` 多进程测试和 1 项真 FUSE
-挂载测试。本轮验收已包含状态真实 `mtime`、旧状态 epoch 回退、损坏时间元数据
-拒绝和 Retry 未耗尽进入 `pending_retries` 的契约断言。
+挂载测试；macOS 不编译真挂载用例，因此默认输出只显示其中 16 项。本轮已单独执行并
+通过 16 项真实多进程测试，真 FUSE 挂载由 Linux 容器独立验收。
 
 ```bash
 # 存储层基准

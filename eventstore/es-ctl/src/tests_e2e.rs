@@ -875,6 +875,9 @@ struct FlakyStub {
     queue: Arc<std::sync::Mutex<std::collections::VecDeque<Result<(), Status>>>>,
     /// 收到的 append 调用数（验证重定向目标）
     append_calls: Arc<std::sync::atomic::AtomicU64>,
+    /// create_stream 的预设响应与调用数（验证控制 Shard 重定向）。
+    create_stream_queue: Arc<std::sync::Mutex<std::collections::VecDeque<Result<(), Status>>>>,
+    create_stream_calls: Arc<std::sync::atomic::AtomicU64>,
     /// get_raft_state 预设响应（is_leader 布尔或错误）
     raft_states: Arc<std::sync::Mutex<std::collections::VecDeque<Result<bool, Status>>>>,
     /// get_raft_state 返回的 voter_ids（member 提升/移除 CAS 读-改-写用）
@@ -894,6 +897,8 @@ impl FlakyStub {
         Self {
             queue: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             append_calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            create_stream_queue: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            create_stream_calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             raft_states: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             voter_ids: Arc::new(std::sync::Mutex::new(vec![1])),
             initialize_result: Arc::new(std::sync::Mutex::new(Ok(()))),
@@ -929,6 +934,10 @@ impl FlakyStub {
         self.queue.lock().unwrap().push_back(r);
     }
 
+    fn push_create_stream(&self, result: Result<(), Status>) {
+        self.create_stream_queue.lock().unwrap().push_back(result);
+    }
+
     fn push_raft_state(&self, r: Result<bool, Status>) {
         self.raft_states.lock().unwrap().push_back(r);
     }
@@ -947,6 +956,11 @@ impl FlakyStub {
 
     fn append_count(&self) -> u64 {
         self.append_calls.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn create_stream_count(&self) -> u64 {
+        self.create_stream_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -1039,7 +1053,18 @@ impl event_store_server::EventStore for FlakyStub {
         &self,
         _request: Request<CreateStreamRequest>,
     ) -> Result<Response<CreateStreamResponse>, Status> {
-        Err(Status::unimplemented("stub"))
+        self.create_stream_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.create_stream_queue
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Ok(()))?;
+        Ok(Response::new(CreateStreamResponse {
+            shard_id: 0,
+            leader_addr: String::new(),
+            exists: false,
+        }))
     }
 }
 
@@ -1157,6 +1182,32 @@ async fn with_leader_redirect_to_leader_addr() {
         .await
         .expect("重定向后应成功");
     assert_eq!(stub_b.append_count(), 1, "重定向目标应被调用");
+}
+
+#[tokio::test]
+async fn create_stream_redirects_to_leader_outside_initial_endpoints() {
+    let leader = FlakyStub::new();
+    let leader_addr = start_flaky(leader.clone()).await;
+    let follower = FlakyStub::new();
+    follower.push_create_stream(Err(Status::unavailable(format!(
+        "not leader; leader_id=2 leader_addr={leader_addr}"
+    ))));
+    let follower_addr = start_flaky(follower).await;
+    let cluster = ClusterClient::new(
+        &[follower_addr],
+        None,
+        Duration::from_secs(2),
+        Duration::from_secs(5),
+    )
+    .expect("客户端");
+
+    let response = cluster
+        .create_stream("orders/redirect")
+        .await
+        .expect("应按公开 leader hint 重定向");
+
+    assert_eq!(response.shard_id, 0);
+    assert_eq!(leader.create_stream_count(), 1);
 }
 
 #[tokio::test]

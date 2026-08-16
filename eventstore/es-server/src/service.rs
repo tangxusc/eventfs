@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
+use es_proto::eventstore::event_store_client::EventStoreClient;
 use es_proto::eventstore::event_store_server::EventStore;
 use es_proto::eventstore::internal_subscription_client::InternalSubscriptionClient;
 use es_proto::eventstore::internal_subscription_server::InternalSubscription;
@@ -111,6 +112,48 @@ impl RemoteShards {
             }
             None => Status::unavailable("not leader; leader unknown, retry later"),
         }
+    }
+
+    /// 从目标 shard leader 读取单分片 `$all` 数据。
+    ///
+    /// `ReadAll` 的一个请求可能覆盖多个分片，而任一节点只承载其中一部分；
+    /// 此方法只发送单分片请求，确保目标 leader 可在本地终止处理，不会递归代理。
+    async fn read_all_shard(
+        &self,
+        cursor: &ShardPosition,
+        max_count: u64,
+        direction: i32,
+    ) -> Result<Vec<Event>, Status> {
+        let (_, addr) = self
+            .find_leader(cursor.shard_id)
+            .await
+            .ok_or_else(|| Status::unavailable("read-all shard source unavailable"))?;
+        let endpoint = tonic::transport::Endpoint::from_shared(addr)
+            .map_err(|_| Status::unavailable("read-all shard source unavailable"))?;
+        let endpoint = es_proto::tls::apply_endpoint_tls(endpoint, self.tls.as_ref())
+            .map_err(|_| Status::unavailable("read-all shard source unavailable"))?;
+        let channel = endpoint
+            .connect()
+            .await
+            .map_err(|_| Status::unavailable("read-all shard source unavailable"))?;
+        let mut client = EventStoreClient::new(channel)
+            .max_encoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE)
+            .max_decoding_message_size(es_proto::limits::MAX_GRPC_MESSAGE_SIZE);
+        let mut responses = client
+            .read_all(ReadAllRequest {
+                shard_ids: Vec::new(),
+                from_position: 0,
+                max_count,
+                direction,
+                from_positions: vec![cursor.clone()],
+            })
+            .await?
+            .into_inner();
+        let mut events = Vec::new();
+        while let Some(response) = responses.message().await? {
+            events.extend(response.events);
+        }
+        Ok(events)
     }
 
     /// 连接远程 shard leader 的内部订阅服务。
@@ -426,6 +469,15 @@ impl EsService {
     /// 读路径解析 stream 归属：只查不分配（读无副作用）。
     /// 未知流（从未创建或路由表缺失）→ NotFound，客户端可直接判定。
     async fn resolve_read_stream_shard(&self, stream_id: &str) -> Result<u64, Status> {
+        if let Some(shard_id) = self.route_table.lookup(stream_id).await {
+            return Ok(shard_id);
+        }
+        // 手动成员集群可能没有静态 peers 广播；从本地已应用 catalog 修复投影，
+        // 不提交 Raft 命令，因此读 miss 仍不产生领域副作用。
+        self.ownership
+            .refresh_local_projection()
+            .await
+            .map_err(crate::ownership::OwnershipError::into_status)?;
         self.route_table
             .lookup(stream_id)
             .await
@@ -925,45 +977,57 @@ impl EventStore for EsService {
         let mut streams: Vec<Vec<Event>> = Vec::with_capacity(cursors.len());
         for cursor in &cursors {
             let shard_id = cursor.shard_id;
-            // 本节点不承载 → Unavailable，客户端轮换其它节点
-            let shard = self.resolve_read_shard(shard_id).await?;
 
             // 反向读尽（ended=true）的分片不再有更早事件，直接给空流；
             // 不能仅靠 from==0 判断——「消费到 position 1 → 游标 0」时
             // position 0 仍未读，from=0 必须能读到它
-            let events = if desc && cursor.ended {
+            let proto_events = if desc && cursor.ended {
                 Vec::new()
-            } else if desc {
-                shard
-                    .storage
-                    .read_all_events_backward(cursor.from_position, per_shard_limit)
-                    .map_err(|e| Status::internal(format!("read_all_events_backward 失败: {e}")))?
             } else {
-                shard
-                    .storage
-                    .read_all_events(cursor.from_position, per_shard_limit)
-                    .map_err(|e| Status::internal(format!("read_all_events 失败: {e}")))?
+                match self.shard_manager.get_shard(shard_id).await {
+                    Ok(shard) => {
+                        let events = if desc {
+                            shard
+                                .storage
+                                .read_all_events_backward(cursor.from_position, per_shard_limit)
+                                .map_err(|e| {
+                                    Status::internal(format!("read_all_events_backward 失败: {e}"))
+                                })?
+                        } else {
+                            shard
+                                .storage
+                                .read_all_events(cursor.from_position, per_shard_limit)
+                                .map_err(|e| {
+                                    Status::internal(format!("read_all_events 失败: {e}"))
+                                })?
+                        };
+                        events
+                            .into_iter()
+                            .map(|e| Event {
+                                stream_id: e.stream_id,
+                                version: e.version,
+                                event_id: e.event_id.as_bytes().to_vec(),
+                                event_type: e.event_type,
+                                data: e.data,
+                                metadata: e.metadata,
+                                hlc: Some(Hlc {
+                                    wall: e.hlc.wall,
+                                    logical: e.hlc.logical,
+                                }),
+                                position: e.position,
+                                shard_id,
+                            })
+                            .collect()
+                    }
+                    Err(_) => {
+                        self.remote
+                            .read_all_shard(cursor, per_shard_limit, req.direction)
+                            .await?
+                    }
+                }
             };
 
-            streams.push(
-                events
-                    .into_iter()
-                    .map(|e| Event {
-                        stream_id: e.stream_id,
-                        version: e.version,
-                        event_id: e.event_id.as_bytes().to_vec(),
-                        event_type: e.event_type,
-                        data: e.data,
-                        metadata: e.metadata,
-                        hlc: Some(Hlc {
-                            wall: e.hlc.wall,
-                            logical: e.hlc.logical,
-                        }),
-                        position: e.position,
-                        shard_id,
-                    })
-                    .collect(),
-            );
+            streams.push(proto_events);
         }
 
         let (proto_events, consumed) = merge_by_hlc(streams, req.max_count, desc);

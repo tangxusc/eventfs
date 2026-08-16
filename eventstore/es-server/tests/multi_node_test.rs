@@ -983,8 +983,12 @@ async fn leader_killed_re_elect_data_intact() {
     cluster.shutdown();
 }
 
-/// 从指定节点读取某个流的全部事件
-async fn read_stream_from(cluster: &TestCluster, node_id: u64, stream_id: &str) -> Vec<Event> {
+/// 尝试从指定节点读取某个流的全部事件。
+async fn try_read_stream_from(
+    cluster: &TestCluster,
+    node_id: u64,
+    stream_id: &str,
+) -> Result<Vec<Event>, tonic::Status> {
     let mut c = cluster.client(node_id).await;
     let mut s = c
         .read_stream(ReadStreamRequest {
@@ -993,14 +997,65 @@ async fn read_stream_from(cluster: &TestCluster, node_id: u64, stream_id: &str) 
             max_count: 0,
             direction: Direction::Forward as i32,
         })
-        .await
-        .expect("read_stream")
+        .await?
         .into_inner();
     let mut out = Vec::new();
-    while let Some(r) = s.message().await.expect("读响应") {
+    while let Some(r) = s.message().await? {
         out.extend(r.events);
     }
-    out
+    Ok(out)
+}
+
+/// 从指定节点读取某个流的全部事件。
+async fn read_stream_from(cluster: &TestCluster, node_id: u64, stream_id: &str) -> Vec<Event> {
+    try_read_stream_from(cluster, node_id, stream_id)
+        .await
+        .expect("read_stream")
+}
+
+/// 等待指定节点实际读到预期数据，避免只比较不同日志基线上的 applied 数字。
+async fn wait_stream_from(
+    cluster: &TestCluster,
+    node_id: u64,
+    stream_id: &str,
+    expected: &[&[u8]],
+    timeout: Duration,
+) -> Vec<Event> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let last_observation = match try_read_stream_from(cluster, node_id, stream_id).await {
+            Ok(events)
+                if events
+                    .iter()
+                    .map(|event| event.data.as_slice())
+                    .collect::<Vec<_>>()
+                    == expected =>
+            {
+                return events;
+            }
+            Ok(events) => {
+                let data = events
+                    .iter()
+                    .map(|event| String::from_utf8_lossy(&event.data).to_string())
+                    .collect::<Vec<_>>();
+                format!("实际事件={data:?}")
+            }
+            Err(status)
+                if matches!(
+                    status.code(),
+                    tonic::Code::NotFound | tonic::Code::Unavailable
+                ) =>
+            {
+                format!("{}: {}", status.code(), status.message())
+            }
+            Err(status) => panic!("node{node_id} 读取 {stream_id} 失败: {status}"),
+        };
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "等待 node{node_id} 读到 {stream_id} 的预期事件超时，最后观察：{last_observation}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// 往指定节点写一条事件
@@ -1371,7 +1426,14 @@ async fn three_node_peers_bootstrap_replicate() {
             .await;
     }
     for id in 1..=3u64 {
-        let events = read_stream_from(&cluster, id, "auto").await;
+        let events = wait_stream_from(
+            &cluster,
+            id,
+            "auto",
+            &[b"one".as_ref(), b"two".as_ref()],
+            Duration::from_secs(10),
+        )
+        .await;
         let datas: Vec<&[u8]> = events.iter().map(|e| e.data.as_slice()).collect();
         assert_eq!(
             datas,
@@ -1480,7 +1542,14 @@ async fn out_of_order_start_bootstrap() {
             .await;
     }
     for id in 1..=3u64 {
-        let events = read_stream_from(&cluster, id, "auto-ordered").await;
+        let events = wait_stream_from(
+            &cluster,
+            id,
+            "auto-ordered",
+            &[b"ok".as_ref()],
+            Duration::from_secs(10),
+        )
+        .await;
         assert_eq!(events.len(), 1, "node{id} 应有 1 条事件");
     }
     eprintln!("✓ 乱序启动下数据复制正常");

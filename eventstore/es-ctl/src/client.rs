@@ -247,7 +247,7 @@ impl ClusterClient {
         &self,
         stream_id: &str,
     ) -> Result<CreateStreamResponse, anyhow::Error> {
-        self.with_any_endpoint(|mut c| async move {
+        self.with_event_leader("创建 Stream", |mut c| async move {
             c.create_stream(CreateStreamRequest {
                 stream_id: stream_id.to_string(),
             })
@@ -372,7 +372,16 @@ impl ClusterClient {
         F: Fn(EventStoreClient<Channel>) -> Fut,
         Fut: Future<Output = Result<T, Status>>,
     {
-        // 重定向地址可能不在初始端点列表，总预算 = 初始端点 × 2 + 2 轮
+        self.with_event_leader(&format!("分片 {shard_id}"), f).await
+    }
+
+    /// 在 EventStore leader 上执行可安全重试的写 RPC。
+    async fn with_event_leader<T, F, Fut>(&self, subject: &str, f: F) -> Result<T, anyhow::Error>
+    where
+        F: Fn(EventStoreClient<Channel>) -> Fut,
+        Fut: Future<Output = Result<T, Status>>,
+    {
+        // 重定向地址可能不在初始端点列表，总预算 = 初始端点 x 2 + 2 轮。
         let mut plan = LeaderRetryPlan::new(self.rotated_endpoints());
         let mut errors: Vec<String> = Vec::new();
 
@@ -411,7 +420,7 @@ impl ClusterClient {
             }
         }
         Err(anyhow!(
-            "未找到分片 {shard_id} 的 leader：所有端点无响应或集群处于选举中（端点: {}{}）",
+            "未找到{subject} 的 leader：所有端点无响应或集群处于选举中（端点: {}{}）",
             self.endpoints.join(", "),
             if errors.is_empty() {
                 String::new()

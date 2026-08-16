@@ -3644,6 +3644,33 @@ async fn read_all_shards(
     out
 }
 
+/// 读取一页 `$all`，保留服务端返回的逐分片消费水位。
+async fn read_all_page(
+    client: &mut EventStoreClient<tonic::transport::Channel>,
+    shard_ids: Vec<u64>,
+    from_position: u64,
+    max_count: u64,
+    direction: Direction,
+    from_positions: Vec<ShardPosition>,
+) -> ReadEventsResponse {
+    let mut stream = client
+        .read_all(ReadAllRequest {
+            shard_ids,
+            from_position,
+            max_count,
+            direction: direction as i32,
+            from_positions,
+        })
+        .await
+        .expect("read_all 应成功")
+        .into_inner();
+    stream
+        .message()
+        .await
+        .expect("读取 read_all 响应")
+        .expect("read_all 应返回一页")
+}
+
 #[tokio::test]
 async fn read_all_merge_per_shard_position_order() {
     let (addr, handle, _server, _dir) = start_test_server().await;
@@ -4331,6 +4358,106 @@ async fn subscribe_aggregates_remote_shard_through_internal_rpc() {
     }
 
     drop(subscription);
+    first_handle.abort();
+    second_handle.abort();
+    first.shutdown().await;
+    second.shutdown().await;
+}
+
+#[tokio::test]
+async fn read_all_aggregates_remote_shard_with_bidirectional_paging() {
+    let (first_addr, first_handle, second_handle, first, second, _first_dir, _second_dir) =
+        start_two_shard_servers().await;
+
+    let mut first_client = EventStoreClient::connect(first_addr)
+        .await
+        .expect("连接接入节点");
+    let mut second_client = EventStoreClient::connect(first.config().node.peers[0].addr.clone())
+        .await
+        .expect("连接远程节点");
+
+    let remote = append_one(&mut second_client, "read-all-remote", b"remote-0").await;
+    let local = append_one(&mut first_client, "read-all-local", b"local-0").await;
+    assert_eq!(remote.shard_id, 0);
+    assert_eq!(local.shard_id, 1);
+    append_one(&mut second_client, "read-all-remote", b"remote-1").await;
+    append_one(&mut first_client, "read-all-local", b"local-1").await;
+
+    let mut forward = Vec::new();
+    let mut cursors = Vec::new();
+    for page in 0..=4 {
+        let response = read_all_page(
+            &mut first_client,
+            if page == 0 { vec![0, 1] } else { Vec::new() },
+            0,
+            1,
+            Direction::Forward,
+            cursors,
+        )
+        .await;
+        cursors = response.next_positions;
+        if response.events.is_empty() {
+            break;
+        }
+        assert_eq!(response.events.len(), 1, "分页上限必须全局生效");
+        forward.extend(response.events);
+    }
+    assert_eq!(forward.len(), 4, "正向读取应汇总本地与远程分片");
+    let identities: HashSet<_> = forward
+        .iter()
+        .map(|event| (event.stream_id.as_str(), event.version))
+        .collect();
+    assert_eq!(
+        identities,
+        HashSet::from([
+            ("read-all-local", 0),
+            ("read-all-local", 1),
+            ("read-all-remote", 0),
+            ("read-all-remote", 1),
+        ])
+    );
+    for shard_id in [0, 1] {
+        let positions: Vec<_> = forward
+            .iter()
+            .filter(|event| event.shard_id == shard_id)
+            .map(|event| event.position)
+            .collect();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    let mut backward = Vec::new();
+    let mut cursors = Vec::new();
+    for page in 0..=3 {
+        let response = read_all_page(
+            &mut first_client,
+            if page == 0 { vec![0, 1] } else { Vec::new() },
+            u64::MAX,
+            2,
+            Direction::Backward,
+            cursors,
+        )
+        .await;
+        cursors = response.next_positions;
+        if response.events.is_empty() {
+            break;
+        }
+        backward.extend(response.events);
+    }
+    assert_eq!(backward.len(), 4, "反向读取应汇总本地与远程分片");
+    let backward_identities: HashSet<_> = backward
+        .iter()
+        .map(|event| (event.stream_id.as_str(), event.version))
+        .collect();
+    assert_eq!(backward_identities, identities);
+    for shard_id in [0, 1] {
+        let positions: Vec<_> = backward
+            .iter()
+            .filter(|event| event.shard_id == shard_id)
+            .map(|event| event.position)
+            .collect();
+        assert!(positions.windows(2).all(|pair| pair[0] > pair[1]));
+    }
+
     first_handle.abort();
     second_handle.abort();
     first.shutdown().await;

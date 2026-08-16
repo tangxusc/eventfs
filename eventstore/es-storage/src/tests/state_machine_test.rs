@@ -1224,6 +1224,11 @@ async fn same_event_id_replay_idempotent() {
 #[tokio::test]
 async fn ownership_ensure_is_serialized_and_persisted() {
     let (mut st, _d) = new_storage(0);
+    assert!(
+        st.read_ownership_catalog()
+            .expect("读取空 catalog")
+            .is_none()
+    );
     let eligible = std::collections::BTreeSet::from([0, 1]);
     let responses = st
         .apply(vec![
@@ -1268,11 +1273,10 @@ async fn ownership_ensure_is_serialized_and_persisted() {
     assert_eq!(first.table.streams, second.table.streams);
     assert_eq!(second.table.version, 1, "重复 Ensure 不能推进 revision");
 
-    let raw = st
-        .get(&crate::key::sm_ownership_catalog(0))
-        .expect("读 catalog")
+    let catalog = st
+        .read_ownership_catalog()
+        .expect("读取 catalog")
         .expect("catalog 已落盘");
-    let catalog: es_core::OwnershipCatalog = crate::encode::decode(&raw).expect("解码 catalog");
     assert_eq!(
         catalog.owner("orders/1").map(es_core::Owner::shard_id),
         Some(0)

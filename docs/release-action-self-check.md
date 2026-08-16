@@ -14,8 +14,8 @@
 | 可执行性 | 每个平台执行 `--help`，并用 `file` 核对文件格式与架构 |
 | Linux FUSE | 仅 Linux 资产包含 `eventfs-fuse` 和对应示例配置 |
 | 完整性 | 四个压缩包按文件名排序生成并自校验 `SHA256SUMS` |
-| 自动发布 | `v*` tag 创建或复用 GitHub Release，重复运行覆盖同名资产 |
-| 手动验收 | `workflow_dispatch` 只生成保留 30 天的 Actions artifact |
+| 触发边界 | 仅 `workflow_dispatch`，不响应 branch/tag push |
+| 手动验收 | 汇总产物为保留 30 天的 Actions artifact，不创建 GitHub Release |
 
 ## 方案选择
 
@@ -29,30 +29,26 @@
 
 ## 资产与版本边界
 
-每个平台生成一个 `eventfs-<版本>-<target>.tar.gz`。tag 构建使用 tag 名；手动构建
-使用 `sha-<短提交号>`。压缩包内带 README 和适用的示例配置，避免二进制与基本运行
-说明分离。
-
-tag 不与 `[workspace.package].version` 强制绑定。因此发布 tag 与 `eventstored
---version`、`esctl --version` 的输出允许不同，发布者需要自行维护语义版本一致性。
-包含 `-` 的 tag 作为 prerelease 创建，其他 `v*` tag 直接正式发布。
+每个平台生成一个 `eventfs-sha-<短提交号>-<target>.tar.gz`。压缩包内带 README 和
+适用的示例配置，避免二进制与基本运行说明分离。该提交标识与
+`[workspace.package].version` 相互独立，`eventstored --version` 与 `esctl --version`
+仍以编译时 Cargo 版本为准。
 
 ## 权限与失败隔离
 
-workflow 默认只有 `contents: read`。矩阵构建与资产汇总不能修改仓库；仅 tag 发布
-job 获得 `contents: write`，并通过当前 workflow 的短期 `GITHUB_TOKEN` 操作 Release。
-不申请 `id-token`、`attestations` 或其他写权限。
+workflow 只有 `contents: read`。矩阵构建与资产汇总不能修改仓库；不存在发布 job，
+也不申请 `contents: write`、`id-token`、`attestations` 或其他写权限。
 
-四个平台任一测试、编译、冒烟或打包失败，汇总与发布 job 都不会执行。汇总 job 要求
-恰好四个压缩包，并在上传前执行 `sha256sum --check`。Release 创建成功但资产上传中断
-时，可重新运行同一 workflow；现有 Release 会被复用，同名资产由 `--clobber` 覆盖。
+四个平台任一测试、编译、冒烟或打包失败，汇总 job 不会执行。汇总 job 要求恰好四个
+压缩包，并在上传前执行 `sha256sum --check`。上传中断时重新运行 workflow 会创建新的
+run artifact；旧 run 保持不变，便于比较与追溯。
 
 ## 已知边界与回滚
 
 - 默认测试包含仓库中的单元、属性/模糊和进程内 e2e；17 项 `#[ignore]` 环境型测试不
   自动启用，其中真 FUSE 挂载需要 `/dev/fuse` 与 `fusermount3`。
-- workflow 不重新统计覆盖率；最近记录基线为行 89.90%、分支 80.08%。Rust 代码变更
-  应继续按 `docs/design.md` 的覆盖率流程单独验收。
+- workflow 不重新统计覆盖率；本轮全功能验收按 `docs/full-validation-self-check.md`
+  独立重算行与分支覆盖率，并要求两者均不低于 80%。
 - SHA256 用于下载完整性核对，不提供发布者身份签名或 GitHub artifact attestation。
-- workflow 回滚只需还原对应 YAML；已发布资产不会自动删除，需由仓库管理员在 GitHub
-  Release 页面明确处理，避免自动化误删可下载版本。
+- workflow 回滚只需还原对应 YAML；已生成的 Actions artifact 按 30 天保留策略到期，
+  无需修改 GitHub Release。

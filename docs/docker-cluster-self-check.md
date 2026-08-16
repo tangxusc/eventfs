@@ -66,10 +66,11 @@ FUSE 二进制，但会引入 Rust/protoc 构建依赖并偏离复用 Action 产
 广播。单元回归测试覆盖首次发布为 `true`、重复表为 `false`；最终容器 e2e 还必须检查
 三个节点的 `routes.json` 一致，并从目标 shard 的两个副本读回同一事件。
 
-数据面读取只会依次尝试 `--endpoints` 显式提供的地址，不会由非承载节点代理请求。
-本配置的复制因子为 2，因此同一 shard 只存在于两个节点；仅提供第三个非承载端点时，
-返回 `shard ... not on this node, retry other nodes` 是预期行为。客户端应像 README 示例
-一样配置三个端点，以便自动尝试实际承载该 shard 的节点。
+单流读取仍由客户端依次尝试 `--endpoints` 显式提供的地址。跨分片 `ReadAll` 不同：
+接入节点在本地读取所承载 shard，并把其余单 shard 子请求代理到对应 leader，最后复用
+HLC 归并与逐 shard 消费水位生成统一响应。代理请求只含一个 shard，目标 leader 必然
+本地终止，不会形成递归。这样 RF=2 布局下即使没有节点承载全部 6 个 shard，单一入口
+也能完成 `$all`；客户端仍建议配置三个端点，以覆盖入口节点本身不可达的情况。
 
 ## FUSE 首次状态创建修复
 
@@ -90,6 +91,13 @@ FUSE 二进制，但会引入 Rust/protoc 构建依赖并偏离复用 Action 产
 检查只证明节点 gRPC 与本地 Raft shard 可查询；client 健康检查使用 `mountpoint` 验证
 `/mnt/eventfs` 已成为真实 FUSE 挂载。最终以三端点 `status`、`member list`、数据闭环
 和 FUSE 文件契约为准。
+
+2026-08-16 当前源码 Linux ARM64 临时包验收通过：三个二进制均为 ARM64 ELF 且
+`--help` 可执行；三个节点与 FUSE client 全部 healthy。6 个 shard 均为两 voter，
+仅连接不承载 shard 4/5 的 node1 仍能 `ReadAll` 汇总 6 个 shard。在线迁移从 shard 0
+切换到 shard 4 后两条事件完整，持久订阅与 AggregateStore 消费者组均完成 Fetch/Ack，
+状态 CAS 从 revision 0 更新到 1。真 FUSE 完成事件写入/fsync、event/caught-up 读取、
+状态首次创建/覆盖和消费者组结算；node1 重启后流、状态与挂载均保持可用。
 
 启动失败时先执行 `docker compose logs eventfs-node1 eventfs-node2 eventfs-node3`。
 配置不一致或旧容器残留时，执行 `docker compose down` 后重建；本方案没有持久化数据，

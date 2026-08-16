@@ -6,9 +6,9 @@
 
 - AggregateStore catalog、256 虚拟分区、实例级 OCC、状态 CAS、跨 Shard follow 和显式结算消费者组已实现。
 - `esctl aggregate` 与 `eventfs-fuse` 已加入 workspace；Linux 条件编译和 36 项 FUSE 单元、契约及无挂载 gRPC e2e 通过。
-- 完整 Linux workspace 验收为默认测试 646 项通过、17 项忽略。最近一次可采信覆盖率基线为行 `89.90%`、分支 `80.08%`；本轮 Rust 1.88 Linux profile 与宿主 LLVM 23 raw format 不兼容，没有用不可信汇总覆盖该基线。
-- 真挂载 e2e 已编译，但当前开发容器没有 `/dev/fuse` 与 `fusermount3`，尚无实际挂载通过证据。
-- 分区迁移的数据复制、追尾、冻结切换与清理仍未实现；不得把 catalog 的 moving 字段视为迁移已完成。
+- 当前 workspace 使用匹配的 nightly LLVM 23 工具重算覆盖率：行 `90.98%`、分支 `81.40%`，均通过 80% 门禁。
+- 真挂载 e2e 已在带 `/dev/fuse` 与 `fusermount3` 的 Debian 容器通过；普通 hosted runner 仍不强制真实挂载。
+- Stream 在线迁移的数据复制、追尾、冻结切换与清理已实现并纳入多进程与 Docker 验收；AggregateStore partition 自动再平衡仍不在当前范围。
 - 状态最后提交时间已进入 proto，状态文件 `lookup/getattr` 返回服务端真实 `mtime`；旧状态缺少时间元数据时回退 Unix epoch。`--daemonize` 尚未实现，当前只支持前台挂载。
 
 ## 1. 目标与边界
@@ -329,9 +329,11 @@ aggregate state get
 - 属性与模糊测试覆盖稳定 hash、key 排序、实例级 OCC、cursor、JSON 分块写入、路径解析、任意 Ack 顺序和 errno 映射。
 - 进程内多 Shard e2e 覆盖分区 fan-out、部分不可用、迁移 fencing、不同实例并发和同实例冲突。
 - Linux FUSE3 真挂载 e2e 覆盖 `mkdir`、`>`、`>>`、分块 write、重复 fsync、状态 CAS、poll、消费、Ack、进程崩溃和卸载。
-- 先复现并修复已知 `leader_killed_re_elect_data_intact` 多进程失败，再把真实多进程套件设为必过。
+- 真实多进程套件必须独立串行运行；`leader_killed_re_elect_data_intact` 已改用事件可见性门禁并通过复验。
 
-GitHub Actions 分为默认测试、nightly 覆盖率和 Ubuntu 真挂载三类隔离 job。覆盖率 JSON 必须同时满足行覆盖和分支覆盖各不低于 80%。构建默认使用 debug 与临时 `CARGO_TARGET_DIR`，job 结束无论成功失败都清理产物。
+Release Action 在四个原生 runner 上运行默认 workspace 测试和 release 构建；覆盖率与
+Ubuntu/Debian 真挂载不混入发布 workflow，而是作为本轮独立验收。覆盖率必须同时满足
+行和分支各不低于 80%。本地构建使用临时 `CARGO_TARGET_DIR`，验收后清理中间产物。
 
 相对性能门槛：
 
@@ -355,14 +357,13 @@ cargo test -p eventfs-fuse
 cargo test -p eventfs-fuse --test mount_e2e_test -- --ignored --test-threads=1
 ```
 
-完整验收中的 17 项忽略项由 14 项真实 `es-server` 多进程测试、2 项真实
-`esctl` 多进程测试和 1 项真 FUSE 挂载测试组成。当前环境缺少 `/dev/fuse`，因此
-真挂载仍是发布前的独立门槛，不能用 MockBackend 或仅编译该测试替代。
+完整验收中的 17 项环境型用例由 14 项真实 `es-server` 多进程测试、2 项真实
+`esctl` 多进程测试和 1 项真 FUSE 挂载测试组成。前 16 项已在 macOS 独立串行通过；
+真挂载已在最小权限 Debian client 容器中通过，不能用 MockBackend 或仅编译替代。
 
-本轮 Linux workspace 共 646 项通过、17 项忽略；`eventfs-fuse` 36 项通过，
-`es-client` AggregateStore 集成测试 6 项通过，跨节点 Renew e2e 通过。覆盖率 profile
-由 Rust 1.88 生成，宿主 LLVM 23 因 raw format 10/11 不兼容而无法可信合并；保留
-上述最近一次 80% 门禁基线，不记录手工混合重复对象所得的汇总值。
+2026-08-16 macOS ARM64 默认 workspace 634 项通过、16 项忽略；覆盖率使用匹配的
+nightly LLVM 23 与 `cargo-llvm-cov 0.8.7` 重算，行覆盖 `90.98%`、分支覆盖
+`81.40%`。Linux 条件编译测试项数以同一提交的 Release Action 输出为准。
 
 ## 13. 实施顺序
 

@@ -3,7 +3,6 @@
 //! external interface 只暴露常用写目标、本地已知归属与条件变更；控制 Shard
 //! Raft、内部 gRPC、fencing 与 `routes.json` 投影均隐藏在 implementation 内。
 
-#[cfg(test)]
 use std::collections::BTreeMap;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -152,6 +151,9 @@ pub(crate) trait OwnershipCommitPort: Send + Sync {
         stream: &str,
         generation: u64,
     ) -> Result<u64, OwnershipError>;
+
+    /// 从本地已应用状态机读取权威投影；不发起共识写入。
+    async fn local_projection(&self) -> Result<Option<es_core::route::RouteTable>, OwnershipError>;
 }
 
 /// 调用者与测试使用的 Stream 归属 interface。
@@ -183,6 +185,7 @@ impl StreamOwnership {
             config,
             shard_manager,
             control_shard_id,
+            route_table.clone(),
         )?);
         Ok(Self::with_port(
             route_table,
@@ -256,6 +259,19 @@ impl StreamOwnership {
     /// - 返回：本地投影中的归属；未知时返回 `None`。
     pub async fn known(&self, stream: &str) -> Option<Owner> {
         self.route_table.lookup_owner(stream).await
+    }
+
+    /// 用本地控制 Shard 已应用的 catalog 修复兼容投影。
+    ///
+    /// 此路径不分配 Stream、不发网络请求；本节点不承载控制 Shard 时保持现状。
+    pub(crate) async fn refresh_local_projection(&self) -> Result<(), OwnershipError> {
+        if let Some(table) = self.port.local_projection().await? {
+            self.route_table
+                .apply_authoritative(table)
+                .await
+                .map_err(OwnershipError::Internal)?;
+        }
+        Ok(())
     }
 
     /// 从控制 Shard 重新取得权威投影；兼容广播只能触发此刷新。
@@ -628,6 +644,7 @@ fn load_or_persist_control_shard(
 struct RaftOwnershipPort {
     shard_manager: Arc<ShardManager>,
     control_shard_id: u64,
+    route_table: Arc<RouteTableManager>,
     peer_addrs: std::collections::BTreeMap<u64, String>,
     tls: Option<TlsClientConfig>,
 }
@@ -637,6 +654,7 @@ impl RaftOwnershipPort {
         config: &Config,
         shard_manager: Arc<ShardManager>,
         control_shard_id: u64,
+        route_table: Arc<RouteTableManager>,
     ) -> Result<Self, String> {
         let tls = config
             .tls
@@ -646,6 +664,7 @@ impl RaftOwnershipPort {
         Ok(Self {
             shard_manager,
             control_shard_id,
+            route_table,
             peer_addrs: config
                 .node
                 .peers
@@ -721,18 +740,24 @@ impl RaftOwnershipPort {
         Ok(response.generation)
     }
 
-    fn forward_node_id(
-        error: &openraft::error::RaftError<
+    fn forward_plan(
+        peer_addrs: &BTreeMap<u64, String>,
+        error: openraft::error::RaftError<
             u64,
             openraft::error::ClientWriteError<u64, openraft::BasicNode>,
         >,
-    ) -> Option<u64> {
-        match error {
+    ) -> (Option<String>, String) {
+        let leader_id = match &error {
             openraft::error::RaftError::APIError(
                 openraft::error::ClientWriteError::ForwardToLeader(forward),
             ) => forward.leader_id,
             _ => None,
-        }
+        };
+        let preferred = leader_id.and_then(|node_id| peer_addrs.get(&node_id).cloned());
+        let public_message = crate::service::client_write_to_status(error)
+            .message()
+            .to_string();
+        (preferred, public_message)
     }
 }
 
@@ -750,17 +775,24 @@ impl OwnershipCommitPort for RaftOwnershipPort {
                 .await
             {
                 Ok(response) => {
-                    return match response.data {
-                        es_storage::EsResponse::OwnershipApplied(applied) => Ok(applied),
+                    let applied = match response.data {
+                        es_storage::EsResponse::OwnershipApplied(applied) => applied,
                         other => Err(OwnershipError::Internal(format!(
                             "控制 Shard 返回意外结果: {other:?}"
-                        ))),
+                        )))?,
                     };
+                    // 本地 leader 路径不经过 OwnershipInternal，必须在这里发布投影。
+                    self.route_table
+                        .publish_authoritative(applied.table.clone())
+                        .await
+                        .map_err(OwnershipError::Internal)?;
+                    return Ok(applied);
                 }
                 Err(error) => {
-                    preferred = Self::forward_node_id(&error)
-                        .and_then(|node_id| self.peer_addrs.get(&node_id).cloned());
-                    last_error = Some(error.to_string());
+                    let plan = Self::forward_plan(&self.peer_addrs, error);
+                    preferred = plan.0;
+                    // 没有内部地址可直连时，保留公开 leader hint 给外部客户端重定向。
+                    last_error = Some(plan.1);
                 }
             }
         }
@@ -806,9 +838,9 @@ impl OwnershipCommitPort for RaftOwnershipPort {
                     };
                 }
                 Err(error) => {
-                    preferred = Self::forward_node_id(&error)
-                        .and_then(|node_id| self.peer_addrs.get(&node_id).cloned());
-                    last_error = Some(error.to_string());
+                    let plan = Self::forward_plan(&self.peer_addrs, error);
+                    preferred = plan.0;
+                    last_error = Some(plan.1);
                 }
             }
         }
@@ -824,6 +856,18 @@ impl OwnershipCommitPort for RaftOwnershipPort {
         Err(OwnershipError::Unavailable(last_error.unwrap_or_else(
             || format!("找不到 Shard {shard_id} leader"),
         )))
+    }
+
+    async fn local_projection(&self) -> Result<Option<es_core::route::RouteTable>, OwnershipError> {
+        let shard = match self.shard_manager.get_shard(self.control_shard_id).await {
+            Ok(shard) => shard,
+            Err(_) => return Ok(None),
+        };
+        shard
+            .storage
+            .read_ownership_catalog()
+            .map(|catalog| catalog.map(|catalog| catalog.project()))
+            .map_err(|error| OwnershipError::Internal(error.to_string()))
     }
 }
 
@@ -858,11 +902,51 @@ impl OwnershipCommitPort for MemoryOwnershipPort {
         *current = (*current).max(generation);
         Ok(*current)
     }
+
+    async fn local_projection(&self) -> Result<Option<es_core::route::RouteTable>, OwnershipError> {
+        Ok(Some(self.catalog.lock().await.project()))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forwarding_without_internal_peer_preserves_public_leader_hint() {
+        use openraft::error::{ClientWriteError, ForwardToLeader, RaftError};
+
+        let error = RaftError::APIError(ClientWriteError::ForwardToLeader(ForwardToLeader::new(
+            2,
+            openraft::BasicNode {
+                addr: "http://127.0.0.1:50052".into(),
+            },
+        )));
+        let (preferred, message) = RaftOwnershipPort::forward_plan(&BTreeMap::new(), error);
+
+        assert_eq!(preferred, None);
+        assert_eq!(
+            message,
+            "not leader; leader_id=2 leader_addr=http://127.0.0.1:50052"
+        );
+    }
+
+    #[test]
+    fn forwarding_prefers_configured_internal_peer() {
+        use openraft::error::{ClientWriteError, ForwardToLeader, RaftError};
+
+        let error = RaftError::APIError(ClientWriteError::ForwardToLeader(ForwardToLeader::new(
+            2,
+            openraft::BasicNode {
+                addr: "http://public-node2:50052".into(),
+            },
+        )));
+        let peers = BTreeMap::from([(2, "http://internal-node2:60052".into())]);
+        let (preferred, message) = RaftOwnershipPort::forward_plan(&peers, error);
+
+        assert_eq!(preferred.as_deref(), Some("http://internal-node2:60052"));
+        assert!(message.contains("leader_addr=http://public-node2:50052"));
+    }
 
     fn test_config(data_dir: &std::path::Path) -> Config {
         Config {
@@ -983,6 +1067,27 @@ mod tests {
         ownership.refresh_projection().await.expect("刷新权威投影");
         assert_eq!(ownership.known("orders/authority").await, Some(owner));
         assert_eq!(ownership.route_table.snapshot().await.version, 1);
+    }
+
+    #[tokio::test]
+    async fn local_catalog_repairs_stale_projection_without_commit() {
+        let (_dir, ownership, port) = test_ownership();
+        let applied = port.catalog.lock().await.apply(OwnershipCommand::Ensure {
+            stream: "orders/local-repair".into(),
+            eligible_shards: BTreeSet::from([0, 1]),
+        });
+        let expected = match applied.outcome {
+            OwnershipOutcome::Owner { owner, .. } => owner,
+            other => panic!("预期 Owner，实际 {other:?}"),
+        };
+        assert!(ownership.known("orders/local-repair").await.is_none());
+
+        ownership
+            .refresh_local_projection()
+            .await
+            .expect("从本地 catalog 修复投影");
+
+        assert_eq!(ownership.known("orders/local-repair").await, Some(expected));
     }
 
     #[tokio::test]
@@ -1317,8 +1422,12 @@ mod tests {
     async fn raft_adapter_without_local_shard_or_peer_is_unavailable() {
         let dir = tempfile::tempdir().expect("创建临时目录");
         let config = test_config(dir.path());
-        let port = RaftOwnershipPort::new(&config, Arc::new(ShardManager::new(1, 2)), 0)
-            .expect("构造生产 adapter");
+        let route_table = Arc::new(
+            RouteTableManager::new(&config, dir.path().join("routes.json")).expect("构造路由投影"),
+        );
+        let port =
+            RaftOwnershipPort::new(&config, Arc::new(ShardManager::new(1, 2)), 0, route_table)
+                .expect("构造生产 adapter");
 
         let commit_error = port
             .commit(OwnershipCommand::ApplyPlacement {
