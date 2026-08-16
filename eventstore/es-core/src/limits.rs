@@ -8,13 +8,13 @@
 /// 一条 append 批在 raft 里是一条日志条目;openraft 对单条超限的
 /// AppendEntries 没有拆小路径(返回 PayloadTooLarge 会被解释为
 /// Unreachable,复制停滞),因此必须从源头限制单事件大小。
-pub const MAX_EVENT_PAYLOAD_BYTES: usize = 1 * 1024 * 1024;
+pub const MAX_EVENT_PAYLOAD_BYTES: usize = 1024 * 1024;
 
-/// 单次 append 请求上限(默认值,字节)。
+/// 单条 Aggregate Raft 日志允许的最大业务 payload（字节）。
 ///
-/// 8MB 传输上限减去 1MiB 余量(proto/bincode 逐事件固定头 + gRPC 信封),
-/// 保证「总和达标」的请求不会在传输层被拒。
-pub const MAX_APPEND_BATCH_BYTES: usize = 7 * 1024 * 1024;
+/// 8MB 传输上限减去 1MiB 余量，用于约束可配置的 `max_event_bytes`，
+/// 避免单条不可拆分的 Raft entry 被网络层拒绝。
+pub const MAX_AGGREGATE_EVENT_BYTES: usize = 7 * 1024 * 1024;
 
 /// snapshot_max_chunk_size 允许上限(字节)。
 ///

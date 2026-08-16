@@ -1,3 +1,7 @@
-# AggregateStore 与 EventStore 保持数据隔离
+---
+status: superseded by ADR-0006
+---
 
-新增的 `AggregateStore` Interface 使用聚合类型事件集、实例级版本和虚拟事件分区，不自动读取、改写或迁移现有 `EventStore` Stream。两套 Interface 各自保持唯一写入权威；eventfs-fuse 只使用 `AggregateStore`，旧数据如需转换必须通过显式迁移工具完成，以避免双写、身份推断和版本语义冲突。
+# 将 AggregateStore 与通用事件接口隔离
+
+该决策曾通过独立 API 隔离两套模型；ADR-0006 删除了通用事件接口，因此本决策已被替代。

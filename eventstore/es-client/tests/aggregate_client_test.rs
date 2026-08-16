@@ -14,8 +14,8 @@ use tonic::{Request, Response, Status};
 struct StubState {
     append_calls: usize,
     append_queue: VecDeque<Result<AppendAggregateEventResponse, Status>>,
-    read_requests: Vec<ReadAggregateEventsRequest>,
-    read_streams: VecDeque<Vec<Result<ReadAggregateEventsResponse, Status>>>,
+    read_requests: Vec<FollowAggregateTypeEventsRequest>,
+    read_streams: VecDeque<Vec<Result<FollowAggregateTypeEventsResponse, Status>>>,
     put_state_calls: usize,
     put_state_queue: VecDeque<Result<PutAggregateStateResponse, Status>>,
     fetch_calls: usize,
@@ -29,7 +29,8 @@ struct StubServer {
 
 #[tonic::async_trait]
 impl AggregateStore for StubServer {
-    type ReadAggregateEventsStream = ReceiverStream<Result<ReadAggregateEventsResponse, Status>>;
+    type FollowAggregateTypeEventsStream =
+        ReceiverStream<Result<FollowAggregateTypeEventsResponse, Status>>;
 
     async fn get_aggregate_store_capabilities(
         &self,
@@ -46,27 +47,27 @@ impl AggregateStore for StubServer {
         }))
     }
 
-    async fn create_event_set(
+    async fn register_aggregate_type(
         &self,
-        _request: Request<CreateEventSetRequest>,
-    ) -> Result<Response<AggregateEventSetInfo>, Status> {
-        Ok(Response::new(AggregateEventSetInfo::default()))
+        _request: Request<RegisterAggregateTypeRequest>,
+    ) -> Result<Response<AggregateTypeInfo>, Status> {
+        Ok(Response::new(AggregateTypeInfo::default()))
     }
 
-    async fn list_event_sets(
+    async fn list_aggregate_types(
         &self,
-        _request: Request<ListEventSetsRequest>,
-    ) -> Result<Response<ListEventSetsResponse>, Status> {
-        Ok(Response::new(ListEventSetsResponse {
-            event_sets: vec![AggregateEventSetInfo::default()],
+        _request: Request<ListAggregateTypesRequest>,
+    ) -> Result<Response<ListAggregateTypesResponse>, Status> {
+        Ok(Response::new(ListAggregateTypesResponse {
+            aggregate_types: vec![AggregateTypeInfo::default()],
         }))
     }
 
-    async fn get_event_set(
+    async fn get_aggregate_type(
         &self,
-        _request: Request<GetEventSetRequest>,
-    ) -> Result<Response<AggregateEventSetInfo>, Status> {
-        Ok(Response::new(AggregateEventSetInfo::default()))
+        _request: Request<GetAggregateTypeRequest>,
+    ) -> Result<Response<AggregateTypeInfo>, Status> {
+        Ok(Response::new(AggregateTypeInfo::default()))
     }
 
     async fn append_aggregate_event(
@@ -84,10 +85,10 @@ impl AggregateStore for StubServer {
         }
     }
 
-    async fn read_aggregate_events(
+    async fn follow_aggregate_type_events(
         &self,
-        request: Request<ReadAggregateEventsRequest>,
-    ) -> Result<Response<Self::ReadAggregateEventsStream>, Status> {
+        request: Request<FollowAggregateTypeEventsRequest>,
+    ) -> Result<Response<Self::FollowAggregateTypeEventsStream>, Status> {
         let items = {
             let mut state = self.state.lock().expect("stub 锁");
             state.read_requests.push(request.into_inner());
@@ -151,9 +152,9 @@ impl AggregateStore for StubServer {
     ) -> Result<Response<AggregateStoreStatus>, Status> {
         Ok(Response::new(AggregateStoreStatus {
             catalog_revision: 1,
-            event_set_count: 1,
-            creating_event_set_count: 0,
-            active_event_set_count: 1,
+            aggregate_type_count: 1,
+            registering_aggregate_type_count: 0,
+            active_aggregate_type_count: 1,
         }))
     }
 
@@ -249,8 +250,8 @@ async fn start_stub() -> (String, Arc<Mutex<StubState>>) {
     (address, state)
 }
 
-fn event_set() -> Option<AggregateEventSetRef> {
-    Some(AggregateEventSetRef {
+fn aggregate_type() -> Option<AggregateTypeRef> {
+    Some(AggregateTypeRef {
         business_space: "orders".into(),
         aggregate_type: "order".into(),
     })
@@ -275,20 +276,20 @@ async fn all_unary_methods_roundtrip_and_rotate_after_connect_failure() {
     );
     assert_eq!(
         client
-            .list_event_sets()
+            .list_aggregate_types()
             .await
             .expect("连接失败后轮换节点")
             .len(),
         1
     );
     client
-        .create_event_set(CreateEventSetRequest::default())
+        .register_aggregate_type(RegisterAggregateTypeRequest::default())
         .await
-        .expect("创建事件集");
+        .expect("注册聚合类型");
     client
-        .get_event_set(event_set().unwrap())
+        .get_aggregate_type(aggregate_type().unwrap())
         .await
-        .expect("获取事件集");
+        .expect("获取聚合类型");
     assert_eq!(
         client
             .list_states(ListAggregateStatesRequest::default())
@@ -314,7 +315,14 @@ async fn all_unary_methods_roundtrip_and_rotate_after_connect_failure() {
             .revision,
         4
     );
-    assert_eq!(client.status().await.expect("服务状态").event_set_count, 1);
+    assert_eq!(
+        client
+            .status()
+            .await
+            .expect("服务状态")
+            .aggregate_type_count,
+        1
+    );
     client
         .create_group(CreateAggregateGroupRequest::default())
         .await
@@ -329,7 +337,7 @@ async fn all_unary_methods_roundtrip_and_rotate_after_connect_failure() {
         .expect("获取组");
     assert_eq!(
         client
-            .list_groups(event_set().unwrap())
+            .list_groups(aggregate_type().unwrap())
             .await
             .expect("列组")
             .len(),
@@ -349,7 +357,7 @@ async fn all_unary_methods_roundtrip_and_rotate_after_connect_failure() {
         .expect("续租组");
     assert_eq!(
         client
-            .list_partitions(event_set().unwrap())
+            .list_partitions(aggregate_type().unwrap())
             .await
             .expect("列分区")
             .len(),
@@ -414,7 +422,7 @@ async fn append_follows_leader_hint_to_uncached_node() {
         .expect("连接 follower");
     let response = client
         .append(AppendAggregateEventRequest {
-            event_set: event_set(),
+            aggregate_type: aggregate_type(),
             aggregate_id: "order-1".into(),
             expected_version: None,
             event: Some(NewAggregateEvent {
@@ -494,8 +502,8 @@ async fn follow_reconnects_from_last_opaque_cursor() {
     let (address, state) = start_stub().await;
     state.lock().expect("stub 锁").read_streams.extend([
         vec![
-            Ok(ReadAggregateEventsResponse {
-                payload: Some(read_aggregate_events_response::Payload::Event(
+            Ok(FollowAggregateTypeEventsResponse {
+                payload: Some(follow_aggregate_type_events_response::Payload::Event(
                     AggregateEvent {
                         aggregate_id: "order-1".into(),
                         aggregate_version: 0,
@@ -506,8 +514,10 @@ async fn follow_reconnects_from_last_opaque_cursor() {
             }),
             Err(Status::unavailable("connection dropped")),
         ],
-        vec![Ok(ReadAggregateEventsResponse {
-            payload: Some(read_aggregate_events_response::Payload::CaughtUp(Empty {})),
+        vec![Ok(FollowAggregateTypeEventsResponse {
+            payload: Some(follow_aggregate_type_events_response::Payload::CaughtUp(
+                Empty {},
+            )),
             cursor: vec![4, 5, 6],
         })],
     ]);
@@ -516,10 +526,10 @@ async fn follow_reconnects_from_last_opaque_cursor() {
         .await
         .expect("连接 stub");
     let mut stream = client
-        .follow(ReadAggregateEventsRequest {
-            event_set: event_set(),
-            start: Some(AggregateReadStart {
-                kind: Some(aggregate_read_start::Kind::Beginning(Empty {})),
+        .follow(FollowAggregateTypeEventsRequest {
+            aggregate_type: aggregate_type(),
+            start: Some(AggregateFollowStart {
+                kind: Some(aggregate_follow_start::Kind::Beginning(Empty {})),
             }),
         })
         .await
@@ -528,7 +538,7 @@ async fn follow_reconnects_from_last_opaque_cursor() {
     let first = stream.next().await.expect("第一帧").expect("第一帧成功");
     assert!(matches!(
         first.payload,
-        Some(read_aggregate_events_response::Payload::Event(_))
+        Some(follow_aggregate_type_events_response::Payload::Event(_))
     ));
     let resumed = tokio::time::timeout(std::time::Duration::from_secs(3), stream.next())
         .await
@@ -537,13 +547,13 @@ async fn follow_reconnects_from_last_opaque_cursor() {
         .expect("续读成功");
     assert!(matches!(
         resumed.payload,
-        Some(read_aggregate_events_response::Payload::CaughtUp(_))
+        Some(follow_aggregate_type_events_response::Payload::CaughtUp(_))
     ));
 
     let requests = &state.lock().expect("stub 锁").read_requests;
     assert_eq!(requests.len(), 2);
     assert!(matches!(
         requests[1].start.as_ref().and_then(|start| start.kind.as_ref()),
-        Some(aggregate_read_start::Kind::Cursor(cursor)) if cursor == &vec![1, 2, 3]
+        Some(aggregate_follow_start::Kind::Cursor(cursor)) if cursor == &vec![1, 2, 3]
     ));
 }

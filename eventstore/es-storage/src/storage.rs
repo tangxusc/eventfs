@@ -1,4 +1,4 @@
-//! EventStore 存储实现：基于 surrealkv 的 RaftLogStorage 与 RaftStateMachine。
+//! EventFS 存储实现：基于 surrealkv 的 RaftLogStorage 与 RaftStateMachine。
 
 use std::fmt::Debug;
 use std::ops::{Bound, RangeBounds};
@@ -10,9 +10,9 @@ use tokio::sync::RwLock;
 
 use crate::key;
 use crate::raft_type::TypeConfig;
-use es_core::{AggregateEvent, Error, Event, OwnershipCatalog, Result};
+use es_core::{AggregateEvent, Error, Result};
 
-/// EventStore 存储：单个分片的 Raft 日志与状态机
+/// EventFS 存储：单个 Shard 的 Raft 日志与 Aggregate 状态机。
 ///
 /// 多个分片共享同一个 `Arc<surrealkv::Tree>`，通过 key 前缀隔离。
 /// 快照与业务数据分离：存于独立快照目录（snapshot_store）。
@@ -22,9 +22,7 @@ pub struct EsStorage {
     tree: Arc<surrealkv::Tree>,
     /// 状态机内存缓存。持久化真值在 tree 中，此处用于快速读取。
     sm_cache: Arc<RwLock<SmCache>>,
-    /// 事件广播通道：apply 成功后发送新事件，供 Subscribe 订阅
-    event_tx: tokio::sync::broadcast::Sender<Event>,
-    /// 聚合事件广播通道：与旧 EventStore 事件保持类型和数据隔离。
+    /// 聚合事件广播通道：apply 成功后发送新事件。
     aggregate_event_tx: tokio::sync::broadcast::Sender<AggregateEvent>,
     /// 快照文件存储（独立目录，与业务数据分离）
     snapshot_store: crate::snapshot::SnapshotStore,
@@ -48,8 +46,6 @@ impl EsStorage {
         tree: Arc<surrealkv::Tree>,
         snapshot: crate::snapshot::SnapshotConfig,
     ) -> Result<Self> {
-        // 创建事件广播通道，容量 1000（订阅者慢了会收到 Lagged 错误）
-        let (event_tx, _rx) = tokio::sync::broadcast::channel(1000);
         let (aggregate_event_tx, _rx) = tokio::sync::broadcast::channel(1000);
         let snapshot_store = crate::snapshot::SnapshotStore::new(snapshot, shard_id)
             .map_err(|e| Error::Storage(format!("快照目录初始化失败: {e}")))?;
@@ -61,7 +57,6 @@ impl EsStorage {
                 last_applied: None,
                 membership: Default::default(),
             })),
-            event_tx,
             aggregate_event_tx,
             snapshot_store,
         })
@@ -77,14 +72,6 @@ impl EsStorage {
         self.shard_id
     }
 
-    /// 订阅新事件（用于 Subscribe RPC）
-    ///
-    /// 返回的 Receiver 会接收到 apply 后广播的所有新事件。
-    /// 订阅者慢了（落后超过 1000 条）会收到 `RecvError::Lagged`。
-    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<Event> {
-        self.event_tx.subscribe()
-    }
-
     /// 订阅当前 Shard 新提交的聚合事件。
     ///
     /// 返回的 receiver 只包含 AggregateStore 事件；落后超过通道容量时返回
@@ -98,25 +85,8 @@ impl EsStorage {
         &self.tree
     }
 
-    /// 读取本 Shard 状态机中已应用的 Stream 归属 catalog。
-    ///
-    /// 返回 `None` 表示尚未应用过归属命令；返回的快照与后续 Raft apply 相互独立。
-    /// 存储读取或反序列化失败时返回 [`es_core::Error`]。
-    pub fn read_ownership_catalog(&self) -> Result<Option<OwnershipCatalog>> {
-        self.get(&key::sm_ownership_catalog(self.shard_id()))?
-            .map(|bytes| {
-                crate::encode::decode(&bytes)
-                    .map_err(|error| Error::Serde(format!("归属 catalog 反序列化失败: {error}")))
-            })
-            .transpose()
-    }
-
     pub(crate) fn sm_cache(&self) -> &Arc<RwLock<SmCache>> {
         &self.sm_cache
-    }
-
-    pub(crate) fn event_tx(&self) -> &tokio::sync::broadcast::Sender<Event> {
-        &self.event_tx
     }
 
     pub(crate) fn aggregate_event_tx(&self) -> &tokio::sync::broadcast::Sender<AggregateEvent> {

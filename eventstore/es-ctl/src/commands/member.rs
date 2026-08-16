@@ -351,3 +351,16 @@ pub async fn run_list(ctx: &Ctx, _args: &MemberListArgs) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn member_change_rendering_covers_formats_and_statuses() {
+        for format in [Format::Simple, Format::Table, Format::Json] {
+            print_change(7, 2, format, "测试变更", true);
+            print_change(7, 2, format, "测试变更", false);
+        }
+    }
+}

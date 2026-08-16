@@ -34,7 +34,7 @@ pub struct ShardScope {
 }
 
 impl ShardScope {
-    /// 全部分片 ID（升序；readall/init/member 的目标列表）
+    /// 全部分片 ID（升序；init/member/status 的目标列表）。
     pub fn all_ids(&self) -> Vec<u64> {
         self.ids.clone()
     }
@@ -43,10 +43,6 @@ impl ShardScope {
     /// 支持稀疏布局——动态扩容后 id 可能不连续）。
     pub fn count(&self) -> u64 {
         self.ids.last().map_or(0, |m| m + 1)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.ids.is_empty()
     }
 
     pub fn source(&self) -> ShardScopeSource {
@@ -135,7 +131,7 @@ mod tests {
             ids: Vec::new(),
             source: ShardScopeSource::DefaultFallback,
         };
-        assert!(scope.is_empty());
+        assert!(scope.all_ids().is_empty());
         assert_eq!(scope.count(), 0);
     }
 

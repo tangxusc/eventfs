@@ -1,9 +1,9 @@
-# EventStore 服务器配置示例
+# EventFS 服务器配置示例
 
 [node]
 id = 1
 listen_addr = "127.0.0.1:50051"
-# 内部订阅 RPC 专用监听端口；必须仅向集群节点网段开放，不能暴露给客户端。
+# AggregateStoreInternal 与 Raft 节点间 RPC 监听端口；必须仅向集群节点网段开放。
 internal_listen_addr = "127.0.0.1:51051"
 
 # 集群节点列表（3 节点示例）。非空即触发启动时自动组建集群（etcd 静态引导语义）：
@@ -91,11 +91,7 @@ max_chunk_size = 3145728
 
 # 请求大小限制（可选，可整体缺省；缺省值见注释）
 # max_event_bytes：单事件 data+metadata 上限（字节），默认 1048576（1MiB）。
-#                  一条 append 批在 raft 里是一条日志条目，单条日志超限时
-#                  openraft 无拆小路径（复制停滞），必须源头拦截
-# max_append_batch_bytes：单次 append 请求上限（字节），默认 7340032（7MiB，
-#                  8MB 传输上限 - 余量）。服务端按 proto 编码精确字节数校验，
-#                  超限返回 FailedPrecondition（"append payload too large..."）
+#                  一条 Aggregate append 对应一条 Raft 日志，超限时无法拆分，
+#                  可配置范围为 1..=7340032（7MiB）
 [limits]
 max_event_bytes = 1048576
-max_append_batch_bytes = 7340032

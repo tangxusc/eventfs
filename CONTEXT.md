@@ -1,79 +1,61 @@
 # EventFS 领域词汇
 
-## Stream
+EventFS 保存聚合事件、当前状态和消费进度。本词汇表定义对外统一语言。
 
-按名称标识的事件序列。同一 Stream 的事件版本严格递增，并且在任一时刻只归属一个 Shard。
+## Language
 
-## 聚合类型事件集
+**业务空间（Business Space）**：
+隔离一组业务模型的命名边界；相同聚合类型名可以存在于不同业务空间。
+_Avoid_: Namespace、Tenant
 
-承载同一业务空间内某种聚合根类型全部实例事件的逻辑集合，例如 `orders/order`。它不承诺实例间全序，也不唯一归属一个 Shard。
-_Avoid_: 聚合类型 Stream、聚合根 Stream
+**聚合类型（Aggregate Type）**：
+同一业务空间内一类聚合根的定义，由 `(business_space, aggregate_type)` 标识。
+_Avoid_: 类型集合、聚合类型序列
 
-## 事件分区
+**聚合实例（Aggregate Instance）**：
+某个聚合类型下由 `aggregate_id` 标识的业务实体；完整身份为 `(business_space, aggregate_type, aggregate_id)`。
+_Avoid_: Stream、Stream ID、Event ID
 
-聚合类型事件集内部固定编号的存储与消费单元。同一聚合根实例稳定归属一个事件分区，事件分区不暴露为用户路径或公共事件字段。
-_Avoid_: Stream、Shard
+**聚合事件（Aggregate Event）**：
+描述一个聚合实例已发生事实的不可变记录。
+_Avoid_: 状态、消息
 
-## 聚合根实例
+**聚合版本（Aggregate Version）**：
+单个聚合实例内严格递增的事件版本，用于顺序和乐观并发控制。
+_Avoid_: Shard Position、全局位置
 
-由 `aggregate_id` 在聚合类型事件集内标识的业务实体，其事件保持实例内顺序。
-_Avoid_: Event ID、Stream ID
+**类型级事件 Feed（Aggregate Type Event Feed）**：
+一个聚合类型下全部实例事件的持续读取视图；保证实例内顺序，不承诺实例间全序。
+_Avoid_: 实例历史、全局事件序列
 
-## 聚合版本
+**Cursor**：
+类型级事件 feed 已消费位置的不透明续读凭据。
+_Avoid_: 聚合版本、可解析位置
 
-单个聚合根实例事件序列的乐观并发版本，只在该实例内严格递增，与其他实例及类型级消费位置无关。
-_Avoid_: Stream Position、Shard Position
+**业务状态文档（Aggregate State Document）**：
+一个聚合实例可覆盖的当前状态表示，使用独立 revision 做并发控制。
+_Avoid_: Raft Snapshot、事件历史
 
-## 分区位置
+**聚合消费者组（Aggregate Group）**：
+按名称共享类型级事件 feed 消费进度、租约和重试策略的消费边界。
+_Avoid_: Persistent Subscription、文件读取者
 
-事件提交时由服务端分配的事件分区内消费位置，只用于游标、消费者组进度与迁移，不属于业务事件内容。
-_Avoid_: Stream Position、聚合版本
+**投递（Delivery）**：
+消费者组在租约期限内交给某个消费成员处理的聚合事件。
+_Avoid_: 已确认事件、永久所有权
 
-## Event ID
+**结算（Settlement）**：
+消费成员对投递作出的 Ack、Retry、Park 或 Skip 决定。
+_Avoid_: 文件关闭、读取成功
 
-标识一次事件提交并用于幂等去重的 UUID，与聚合根实例身份无关。
-_Avoid_: Aggregate ID、聚合根 ID
+**虚拟分区（Aggregate Partition）**：
+聚合类型内部稳定划分实例的消费与存储单元；同一聚合实例始终落在同一虚拟分区。
+_Avoid_: Shard、公共路径层级
 
-## 业务状态文档
+**Shard**：
+独立复制并提交状态变更的故障隔离单元；属于部署概念，不属于聚合实例身份。
+_Avoid_: 聚合类型、虚拟分区
 
-某个聚合根实例可覆盖的最新状态表示，与事件历史并存但不属于事件序列。
-_Avoid_: 快照、Raft Snapshot、状态机快照
-
-## Raft Snapshot
-
-用于复制、日志压缩与恢复的 Shard 状态机备份，不承载业务状态文档语义。
-_Avoid_: 业务快照、业务状态文档
-
-## 消费成员
-
-以消费者组身份读取聚合类型事件集投递并显式确认处理结果的客户端实例。
-_Avoid_: 文件读取者
-
-## 投递确认
-
-消费成员对已处理投递作出的显式结算；只有确认后的连续进度才能成为消费者组的已提交位置。
-_Avoid_: 读取成功、文件关闭
-
-## Shard
-
-独立的 Raft group 与存储树。Shard 内按提交位置严格有序，不同 Shard 之间不提供严格全序。
-
-## Stream 归属
-
-Stream 到 Shard 的唯一映射。首次归属与迁移切换必须经过归属权威提交；节点无法确认提交时必须拒绝并允许重试，不能自行分配。
-
-## 归属权威
-
-由控制 Shard 的 Raft 状态机保存的 Stream 归属事实。它是归属写入的唯一权威；`routes.json` 是面向本地快读和旧工具的兼容投影。
-
-## 控制 Shard
-
-服务器启动配置中编号最小的 Shard。它承载归属权威，运行期间不得从放置表中移除。使用现有 Raft group，避免引入额外部署单元。
-
-## 归属代次
-
-某个 Stream 每次改变归属时递增的 generation。写入携带当前代次；Shard 通过 fencing 拒绝旧代次写入，防止过期路由在迁移后继续写入源 Shard。
-
-## 归属投影
-
-归属权威在节点本地的只读快照，持久化为旧格式兼容的 `routes.json`。投影可以短暂落后，但不得自行产生或覆盖归属事实。
+**Raft Snapshot**：
+用于复制恢复和日志压缩的 Shard 状态机备份。
+_Avoid_: 业务状态文档、业务快照

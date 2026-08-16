@@ -1,6 +1,6 @@
 [package]
 name = "es-storage"
-description = "EventStore 存储层：surrealkv 封装与 openraft v2 存储实现"
+description = "EventFS AggregateStore 存储层：surrealkv 与 openraft v2 状态机"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

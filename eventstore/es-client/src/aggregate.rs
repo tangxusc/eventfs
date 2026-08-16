@@ -1,4 +1,4 @@
-//! 聚合事件集客户端。
+//! AggregateStore 客户端。
 //!
 //! 模块负责节点轮换、leader hint 重定向和 follow cursor 续读；调用方只处理
 //! 聚合版本、状态 revision 与公开事件，不接触物理 Shard 或分区位置。
@@ -29,7 +29,7 @@ const FOLLOW_RECONNECT_DELAY: Duration = Duration::from_millis(200);
 /// 每个成功 frame 都携带服务端 opaque cursor。可重试断线后客户端用最后一个
 /// cursor 重建订阅，因此批边界可能重投，但不会主动跳过已确认给调用方的 frame。
 pub type AggregateFollowStream =
-    Pin<Box<dyn Stream<Item = Result<ReadAggregateEventsResponse, ClientError>> + Send>>;
+    Pin<Box<dyn Stream<Item = Result<FollowAggregateTypeEventsResponse, ClientError>> + Send>>;
 
 /// AggregateStore 客户端。
 ///
@@ -198,13 +198,13 @@ impl AggregateStoreClient {
 
     async fn open_follow(
         &mut self,
-        request: ReadAggregateEventsRequest,
-    ) -> Result<Streaming<ReadAggregateEventsResponse>, ClientError> {
+        request: FollowAggregateTypeEventsRequest,
+    ) -> Result<Streaming<FollowAggregateTypeEventsResponse>, ClientError> {
         self.call(RetrySafety::Idempotent, |mut client| {
             let request = request.clone();
             async move {
                 client
-                    .read_aggregate_events(request)
+                    .follow_aggregate_type_events(request)
                     .await
                     .map(|response| response.into_inner())
             }
@@ -229,25 +229,25 @@ impl AggregateStoreClient {
         .await
     }
 
-    /// 幂等创建聚合事件集。
+    /// 幂等注册聚合类型。
     ///
     /// # 参数
     /// `request.operation_id` 必须为 16 字节 UUID，重试时必须保持不变。
     ///
     /// # 返回
-    /// 返回激活后的事件集定义。
+    /// 返回激活后的聚合类型定义。
     ///
     /// # 错误
     /// 身份非法、operation ID 冲突、leader 不可用或 RPC 失败时返回 [`ClientError`]。
-    pub async fn create_event_set(
+    pub async fn register_aggregate_type(
         &mut self,
-        request: CreateEventSetRequest,
-    ) -> Result<AggregateEventSetInfo, ClientError> {
+        request: RegisterAggregateTypeRequest,
+    ) -> Result<AggregateTypeInfo, ClientError> {
         self.call(RetrySafety::Idempotent, |mut client| {
             let request = request.clone();
             async move {
                 client
-                    .create_event_set(request)
+                    .register_aggregate_type(request)
                     .await
                     .map(|response| response.into_inner())
             }
@@ -255,44 +255,44 @@ impl AggregateStoreClient {
         .await
     }
 
-    /// 枚举聚合事件集。
+    /// 枚举聚合类型。
     ///
     /// # 返回
-    /// 返回 catalog 中的全部事件集。
+    /// 返回 catalog 中的全部聚合类型。
     ///
     /// # 错误
     /// control leader 不可用或 RPC 失败时返回 [`ClientError`]。
-    pub async fn list_event_sets(&mut self) -> Result<Vec<AggregateEventSetInfo>, ClientError> {
+    pub async fn list_aggregate_types(&mut self) -> Result<Vec<AggregateTypeInfo>, ClientError> {
         self.call(RetrySafety::Idempotent, |mut client| async move {
             client
-                .list_event_sets(ListEventSetsRequest {})
+                .list_aggregate_types(ListAggregateTypesRequest {})
                 .await
-                .map(|response| response.into_inner().event_sets)
+                .map(|response| response.into_inner().aggregate_types)
         })
         .await
     }
 
-    /// 获取指定聚合事件集。
+    /// 获取指定聚合类型。
     ///
     /// # 参数
-    /// `event_set` 由业务空间和聚合类型构成。
+    /// `aggregate_type` 由业务空间和聚合类型构成。
     ///
     /// # 返回
-    /// 返回事件集定义。
+    /// 返回聚合类型定义。
     ///
     /// # 错误
-    /// 事件集不存在、control leader 不可用或 RPC 失败时返回 [`ClientError`]。
-    pub async fn get_event_set(
+    /// 聚合类型不存在、control leader 不可用或 RPC 失败时返回 [`ClientError`]。
+    pub async fn get_aggregate_type(
         &mut self,
-        event_set: AggregateEventSetRef,
-    ) -> Result<AggregateEventSetInfo, ClientError> {
+        aggregate_type: AggregateTypeRef,
+    ) -> Result<AggregateTypeInfo, ClientError> {
         self.call(RetrySafety::Idempotent, |mut client| {
-            let request = GetEventSetRequest {
-                event_set: Some(event_set.clone()),
+            let request = GetAggregateTypeRequest {
+                aggregate_type: Some(aggregate_type.clone()),
             };
             async move {
                 client
-                    .get_event_set(request)
+                    .get_aggregate_type(request)
                     .await
                     .map(|response| response.into_inner())
             }
@@ -303,7 +303,7 @@ impl AggregateStoreClient {
     /// 以实例级 OCC 追加一条事件。
     ///
     /// # 参数
-    /// `request` 包含事件集、聚合 ID、期望版本和带稳定 UUID 的事件。
+    /// `request` 包含聚合类型、聚合 ID、期望版本和带稳定 UUID 的事件。
     ///
     /// # 返回
     /// 返回服务端分配的聚合版本；不暴露物理 position。
@@ -338,7 +338,7 @@ impl AggregateStoreClient {
     /// 首次建流失败时直接返回 [`ClientError`]；流建立后的永久错误通过流元素返回。
     pub async fn follow(
         &mut self,
-        request: ReadAggregateEventsRequest,
+        request: FollowAggregateTypeEventsRequest,
     ) -> Result<AggregateFollowStream, ClientError> {
         let initial = self.open_follow(request.clone()).await?;
         let mut worker = self.clone();
@@ -378,7 +378,7 @@ impl AggregateStoreClient {
     /// 读取单个聚合实例状态。
     ///
     /// # 参数
-    /// `request` 指定事件集与聚合 ID。
+    /// `request` 指定聚合类型与聚合 ID。
     ///
     /// # 返回
     /// 返回状态 revision 和原始 JSON bytes。
@@ -430,7 +430,7 @@ impl AggregateStoreClient {
     /// 查询 AggregateStore catalog 状态。
     ///
     /// # 返回
-    /// 返回 catalog revision 及创建中/已激活事件集数量。
+    /// 返回 catalog revision 及注册中/已激活聚合类型数量。
     ///
     /// # 错误
     /// control leader 不可用或 RPC 失败时返回 [`ClientError`]。
@@ -499,7 +499,7 @@ impl AggregateStoreClient {
     /// 以 revision CAS 删除消费者组定义。
     ///
     /// # 参数
-    /// `request` 携带事件集、组名、expected revision 和 operation ID。
+    /// `request` 携带聚合类型、组名、expected revision 和 operation ID。
     ///
     /// # 返回
     /// 删除成功返回 `Ok(())`。
@@ -520,7 +520,7 @@ impl AggregateStoreClient {
     /// 获取一个聚合消费者组。
     ///
     /// # 参数
-    /// `request` 指定事件集和组名。
+    /// `request` 指定聚合类型和组名。
     ///
     /// # 返回
     /// 返回当前组定义。
@@ -543,10 +543,10 @@ impl AggregateStoreClient {
         .await
     }
 
-    /// 枚举事件集的聚合消费者组。
+    /// 枚举聚合类型的消费者组。
     ///
     /// # 参数
-    /// `event_set` 指定业务空间和聚合类型。
+    /// `aggregate_type` 指定业务空间和聚合类型。
     ///
     /// # 返回
     /// 返回按 catalog 顺序排列的组定义。
@@ -555,11 +555,11 @@ impl AggregateStoreClient {
     /// control leader 不可用或 RPC 失败时返回 [`ClientError`]。
     pub async fn list_groups(
         &mut self,
-        event_set: AggregateEventSetRef,
+        aggregate_type: AggregateTypeRef,
     ) -> Result<Vec<AggregateGroupInfo>, ClientError> {
         self.call(RetrySafety::Idempotent, |mut client| {
             let request = ListAggregateGroupsRequest {
-                event_set: Some(event_set.clone()),
+                aggregate_type: Some(aggregate_type.clone()),
             };
             async move {
                 client
@@ -649,23 +649,23 @@ impl AggregateStoreClient {
         .await
     }
 
-    /// 查询事件集的内部放置状态，供运维诊断使用。
+    /// 查询聚合类型的内部放置状态，供运维诊断使用。
     ///
     /// # 参数
-    /// `event_set` 指定业务空间与聚合类型。
+    /// `aggregate_type` 指定业务空间与聚合类型。
     ///
     /// # 返回
-    /// 返回固定虚拟分区的 Shard、generation 与迁移状态。
+    /// 返回固定虚拟分区的 Shard、generation 与移动状态。
     ///
     /// # 错误
-    /// 事件集不存在、control leader 不可用或 RPC 失败时返回 [`ClientError`]。
+    /// 聚合类型不存在、control leader 不可用或 RPC 失败时返回 [`ClientError`]。
     pub async fn list_partitions(
         &mut self,
-        event_set: AggregateEventSetRef,
+        aggregate_type: AggregateTypeRef,
     ) -> Result<Vec<AggregatePartitionInfo>, ClientError> {
         self.call(RetrySafety::Idempotent, |mut client| {
             let request = ListAggregatePartitionsRequest {
-                event_set: Some(event_set.clone()),
+                aggregate_type: Some(aggregate_type.clone()),
             };
             async move {
                 client
@@ -680,17 +680,17 @@ impl AggregateStoreClient {
 
 async fn run_follow(
     client: &mut AggregateStoreClient,
-    mut request: ReadAggregateEventsRequest,
-    mut stream: Streaming<ReadAggregateEventsResponse>,
-    tx: tokio::sync::mpsc::Sender<Result<ReadAggregateEventsResponse, ClientError>>,
+    mut request: FollowAggregateTypeEventsRequest,
+    mut stream: Streaming<FollowAggregateTypeEventsResponse>,
+    tx: tokio::sync::mpsc::Sender<Result<FollowAggregateTypeEventsResponse, ClientError>>,
 ) {
     loop {
         let reconnect = loop {
             match stream.message().await {
                 Ok(Some(frame)) => {
                     if !frame.cursor.is_empty() {
-                        request.start = Some(AggregateReadStart {
-                            kind: Some(aggregate_read_start::Kind::Cursor(frame.cursor.clone())),
+                        request.start = Some(AggregateFollowStart {
+                            kind: Some(aggregate_follow_start::Kind::Cursor(frame.cursor.clone())),
                         });
                     }
                     if tx.send(Ok(frame)).await.is_err() {

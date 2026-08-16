@@ -17,7 +17,7 @@ use fuser::{
 use tokio::sync::Notify;
 use uuid::Uuid;
 
-use crate::backend::{BackendError, Capabilities, EventFsBackend, EventSet};
+use crate::backend::{AggregateType, BackendError, Capabilities, EventFsBackend};
 use crate::codec::{self, EventEnvelope, SettlementEnvelope};
 use crate::handle::{BeginError, BufferedWrite, StreamBuffer, WriteError};
 use crate::path::{Node, PathError};
@@ -144,7 +144,7 @@ impl InodeTable {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ConsumerKey {
-    event_set: EventSet,
+    aggregate_type: AggregateType,
     group_name: String,
     consumer_id: String,
 }
@@ -155,22 +155,22 @@ enum OpenHandle {
         state: tokio::sync::Mutex<DirectoryState>,
     },
     StaticRead(Vec<u8>),
-    Stream {
+    StreamingRead {
         shared: Arc<StreamShared>,
         consumer: Option<ConsumerKey>,
     },
     EventWrite {
-        event_set: EventSet,
+        aggregate_type: AggregateType,
         buffer: Mutex<BufferedWrite<EventEnvelope>>,
     },
     StateWrite {
-        event_set: EventSet,
+        aggregate_type: AggregateType,
         aggregate_id: String,
         revision: Option<u64>,
         buffer: Mutex<BufferedWrite<Vec<u8>>>,
     },
     SettlementWrite {
-        event_set: EventSet,
+        aggregate_type: AggregateType,
         group_name: String,
         consumer_id: String,
         buffer: Mutex<BufferedWrite<SettlementEnvelope>>,
@@ -425,10 +425,10 @@ impl<B: EventFsBackend> Inner<B> {
         let Node::State { aggregate_id, .. } = node else {
             return Err(Errno::EINVAL);
         };
-        let event_set = node_event_set(node)?;
+        let aggregate_type = node_aggregate_type(node)?;
         let state = self
             .backend
-            .get_state(&event_set, aggregate_id)
+            .get_state(&aggregate_type, aggregate_id)
             .await
             .map_err(backend_errno)?
             .ok_or(Errno::ENOENT)?;
@@ -447,7 +447,7 @@ impl<B: EventFsBackend> Inner<B> {
         else {
             return false;
         };
-        let Ok(expected_event_set) = EventSet::new(business_space, aggregate_type) else {
+        let Ok(expected_aggregate_type) = AggregateType::new(business_space, aggregate_type) else {
             return false;
         };
         self.handles
@@ -458,11 +458,11 @@ impl<B: EventFsBackend> Inner<B> {
                 matches!(
                     handle.as_ref(),
                     OpenHandle::StateWrite {
-                        event_set,
+                        aggregate_type,
                         aggregate_id: open_aggregate_id,
                         revision: None,
                         ..
-                    } if event_set == &expected_event_set && open_aggregate_id == aggregate_id
+                    } if aggregate_type == &expected_aggregate_type && open_aggregate_id == aggregate_id
                 )
             })
     }
@@ -494,8 +494,11 @@ impl<B: EventFsBackend> Inner<B> {
             .ok_or(Errno::EBADF)
     }
 
-    async fn event_sets(&self) -> Result<Vec<EventSet>, Errno> {
-        self.backend.list_event_sets().await.map_err(backend_errno)
+    async fn aggregate_types(&self) -> Result<Vec<AggregateType>, Errno> {
+        self.backend
+            .list_aggregate_types()
+            .await
+            .map_err(backend_errno)
     }
 
     async fn lookup_child(
@@ -512,29 +515,29 @@ impl<B: EventFsBackend> Inner<B> {
                     .inode(&child)
                     .is_some()
                     || self
-                        .event_sets()
+                        .aggregate_types()
                         .await?
                         .iter()
-                        .any(|event_set| event_set.business_space == *space)
+                        .any(|aggregate_type| aggregate_type.business_space == *space)
             }
             (
-                Node::EventSet {
+                Node::AggregateType {
                     business_space,
                     aggregate_type,
                 },
                 Node::BusinessSpace(_),
-            ) => self.event_sets().await?.iter().any(|event_set| {
-                event_set.business_space == *business_space
-                    && event_set.aggregate_type == *aggregate_type
+            ) => self.aggregate_types().await?.iter().any(|aggregate_type| {
+                aggregate_type.business_space == *business_space
+                    && aggregate_type.aggregate_type == *aggregate_type
             }),
             (Node::State { .. }, Node::States { .. }) => {
                 let (size, mtime) = self.state_attributes(&child).await?;
                 return Ok((child, size, mtime));
             }
             (Node::Group { group_name, .. }, Node::Groups { .. }) => {
-                let event_set = node_event_set(&child)?;
+                let aggregate_type = node_aggregate_type(&child)?;
                 self.backend
-                    .list_groups(&event_set)
+                    .list_groups(&aggregate_type)
                     .await
                     .map_err(backend_errno)?
                     .iter()
@@ -543,7 +546,7 @@ impl<B: EventFsBackend> Inner<B> {
             (Node::Consumer { .. }, Node::Group { .. }) => true,
             (
                 Node::Events { .. } | Node::States { .. } | Node::Groups { .. },
-                Node::EventSet { .. },
+                Node::AggregateType { .. },
             ) => true,
             _ => false,
         };
@@ -559,10 +562,10 @@ impl<B: EventFsBackend> Inner<B> {
         match node {
             Node::Root => {
                 let mut spaces = self
-                    .event_sets()
+                    .aggregate_types()
                     .await?
                     .into_iter()
-                    .map(|event_set| event_set.business_space)
+                    .map(|aggregate_type| aggregate_type.business_space)
                     .collect::<BTreeSet<_>>();
                 spaces.extend(
                     self.inodes
@@ -583,32 +586,32 @@ impl<B: EventFsBackend> Inner<B> {
             }
             Node::BusinessSpace(space) => {
                 children.extend(
-                    self.event_sets()
+                    self.aggregate_types()
                         .await?
                         .into_iter()
-                        .filter(|event_set| event_set.business_space == *space)
-                        .map(|event_set| {
+                        .filter(|aggregate_type| aggregate_type.business_space == *space)
+                        .map(|aggregate_type| {
                             (
-                                event_set.aggregate_type.clone(),
-                                Node::EventSet {
-                                    business_space: event_set.business_space,
-                                    aggregate_type: event_set.aggregate_type,
+                                aggregate_type.aggregate_type.clone(),
+                                Node::AggregateType {
+                                    business_space: aggregate_type.business_space,
+                                    aggregate_type: aggregate_type.aggregate_type,
                                 },
                                 0,
                             )
                         }),
                 );
             }
-            Node::EventSet { .. } => {
+            Node::AggregateType { .. } => {
                 for name in ["events.jsonl", "states", "groups"] {
                     children.push((name.into(), node.child(name).map_err(path_errno)?, 0));
                 }
             }
             Node::States { .. } => {
-                let event_set = node_event_set(node)?;
+                let aggregate_type = node_aggregate_type(node)?;
                 children.extend(
                     self.backend
-                        .list_states(&event_set)
+                        .list_states(&aggregate_type)
                         .await
                         .map_err(backend_errno)?
                         .into_iter()
@@ -620,10 +623,10 @@ impl<B: EventFsBackend> Inner<B> {
                 );
             }
             Node::Groups { .. } => {
-                let event_set = node_event_set(node)?;
+                let aggregate_type = node_aggregate_type(node)?;
                 children.extend(
                     self.backend
-                        .list_groups(&event_set)
+                        .list_groups(&aggregate_type)
                         .await
                         .map_err(backend_errno)?
                         .into_iter()
@@ -651,11 +654,15 @@ impl<B: EventFsBackend> Inner<B> {
         }
 
         let children = if matches!(node, Node::States { .. }) {
-            let event_set = node_event_set(node)?;
+            let aggregate_type = node_aggregate_type(node)?;
             let request_token = state.next_page_token.clone();
             let page = self
                 .backend
-                .list_states_page(&event_set, request_token.clone(), STATE_DIRECTORY_PAGE_SIZE)
+                .list_states_page(
+                    &aggregate_type,
+                    request_token.clone(),
+                    STATE_DIRECTORY_PAGE_SIZE,
+                )
                 .await
                 .map_err(backend_errno)?;
             if !page.next_page_token.is_empty() && page.next_page_token == request_token {
@@ -694,17 +701,17 @@ impl<B: EventFsBackend> Inner<B> {
         let child = parent.child(name).map_err(path_errno)?;
         match (parent, &child) {
             (Node::Root, Node::BusinessSpace(_)) => {}
-            (Node::BusinessSpace(_), Node::EventSet { .. }) => {
-                let event_set = node_event_set(&child)?;
+            (Node::BusinessSpace(_), Node::AggregateType { .. }) => {
+                let aggregate_type = node_aggregate_type(&child)?;
                 self.backend
-                    .create_event_set(&event_set, Uuid::new_v4())
+                    .register_aggregate_type(&aggregate_type, Uuid::new_v4())
                     .await
                     .map_err(backend_errno)?;
             }
             (Node::Groups { .. }, Node::Group { group_name, .. }) => {
-                let event_set = node_event_set(&child)?;
+                let aggregate_type = node_aggregate_type(&child)?;
                 self.backend
-                    .create_group(&event_set, group_name, Uuid::new_v4())
+                    .create_group(&aggregate_type, group_name, Uuid::new_v4())
                     .await
                     .map_err(backend_errno)?;
             }
@@ -727,10 +734,10 @@ impl<B: EventFsBackend> Inner<B> {
         let direct = FopenFlags::FOPEN_DIRECT_IO | FopenFlags::FOPEN_NONSEEKABLE;
         match (node, flags.acc_mode()) {
             (node @ Node::Events { .. }, OpenAccMode::O_RDONLY) => {
-                let event_set = node_event_set(&node)?;
+                let aggregate_type = node_aggregate_type(&node)?;
                 let mut receiver = self
                     .backend
-                    .follow(&event_set)
+                    .follow(&aggregate_type)
                     .await
                     .map_err(backend_errno)?;
                 let shared = Arc::new(StreamShared::new());
@@ -752,7 +759,7 @@ impl<B: EventFsBackend> Inner<B> {
                     producer.close();
                 });
                 Ok((
-                    self.insert_handle(OpenHandle::Stream {
+                    self.insert_handle(OpenHandle::StreamingRead {
                         shared,
                         consumer: None,
                     }),
@@ -761,7 +768,7 @@ impl<B: EventFsBackend> Inner<B> {
             }
             (node @ Node::Events { .. }, OpenAccMode::O_WRONLY) => Ok((
                 self.insert_handle(OpenHandle::EventWrite {
-                    event_set: node_event_set(&node)?,
+                    aggregate_type: node_aggregate_type(&node)?,
                     buffer: Mutex::new(BufferedWrite::new(self.capabilities.max_event_bytes)),
                 }),
                 FopenFlags::FOPEN_DIRECT_IO,
@@ -774,11 +781,11 @@ impl<B: EventFsBackend> Inner<B> {
                 },
                 OpenAccMode::O_RDONLY,
             ) => {
-                let event_set =
-                    EventSet::new(business_space, aggregate_type).map_err(backend_errno)?;
+                let aggregate_type =
+                    AggregateType::new(business_space, aggregate_type).map_err(backend_errno)?;
                 let state = self
                     .backend
-                    .get_state(&event_set, &aggregate_id)
+                    .get_state(&aggregate_type, &aggregate_id)
                     .await
                     .map_err(backend_errno)?
                     .ok_or(Errno::ENOENT)?;
@@ -795,17 +802,17 @@ impl<B: EventFsBackend> Inner<B> {
                 },
                 OpenAccMode::O_WRONLY,
             ) => {
-                let event_set =
-                    EventSet::new(business_space, aggregate_type).map_err(backend_errno)?;
+                let aggregate_type =
+                    AggregateType::new(business_space, aggregate_type).map_err(backend_errno)?;
                 let revision = self
                     .backend
-                    .get_state(&event_set, &aggregate_id)
+                    .get_state(&aggregate_type, &aggregate_id)
                     .await
                     .map_err(backend_errno)?
                     .map(|state| state.revision);
                 Ok((
                     self.insert_handle(OpenHandle::StateWrite {
-                        event_set,
+                        aggregate_type,
                         aggregate_id,
                         revision,
                         buffer: Mutex::new(BufferedWrite::new(self.capabilities.max_state_bytes)),
@@ -823,7 +830,7 @@ impl<B: EventFsBackend> Inner<B> {
                 OpenAccMode::O_RDONLY,
             ) => {
                 let key = ConsumerKey {
-                    event_set: EventSet::new(business_space, aggregate_type)
+                    aggregate_type: AggregateType::new(business_space, aggregate_type)
                         .map_err(backend_errno)?,
                     group_name,
                     consumer_id,
@@ -839,7 +846,7 @@ impl<B: EventFsBackend> Inner<B> {
                 let shared = Arc::new(StreamShared::new());
                 self.spawn_group_reader(key.clone(), shared.clone());
                 Ok((
-                    self.insert_handle(OpenHandle::Stream {
+                    self.insert_handle(OpenHandle::StreamingRead {
                         shared,
                         consumer: Some(key),
                     }),
@@ -856,7 +863,7 @@ impl<B: EventFsBackend> Inner<B> {
                 OpenAccMode::O_WRONLY,
             ) => Ok((
                 self.insert_handle(OpenHandle::SettlementWrite {
-                    event_set: EventSet::new(business_space, aggregate_type)
+                    aggregate_type: AggregateType::new(business_space, aggregate_type)
                         .map_err(backend_errno)?,
                     group_name,
                     consumer_id,
@@ -873,7 +880,7 @@ impl<B: EventFsBackend> Inner<B> {
         self.runtime.spawn(async move {
             let mut unacked = BTreeMap::new();
             while !shared.closed.load(Ordering::Acquire) {
-                let fetch = backend.fetch_group(&key.event_set, &key.group_name, &key.consumer_id);
+                let fetch = backend.fetch_group(&key.aggregate_type, &key.group_name, &key.consumer_id);
                 let fetch_result = if let Some(delay) = renew_delay(&unacked) {
                     if delay <= Duration::from_millis(1) {
                         None
@@ -889,7 +896,7 @@ impl<B: EventFsBackend> Inner<B> {
                 if fetch_result.is_none() {
                     match backend
                         .renew_group(
-                            &key.event_set,
+                            &key.aggregate_type,
                             &key.group_name,
                             &key.consumer_id,
                             unacked.keys().cloned().collect(),
@@ -954,7 +961,10 @@ impl<B: EventFsBackend> Inner<B> {
 
     async fn commit(&self, handle: &OpenHandle) -> Result<(), Errno> {
         match handle {
-            OpenHandle::EventWrite { event_set, buffer } => {
+            OpenHandle::EventWrite {
+                aggregate_type,
+                buffer,
+            } => {
                 let request = {
                     let mut buffer = buffer.lock().expect("event buffer poisoned");
                     buffer
@@ -964,7 +974,7 @@ impl<B: EventFsBackend> Inner<B> {
                 let Some(request) = request else {
                     return Ok(());
                 };
-                let result = self.backend.append(event_set, &request).await;
+                let result = self.backend.append(aggregate_type, &request).await;
                 buffer
                     .lock()
                     .expect("event buffer poisoned")
@@ -972,7 +982,7 @@ impl<B: EventFsBackend> Inner<B> {
                 result.map(|_| ()).map_err(backend_errno)
             }
             OpenHandle::StateWrite {
-                event_set,
+                aggregate_type,
                 aggregate_id,
                 revision,
                 buffer,
@@ -991,7 +1001,7 @@ impl<B: EventFsBackend> Inner<B> {
                 };
                 let result = self
                     .backend
-                    .put_state(event_set, aggregate_id, *revision, request)
+                    .put_state(aggregate_type, aggregate_id, *revision, request)
                     .await;
                 buffer
                     .lock()
@@ -1000,7 +1010,7 @@ impl<B: EventFsBackend> Inner<B> {
                 result.map(|_| ()).map_err(backend_errno)
             }
             OpenHandle::SettlementWrite {
-                event_set,
+                aggregate_type,
                 group_name,
                 consumer_id,
                 buffer,
@@ -1018,7 +1028,7 @@ impl<B: EventFsBackend> Inner<B> {
                 };
                 let result = self
                     .backend
-                    .settle_group(event_set, group_name, consumer_id, &request.settlements)
+                    .settle_group(aggregate_type, group_name, consumer_id, &request.settlements)
                     .await
                     .and_then(|response| {
                         if response.results.iter().all(|result| {
@@ -1050,7 +1060,7 @@ impl<B: EventFsBackend> Inner<B> {
             }
             OpenHandle::Directory { .. }
             | OpenHandle::StaticRead(_)
-            | OpenHandle::Stream { .. } => Ok(()),
+            | OpenHandle::StreamingRead { .. } => Ok(()),
         }
     }
 }
@@ -1333,7 +1343,7 @@ impl<B: EventFsBackend> Filesystem for EventFs<B> {
                 let end = start.saturating_add(size as usize).min(data.len());
                 reply.data(&data[start..end]);
             }
-            OpenHandle::Stream { shared, .. } => {
+            OpenHandle::StreamingRead { shared, .. } => {
                 let shared = shared.clone();
                 self.inner.runtime.spawn(async move {
                     match shared.read(offset, size).await {
@@ -1454,7 +1464,7 @@ impl<B: EventFsBackend> Filesystem for EventFs<B> {
             reply.error(Errno::EBADF);
             return;
         };
-        if let OpenHandle::Stream { shared, consumer } = handle.as_ref() {
+        if let OpenHandle::StreamingRead { shared, consumer } = handle.as_ref() {
             shared.close();
             if let Some(consumer) = consumer {
                 self.inner
@@ -1517,7 +1527,7 @@ impl<B: EventFsBackend> Filesystem for EventFs<B> {
             reply.error(Errno::EBADF);
             return;
         };
-        let OpenHandle::Stream { shared, .. } = handle.as_ref() else {
+        let OpenHandle::StreamingRead { shared, .. } = handle.as_ref() else {
             reply.poll(PollEvents::POLLIN | PollEvents::POLLOUT);
             return;
         };
@@ -1577,16 +1587,16 @@ fn renew_delay(unacked: &BTreeMap<Vec<u8>, u64>) -> Option<Duration> {
     Some(Duration::from_millis(delay_ms))
 }
 
-fn node_event_set(node: &Node) -> Result<EventSet, Errno> {
-    let (business_space, aggregate_type) = node.event_set().ok_or(Errno::EINVAL)?;
-    EventSet::new(business_space, aggregate_type).map_err(backend_errno)
+fn node_aggregate_type(node: &Node) -> Result<AggregateType, Errno> {
+    let (business_space, aggregate_type) = node.aggregate_type().ok_or(Errno::EINVAL)?;
+    AggregateType::new(business_space, aggregate_type).map_err(backend_errno)
 }
 
 fn parent_node(node: &Node) -> Node {
     match node {
         Node::Root => Node::Root,
         Node::BusinessSpace(_) => Node::Root,
-        Node::EventSet { business_space, .. } => Node::BusinessSpace(business_space.clone()),
+        Node::AggregateType { business_space, .. } => Node::BusinessSpace(business_space.clone()),
         Node::Events {
             business_space,
             aggregate_type,
@@ -1598,7 +1608,7 @@ fn parent_node(node: &Node) -> Node {
         | Node::Groups {
             business_space,
             aggregate_type,
-        } => Node::EventSet {
+        } => Node::AggregateType {
             business_space: business_space.clone(),
             aggregate_type: aggregate_type.clone(),
         },
@@ -1689,7 +1699,7 @@ mod tests {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct StateWriteCall {
-        event_set: EventSet,
+        aggregate_type: AggregateType,
         aggregate_id: String,
         revision: Option<u64>,
         data: Vec<u8>,
@@ -1697,7 +1707,7 @@ mod tests {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct SettlementCall {
-        event_set: EventSet,
+        aggregate_type: AggregateType,
         group_name: String,
         consumer_id: String,
         settlements: Vec<Settlement>,
@@ -1705,10 +1715,10 @@ mod tests {
 
     #[derive(Default)]
     struct MockBackend {
-        event_sets: Mutex<BTreeSet<EventSet>>,
-        groups: Mutex<HashMap<EventSet, BTreeSet<String>>>,
-        states: Mutex<HashMap<(EventSet, String), StateDocument>>,
-        appends: Mutex<Vec<(EventSet, EventEnvelope)>>,
+        aggregate_types: Mutex<BTreeSet<AggregateType>>,
+        groups: Mutex<HashMap<AggregateType, BTreeSet<String>>>,
+        states: Mutex<HashMap<(AggregateType, String), StateDocument>>,
+        appends: Mutex<Vec<(AggregateType, EventEnvelope)>>,
         state_writes: Mutex<Vec<StateWriteCall>>,
         settlements: Mutex<Vec<SettlementCall>>,
         settlement_status: Mutex<Option<i32>>,
@@ -1728,37 +1738,41 @@ mod tests {
             })
         }
 
-        async fn list_event_sets(&self) -> BackendResult<Vec<EventSet>> {
+        async fn list_aggregate_types(&self) -> BackendResult<Vec<AggregateType>> {
             Ok(self
-                .event_sets
+                .aggregate_types
                 .lock()
-                .expect("event sets poisoned")
+                .expect("aggregate types poisoned")
                 .iter()
                 .cloned()
                 .collect())
         }
 
-        async fn create_event_set(
+        async fn register_aggregate_type(
             &self,
-            event_set: &EventSet,
+            aggregate_type: &AggregateType,
             _operation_id: Uuid,
         ) -> BackendResult<()> {
-            self.event_sets
+            self.aggregate_types
                 .lock()
-                .expect("event sets poisoned")
-                .insert(event_set.clone());
+                .expect("aggregate types poisoned")
+                .insert(aggregate_type.clone());
             Ok(())
         }
 
-        async fn append(&self, event_set: &EventSet, event: &EventEnvelope) -> BackendResult<u64> {
+        async fn append(
+            &self,
+            aggregate_type: &AggregateType,
+            event: &EventEnvelope,
+        ) -> BackendResult<u64> {
             let mut appends = self.appends.lock().expect("appends poisoned");
-            appends.push((event_set.clone(), event.clone()));
+            appends.push((aggregate_type.clone(), event.clone()));
             Ok((appends.len() - 1) as u64)
         }
 
         async fn follow(
             &self,
-            _event_set: &EventSet,
+            _aggregate_type: &AggregateType,
         ) -> BackendResult<tokio::sync::mpsc::Receiver<BackendResult<Vec<u8>>>> {
             let (_sender, receiver) = tokio::sync::mpsc::channel(1);
             Ok(receiver)
@@ -1766,7 +1780,7 @@ mod tests {
 
         async fn list_states_page(
             &self,
-            event_set: &EventSet,
+            aggregate_type: &AggregateType,
             page_token: Vec<u8>,
             page_size: u32,
         ) -> BackendResult<StatePage> {
@@ -1787,7 +1801,7 @@ mod tests {
                 .lock()
                 .expect("states poisoned")
                 .keys()
-                .filter(|(candidate, _)| candidate == event_set)
+                .filter(|(candidate, _)| candidate == aggregate_type)
                 .map(|(_, aggregate_id)| aggregate_id.clone())
                 .collect::<Vec<_>>();
             aggregate_ids.sort();
@@ -1805,20 +1819,20 @@ mod tests {
 
         async fn get_state(
             &self,
-            event_set: &EventSet,
+            aggregate_type: &AggregateType,
             aggregate_id: &str,
         ) -> BackendResult<Option<StateDocument>> {
             Ok(self
                 .states
                 .lock()
                 .expect("states poisoned")
-                .get(&(event_set.clone(), aggregate_id.into()))
+                .get(&(aggregate_type.clone(), aggregate_id.into()))
                 .cloned())
         }
 
         async fn put_state(
             &self,
-            event_set: &EventSet,
+            aggregate_type: &AggregateType,
             aggregate_id: &str,
             revision: Option<u64>,
             data: Vec<u8>,
@@ -1827,12 +1841,12 @@ mod tests {
                 .lock()
                 .expect("state writes poisoned")
                 .push(StateWriteCall {
-                    event_set: event_set.clone(),
+                    aggregate_type: aggregate_type.clone(),
                     aggregate_id: aggregate_id.into(),
                     revision,
                     data: data.clone(),
                 });
-            let key = (event_set.clone(), aggregate_id.to_string());
+            let key = (aggregate_type.clone(), aggregate_id.to_string());
             let mut states = self.states.lock().expect("states poisoned");
             let current = states.get(&key).map(|state| state.revision);
             if current != revision {
@@ -1847,12 +1861,12 @@ mod tests {
             Ok(state)
         }
 
-        async fn list_groups(&self, event_set: &EventSet) -> BackendResult<Vec<String>> {
+        async fn list_groups(&self, aggregate_type: &AggregateType) -> BackendResult<Vec<String>> {
             Ok(self
                 .groups
                 .lock()
                 .expect("groups poisoned")
-                .get(event_set)
+                .get(aggregate_type)
                 .into_iter()
                 .flatten()
                 .cloned()
@@ -1861,14 +1875,14 @@ mod tests {
 
         async fn create_group(
             &self,
-            event_set: &EventSet,
+            aggregate_type: &AggregateType,
             group_name: &str,
             _operation_id: Uuid,
         ) -> BackendResult<()> {
             self.groups
                 .lock()
                 .expect("groups poisoned")
-                .entry(event_set.clone())
+                .entry(aggregate_type.clone())
                 .or_default()
                 .insert(group_name.into());
             Ok(())
@@ -1876,7 +1890,7 @@ mod tests {
 
         async fn fetch_group(
             &self,
-            _event_set: &EventSet,
+            _aggregate_type: &AggregateType,
             _group_name: &str,
             _consumer_id: &str,
         ) -> BackendResult<FetchAggregateGroupResponse> {
@@ -1897,7 +1911,7 @@ mod tests {
 
         async fn settle_group(
             &self,
-            event_set: &EventSet,
+            aggregate_type: &AggregateType,
             group_name: &str,
             consumer_id: &str,
             settlements: &[Settlement],
@@ -1906,7 +1920,7 @@ mod tests {
                 .lock()
                 .expect("settlements poisoned")
                 .push(SettlementCall {
-                    event_set: event_set.clone(),
+                    aggregate_type: aggregate_type.clone(),
                     group_name: group_name.into(),
                     consumer_id: consumer_id.into(),
                     settlements: settlements.to_vec(),
@@ -1932,7 +1946,7 @@ mod tests {
 
         async fn renew_group(
             &self,
-            _event_set: &EventSet,
+            _aggregate_type: &AggregateType,
             _group_name: &str,
             _consumer_id: &str,
             delivery_ids: Vec<Vec<u8>>,
@@ -2046,38 +2060,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mkdir_creates_event_set_and_consumer_group() {
+    async fn mkdir_creates_aggregate_type_and_consumer_group() {
         let (filesystem, backend) = mock_filesystem();
         let business_space = filesystem
             .inner
             .create_directory(&Node::Root, "orders")
             .await
             .unwrap();
-        let event_set_node = filesystem
+        let aggregate_type_node = filesystem
             .inner
             .create_directory(&business_space, "order")
             .await
             .unwrap();
-        let groups = event_set_node.child("groups").unwrap();
+        let groups = aggregate_type_node.child("groups").unwrap();
         filesystem
             .inner
             .create_directory(&groups, "payments")
             .await
             .unwrap();
 
-        let event_set = EventSet::new("orders", "order").unwrap();
+        let aggregate_type = AggregateType::new("orders", "order").unwrap();
         assert_eq!(
-            backend.list_event_sets().await.unwrap(),
-            vec![event_set.clone()]
+            backend.list_aggregate_types().await.unwrap(),
+            vec![aggregate_type.clone()]
         );
         assert_eq!(
-            backend.list_groups(&event_set).await.unwrap(),
+            backend.list_groups(&aggregate_type).await.unwrap(),
             vec!["payments"]
         );
         assert_eq!(
             filesystem
                 .inner
-                .create_directory(&event_set_node, "states")
+                .create_directory(&aggregate_type_node, "states")
                 .await,
             Err(Errno::EPERM)
         );
@@ -2106,7 +2120,7 @@ mod tests {
 
         let appends = backend.appends.lock().expect("appends poisoned");
         assert_eq!(appends.len(), 1);
-        assert_eq!(appends[0].0, EventSet::new("orders", "order").unwrap());
+        assert_eq!(appends[0].0, AggregateType::new("orders", "order").unwrap());
         assert_eq!(appends[0].1.aggregate_id, "order-1");
         assert_eq!(appends[0].1.data, br#"{"amount":100}"#);
     }
@@ -2114,8 +2128,8 @@ mod tests {
     #[tokio::test]
     async fn state_write_uses_open_revision_and_retries_conflict() {
         let (filesystem, backend) = mock_filesystem();
-        let event_set = EventSet::new("orders", "order").unwrap();
-        let key = (event_set.clone(), "order-1".to_string());
+        let aggregate_type = AggregateType::new("orders", "order").unwrap();
+        let key = (aggregate_type.clone(), "order-1".to_string());
         backend.states.lock().expect("states poisoned").insert(
             key.clone(),
             StateDocument {
@@ -2199,7 +2213,7 @@ mod tests {
         assert_eq!(settlements[0].settlements[0].delivery_id, [0x0a, 0x0b]);
         drop(settlements);
         let reader = filesystem.inner.handle(reader_id).unwrap();
-        if let OpenHandle::Stream { shared, .. } = reader.as_ref() {
+        if let OpenHandle::StreamingRead { shared, .. } = reader.as_ref() {
             shared.close();
         }
     }
@@ -2296,17 +2310,17 @@ mod tests {
 
         assert_eq!(parent_node(&Node::Root), Node::Root);
         assert_eq!(parent_node(&space), Node::Root);
-        assert!(matches!(parent_node(&event), Node::EventSet { .. }));
-        assert!(node_event_set(&Node::Root).is_err());
+        assert!(matches!(parent_node(&event), Node::AggregateType { .. }));
+        assert!(node_aggregate_type(&Node::Root).is_err());
     }
 
     #[tokio::test]
     async fn state_directory_pages_incrementally_and_releases_inode_references() {
         let (filesystem, backend) = mock_filesystem();
-        let event_set = EventSet::new("orders", "order").unwrap();
+        let aggregate_type = AggregateType::new("orders", "order").unwrap();
         for index in 0..600 {
             backend.states.lock().expect("states poisoned").insert(
-                (event_set.clone(), format!("order-{index:03}")),
+                (aggregate_type.clone(), format!("order-{index:03}")),
                 StateDocument {
                     revision: 0,
                     data: b"{}".to_vec(),
@@ -2384,21 +2398,21 @@ mod tests {
     #[tokio::test]
     async fn lookup_and_children_cover_the_complete_namespace() {
         let (filesystem, backend) = mock_filesystem();
-        let event_set = EventSet::new("orders", "order").unwrap();
+        let aggregate_type = AggregateType::new("orders", "order").unwrap();
         backend
-            .event_sets
+            .aggregate_types
             .lock()
-            .expect("event sets poisoned")
-            .insert(event_set.clone());
+            .expect("aggregate types poisoned")
+            .insert(aggregate_type.clone());
         backend
             .groups
             .lock()
             .expect("groups poisoned")
-            .entry(event_set.clone())
+            .entry(aggregate_type.clone())
             .or_default()
             .insert("workers".into());
         backend.states.lock().expect("states poisoned").insert(
-            (event_set, "order-1".into()),
+            (aggregate_type, "order-1".into()),
             StateDocument {
                 revision: 1,
                 data: br#"{"balance":50}"#.to_vec(),
@@ -2408,17 +2422,17 @@ mod tests {
 
         let inner = &filesystem.inner;
         let (space, _, _) = inner.lookup_child(&Node::Root, "orders").await.unwrap();
-        let (event_set_node, _, _) = inner.lookup_child(&space, "order").await.unwrap();
+        let (aggregate_type_node, _, _) = inner.lookup_child(&space, "order").await.unwrap();
         assert_eq!(
             inner.lookup_child(&space, "missing").await,
             Err(Errno::ENOENT)
         );
         let (_, _, _) = inner
-            .lookup_child(&event_set_node, "events.jsonl")
+            .lookup_child(&aggregate_type_node, "events.jsonl")
             .await
             .unwrap();
-        let states = event_set_node.child("states").unwrap();
-        let groups = event_set_node.child("groups").unwrap();
+        let states = aggregate_type_node.child("states").unwrap();
+        let groups = aggregate_type_node.child("groups").unwrap();
         assert_eq!(
             inner.lookup_child(&states, "order-1.json").await.unwrap().1,
             br#"{"balance":50}"#.len() as u64
@@ -2440,7 +2454,7 @@ mod tests {
 
         assert_eq!(inner.children(&Node::Root).await.unwrap().len(), 1);
         assert_eq!(inner.children(&space).await.unwrap().len(), 1);
-        assert_eq!(inner.children(&event_set_node).await.unwrap().len(), 3);
+        assert_eq!(inner.children(&aggregate_type_node).await.unwrap().len(), 3);
         assert_eq!(inner.children(&states).await.unwrap().len(), 1);
         assert_eq!(inner.children(&groups).await.unwrap().len(), 1);
         assert!(inner.children(&group).await.unwrap().is_empty());
@@ -2455,13 +2469,13 @@ mod tests {
     #[tokio::test]
     async fn state_attributes_refresh_backend_for_getattr() {
         let (filesystem, backend) = mock_filesystem();
-        let event_set = EventSet::new("orders", "order").unwrap();
+        let aggregate_type = AggregateType::new("orders", "order").unwrap();
         let node = Node::parse("/orders/order/states/order-1.json").unwrap();
         assert_eq!(
             filesystem.inner.state_attributes(&Node::Root).await,
             Err(Errno::EINVAL)
         );
-        let key = (event_set, "order-1".to_string());
+        let key = (aggregate_type, "order-1".to_string());
         backend.states.lock().expect("states poisoned").insert(
             key.clone(),
             StateDocument {
@@ -2540,9 +2554,9 @@ mod tests {
             Err(Errno::ENOENT)
         ));
 
-        let event_set = EventSet::new("orders", "order").unwrap();
+        let aggregate_type = AggregateType::new("orders", "order").unwrap();
         backend.states.lock().expect("states poisoned").insert(
-            (event_set, "order-1".into()),
+            (aggregate_type, "order-1".into()),
             StateDocument {
                 revision: 1,
                 data: b"state".to_vec(),
@@ -2564,13 +2578,13 @@ mod tests {
         assert_eq!(data, b"state");
         assert_eq!(inner.handle(FileHandle(u64::MAX)).err(), Some(Errno::EBADF));
 
-        let (stream_id, flags) = inner
+        let (handle_id, flags) = inner
             .open_handle(events, OpenFlags(libc::O_RDONLY))
             .await
             .unwrap();
         assert!(flags.contains(FopenFlags::FOPEN_NONSEEKABLE));
-        let stream = inner.handle(stream_id).unwrap();
-        let OpenHandle::Stream { shared, .. } = stream.as_ref() else {
+        let streaming_read = inner.handle(handle_id).unwrap();
+        let OpenHandle::StreamingRead { shared, .. } = streaming_read.as_ref() else {
             panic!("events 读句柄必须是流");
         };
         tokio::task::yield_now().await;
@@ -2607,7 +2621,7 @@ mod tests {
             .await
             .unwrap();
         let handle = filesystem.inner.handle(handle_id).unwrap();
-        let OpenHandle::Stream { shared, .. } = handle.as_ref() else {
+        let OpenHandle::StreamingRead { shared, .. } = handle.as_ref() else {
             panic!("消费者读句柄必须是流");
         };
         let frame = shared.read(0, 4096).await.expect("读取 delivery frame");
@@ -2642,7 +2656,7 @@ mod tests {
             .await
             .unwrap();
         let invalid = filesystem.inner.handle(invalid_id).unwrap();
-        let OpenHandle::Stream { shared, .. } = invalid.as_ref() else {
+        let OpenHandle::StreamingRead { shared, .. } = invalid.as_ref() else {
             panic!("消费者读句柄必须是流");
         };
         assert_eq!(shared.read(0, 1).await, Err(Errno::EIO));
@@ -2669,7 +2683,7 @@ mod tests {
             .await
             .unwrap();
         let handle = filesystem.inner.handle(handle_id).unwrap();
-        let OpenHandle::Stream { shared, .. } = handle.as_ref() else {
+        let OpenHandle::StreamingRead { shared, .. } = handle.as_ref() else {
             panic!("消费者读句柄必须是流");
         };
         let _ = shared.read(0, 4096).await.expect("读取待续租 delivery");
@@ -2710,7 +2724,7 @@ mod tests {
             .await
             .unwrap();
         let handle = filesystem.inner.handle(handle_id).unwrap();
-        let OpenHandle::Stream { shared, .. } = handle.as_ref() else {
+        let OpenHandle::StreamingRead { shared, .. } = handle.as_ref() else {
             panic!("消费者读句柄必须是流");
         };
         let _ = shared.read(0, 4096).await.expect("读取短租约 delivery");

@@ -137,7 +137,7 @@ async fn wait_listener(addr: &str) {
     }
 }
 
-/// 内部订阅端口应与公共 API 一同启动，且二者可独立连接。
+/// 公共 AggregateStore 与内部 AggregateStoreInternal 必须隔离监听。
 #[tokio::test]
 async fn server_serves_public_and_internal_listeners() {
     let dir = tempfile::tempdir().expect("临时目录");
@@ -176,39 +176,6 @@ async fn server_serves_public_and_internal_listeners() {
     wait_listener(&public_addr).await;
     wait_listener(&internal_addr).await;
 
-    let request = es_proto::eventstore::InstallOwnershipFenceRequest {
-        shard_id: 0,
-        stream_id: "listener-scope".into(),
-        generation: 1,
-    };
-    let mut public =
-        es_proto::eventstore::ownership_internal_client::OwnershipInternalClient::connect(format!(
-            "http://{public_addr}"
-        ))
-        .await
-        .expect("连接公共端口");
-    let public_error = public
-        .install_ownership_fence(request.clone())
-        .await
-        .expect_err("公共端口不得暴露归属控制协议");
-    assert_eq!(public_error.code(), tonic::Code::Unimplemented);
-
-    let mut internal =
-        es_proto::eventstore::ownership_internal_client::OwnershipInternalClient::connect(format!(
-            "http://{internal_addr}"
-        ))
-        .await
-        .expect("连接内部端口");
-    let internal_error = internal
-        .install_ownership_fence(request)
-        .await
-        .expect_err("未组建 Raft 时应返回业务错误");
-    assert_ne!(
-        internal_error.code(),
-        tonic::Code::Unimplemented,
-        "内部端口必须注册归属控制协议"
-    );
-
     let mut aggregate =
         es_proto::eventstore::aggregate_store_client::AggregateStoreClient::connect(format!(
             "http://{public_addr}"
@@ -233,7 +200,7 @@ async fn server_serves_public_and_internal_listeners() {
     .await
     .expect("连接公共端口检查内部协议隔离");
     let public_internal_error = public_internal
-        .get_aggregate_catalog_internal(catalog_request.clone())
+        .get_aggregate_catalog_internal(catalog_request)
         .await
         .expect_err("公共端口不得暴露 AggregateStoreInternal");
     assert_eq!(public_internal_error.code(), tonic::Code::Unimplemented);

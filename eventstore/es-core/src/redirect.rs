@@ -103,38 +103,6 @@ impl LeaderRetryPlan {
         }
     }
 
-    /// 取下一个待尝试的目标。
-    ///
-    /// **出队优先于预算检查**:队列空才返回 `None`,预算不阻止尝试队列中
-    /// 未尝试过的目标。去重跳过的重复目标不消耗预算;有效尝试消耗 1 份
-    /// 预算。预算耗尽后仅重定向目标可返回(受 [`Self::redirect_tail`]
-    /// 计数限制),`retry_later` 重入队的目标终止。
-    /// 取出后可用 [`Self::needs_backoff`] 判断本次是否需退避再发请求。
-    pub fn next(&mut self) -> Option<String> {
-        loop {
-            // 先出队:最后预算槽位上收到的重定向地址(redirect_to 已入队)
-            // 必须有机会被尝试——预算只限制「已尝试次数」,不阻止尝试
-            // 已知地址
-            let item = self.queue.pop_front()?;
-            if !self.tried.insert(item.addr.clone()) {
-                // 队列中重复目标:去重跳过,不消耗预算
-                continue;
-            }
-            if self.budget == 0 {
-                // 预算耗尽:仅重定向目标可继续(有 leader 提示,集群已选出
-                // leader,值得追着试);tail 计数兜底,保持有界
-                if item.kind == RetryKind::Redirect && self.redirect_tail > 0 {
-                    self.redirect_tail -= 1;
-                    return Some(item.addr);
-                }
-                // 选举中目标(leader unknown):预算耗尽即终止
-                continue;
-            }
-            self.budget -= 1;
-            return Some(item.addr);
-        }
-    }
-
     /// 重定向地址插队到队首,优先尝试。
     ///
     /// 已尝试过的目标同样入队并允许重试(集群状态可能已变化);
@@ -167,6 +135,34 @@ impl LeaderRetryPlan {
     /// 无需退避,避免无谓延迟("先把其它节点试完")。
     pub fn needs_backoff(&self, target: &str) -> bool {
         self.backoff_target.as_deref() == Some(target)
+    }
+}
+
+impl Iterator for LeaderRetryPlan {
+    type Item = String;
+
+    /// 取下一个待尝试的目标。
+    ///
+    /// 出队优先于预算检查。重复目标不消耗预算；预算耗尽后只允许有界地继续
+    /// 尝试 leader 重定向目标。取出后可用 [`LeaderRetryPlan::needs_backoff`]
+    /// 判断本次是否需退避再发请求。
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            // 最后预算槽位收到的重定向地址必须仍有机会被尝试。
+            let item = self.queue.pop_front()?;
+            if !self.tried.insert(item.addr.clone()) {
+                continue;
+            }
+            if self.budget == 0 {
+                if item.kind == RetryKind::Redirect && self.redirect_tail > 0 {
+                    self.redirect_tail -= 1;
+                    return Some(item.addr);
+                }
+                continue;
+            }
+            self.budget -= 1;
+            return Some(item.addr);
+        }
     }
 }
 

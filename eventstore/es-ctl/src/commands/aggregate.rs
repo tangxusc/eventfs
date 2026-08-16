@@ -1,4 +1,4 @@
-//! `esctl aggregate`：聚合事件集、实例事件、状态与诊断命令。
+//! `esctl aggregate`：聚合类型、实例事件、状态与诊断命令。
 
 use anyhow::{Context, Result, anyhow, bail};
 use es_client::AggregateStoreClient;
@@ -7,18 +7,18 @@ use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 use crate::cli::{
-    AggregateAction, AggregateAppendArgs, AggregateCreateArgs, AggregateEventSetArgs,
-    AggregateFollowArgs, AggregateGroupAction, AggregateGroupCreateArgs, AggregateGroupDeleteArgs,
-    AggregateGroupFetchArgs, AggregateGroupSettingsArgs, AggregateGroupSettleArgs,
-    AggregateGroupSettlementActionArg, AggregateGroupUpdateArgs, AggregateStateAction,
-    AggregateStateGetArgs, AggregateStateListArgs, AggregateStatePutArgs,
+    AggregateAction, AggregateAppendArgs, AggregateFollowArgs, AggregateGroupAction,
+    AggregateGroupCreateArgs, AggregateGroupDeleteArgs, AggregateGroupFetchArgs,
+    AggregateGroupSettingsArgs, AggregateGroupSettleArgs, AggregateGroupSettlementActionArg,
+    AggregateGroupUpdateArgs, AggregateStateAction, AggregateStateGetArgs, AggregateStateListArgs,
+    AggregateStatePutArgs, AggregateTypeAction, AggregateTypeArgs, AggregateTypeRegisterArgs,
     ExpectedAggregateVersionArg, Format,
 };
 use crate::commands::Ctx;
 use crate::output;
 
-fn event_set(business_space: &str, aggregate_type: &str) -> AggregateEventSetRef {
-    AggregateEventSetRef {
+fn aggregate_type(business_space: &str, aggregate_type: &str) -> AggregateTypeRef {
+    AggregateTypeRef {
         business_space: business_space.into(),
         aggregate_type: aggregate_type.into(),
     }
@@ -93,14 +93,14 @@ fn event_json(event: &AggregateEvent) -> serde_json::Value {
     })
 }
 
-fn event_set_json(info: &AggregateEventSetInfo) -> serde_json::Value {
-    let identity = info.event_set.as_ref();
+fn aggregate_type_json(info: &AggregateTypeInfo) -> serde_json::Value {
+    let identity = info.aggregate_type.as_ref();
     serde_json::json!({
         "business_space": identity.map(|value| value.business_space.as_str()).unwrap_or(""),
         "aggregate_type": identity.map(|value| value.aggregate_type.as_str()).unwrap_or(""),
         "partition_count": info.partition_count,
         "hash_algorithm": info.hash_algorithm,
-        "status": AggregateEventSetStatus::try_from(info.status)
+        "status": AggregateTypeStatus::try_from(info.status)
             .map(|status| status.as_str_name())
             .unwrap_or("UNKNOWN"),
         "catalog_revision": info.catalog_revision,
@@ -168,7 +168,7 @@ fn merged_group_settings(
 }
 
 fn group_json(info: &AggregateGroupInfo) -> serde_json::Value {
-    let identity = info.event_set.as_ref();
+    let identity = info.aggregate_type.as_ref();
     let start = info
         .start
         .as_ref()
@@ -240,7 +240,7 @@ fn render_groups(format: Format, groups: &[AggregateGroupInfo]) -> String {
     }
 }
 
-async fn create(ctx: &Ctx, args: &AggregateCreateArgs) -> Result<()> {
+async fn register(ctx: &Ctx, args: &AggregateTypeRegisterArgs) -> Result<()> {
     let operation_id = match &args.operation_id {
         Some(value) => {
             Uuid::parse_str(value).with_context(|| format!("非法 operation ID {value:?}"))?
@@ -249,26 +249,26 @@ async fn create(ctx: &Ctx, args: &AggregateCreateArgs) -> Result<()> {
     };
     let mut client = connect(ctx).await?;
     let info = client
-        .create_event_set(CreateEventSetRequest {
-            event_set: Some(event_set(&args.business_space, &args.aggregate_type)),
+        .register_aggregate_type(RegisterAggregateTypeRequest {
+            aggregate_type: Some(aggregate_type(&args.business_space, &args.aggregate_type)),
             operation_id: operation_id.as_bytes().to_vec(),
         })
         .await?;
-    println!("{}", render_event_sets(ctx.format, &[info]));
+    println!("{}", render_aggregate_types(ctx.format, &[info]));
     Ok(())
 }
 
-fn render_event_sets(format: Format, infos: &[AggregateEventSetInfo]) -> String {
+fn render_aggregate_types(format: Format, infos: &[AggregateTypeInfo]) -> String {
     match format {
         Format::Json => serde_json::json!({
-            "event_sets": infos.iter().map(event_set_json).collect::<Vec<_>>()
+            "aggregate_types": infos.iter().map(aggregate_type_json).collect::<Vec<_>>()
         })
         .to_string(),
         Format::Table => {
             let rows = infos
                 .iter()
                 .map(|info| {
-                    let identity = info.event_set.as_ref();
+                    let identity = info.aggregate_type.as_ref();
                     vec![
                         identity
                             .map(|v| v.business_space.clone())
@@ -277,7 +277,7 @@ fn render_event_sets(format: Format, infos: &[AggregateEventSetInfo]) -> String 
                             .map(|v| v.aggregate_type.clone())
                             .unwrap_or_default(),
                         info.partition_count.to_string(),
-                        AggregateEventSetStatus::try_from(info.status)
+                        AggregateTypeStatus::try_from(info.status)
                             .map(|value| value.as_str_name().to_string())
                             .unwrap_or_else(|_| "UNKNOWN".into()),
                         info.catalog_revision.to_string(),
@@ -294,13 +294,13 @@ fn render_event_sets(format: Format, infos: &[AggregateEventSetInfo]) -> String 
         Format::Simple => infos
             .iter()
             .map(|info| {
-                let identity = info.event_set.as_ref();
+                let identity = info.aggregate_type.as_ref();
                 format!(
                     "{}/{}\t{} partitions\t{}\trevision {}",
                     identity.map(|v| v.business_space.as_str()).unwrap_or(""),
                     identity.map(|v| v.aggregate_type.as_str()).unwrap_or(""),
                     info.partition_count,
-                    AggregateEventSetStatus::try_from(info.status)
+                    AggregateTypeStatus::try_from(info.status)
                         .map(|value| value.as_str_name())
                         .unwrap_or("UNKNOWN"),
                     info.catalog_revision
@@ -324,7 +324,7 @@ async fn append(ctx: &Ctx, args: &AggregateAppendArgs) -> Result<()> {
     let mut client = connect(ctx).await?;
     let response = client
         .append(AppendAggregateEventRequest {
-            event_set: Some(event_set(&args.business_space, &args.aggregate_type)),
+            aggregate_type: Some(aggregate_type(&args.business_space, &args.aggregate_type)),
             aggregate_id: args.aggregate_id.clone(),
             expected_version: Some(expected_version(&args.expected_version)),
             event: Some(NewAggregateEvent {
@@ -354,37 +354,39 @@ async fn append(ctx: &Ctx, args: &AggregateAppendArgs) -> Result<()> {
 
 async fn follow(ctx: &Ctx, args: &AggregateFollowArgs) -> Result<()> {
     let start = if let Some(cursor) = &args.cursor {
-        aggregate_read_start::Kind::Cursor(decode_hex(cursor)?)
+        aggregate_follow_start::Kind::Cursor(decode_hex(cursor)?)
     } else if args.now {
-        aggregate_read_start::Kind::Now(Empty {})
+        aggregate_follow_start::Kind::Now(Empty {})
     } else {
-        aggregate_read_start::Kind::Beginning(Empty {})
+        aggregate_follow_start::Kind::Beginning(Empty {})
     };
     let mut client = connect(ctx).await?;
     let mut stream = client
-        .follow(ReadAggregateEventsRequest {
-            event_set: Some(event_set(&args.business_space, &args.aggregate_type)),
-            start: Some(AggregateReadStart { kind: Some(start) }),
+        .follow(FollowAggregateTypeEventsRequest {
+            aggregate_type: Some(aggregate_type(&args.business_space, &args.aggregate_type)),
+            start: Some(AggregateFollowStart { kind: Some(start) }),
         })
         .await?;
     while let Some(frame) = stream.next().await {
         let frame = frame?;
         let cursor = output::hex(&frame.cursor);
         match frame.payload {
-            Some(read_aggregate_events_response::Payload::Event(event)) => match ctx.format {
-                Format::Json => println!(
-                    "{}",
-                    serde_json::json!({"type": "event", "event": event_json(&event), "cursor": cursor})
-                ),
-                _ => println!(
-                    "{}\t{}\t[{}]\t{}",
-                    event.aggregate_id,
-                    event.aggregate_version,
-                    event.event_type,
-                    json_bytes(&event.data)
-                ),
-            },
-            Some(read_aggregate_events_response::Payload::CaughtUp(_)) => {
+            Some(follow_aggregate_type_events_response::Payload::Event(event)) => {
+                match ctx.format {
+                    Format::Json => println!(
+                        "{}",
+                        serde_json::json!({"type": "event", "event": event_json(&event), "cursor": cursor})
+                    ),
+                    _ => println!(
+                        "{}\t{}\t[{}]\t{}",
+                        event.aggregate_id,
+                        event.aggregate_version,
+                        event.event_type,
+                        json_bytes(&event.data)
+                    ),
+                }
+            }
+            Some(follow_aggregate_type_events_response::Payload::CaughtUp(_)) => {
                 match ctx.format {
                     Format::Json => println!(
                         "{}",
@@ -396,7 +398,7 @@ async fn follow(ctx: &Ctx, args: &AggregateFollowArgs) -> Result<()> {
                     return Ok(());
                 }
             }
-            Some(read_aggregate_events_response::Payload::Degraded(value)) => {
+            Some(follow_aggregate_type_events_response::Payload::Degraded(value)) => {
                 if args.once {
                     bail!(
                         "follow 已降级，{} 个来源不可用，无法确认完全追平",
@@ -408,7 +410,7 @@ async fn follow(ctx: &Ctx, args: &AggregateFollowArgs) -> Result<()> {
                     value.unavailable_source_count
                 );
             }
-            Some(read_aggregate_events_response::Payload::Recovered(_)) => {
+            Some(follow_aggregate_type_events_response::Payload::Recovered(_)) => {
                 eprintln!("[follow 已恢复]");
             }
             None => {}
@@ -421,7 +423,7 @@ async fn state_list(ctx: &Ctx, args: &AggregateStateListArgs) -> Result<()> {
     let mut client = connect(ctx).await?;
     let response = client
         .list_states(ListAggregateStatesRequest {
-            event_set: Some(event_set(&args.business_space, &args.aggregate_type)),
+            aggregate_type: Some(aggregate_type(&args.business_space, &args.aggregate_type)),
             page_size: args.page_size,
             page_token: args
                 .page_token
@@ -470,7 +472,7 @@ async fn state_get(ctx: &Ctx, args: &AggregateStateGetArgs) -> Result<()> {
     let mut client = connect(ctx).await?;
     let response = client
         .get_state(GetAggregateStateRequest {
-            event_set: Some(event_set(&args.business_space, &args.aggregate_type)),
+            aggregate_type: Some(aggregate_type(&args.business_space, &args.aggregate_type)),
             aggregate_id: args.aggregate_id.clone(),
         })
         .await?;
@@ -506,7 +508,7 @@ async fn state_put(ctx: &Ctx, args: &AggregateStatePutArgs) -> Result<()> {
     let mut client = connect(ctx).await?;
     let response = client
         .put_state(PutAggregateStateRequest {
-            event_set: Some(event_set(&args.business_space, &args.aggregate_type)),
+            aggregate_type: Some(aggregate_type(&args.business_space, &args.aggregate_type)),
             aggregate_id: args.aggregate_id.clone(),
             expected_revision: Some(ExpectedStateRevision { kind: Some(kind) }),
             data,
@@ -522,19 +524,19 @@ async fn state_put(ctx: &Ctx, args: &AggregateStatePutArgs) -> Result<()> {
     Ok(())
 }
 
-async fn get(ctx: &Ctx, args: &AggregateEventSetArgs) -> Result<()> {
+async fn get(ctx: &Ctx, args: &AggregateTypeArgs) -> Result<()> {
     let mut client = connect(ctx).await?;
     let info = client
-        .get_event_set(event_set(&args.business_space, &args.aggregate_type))
+        .get_aggregate_type(aggregate_type(&args.business_space, &args.aggregate_type))
         .await?;
-    println!("{}", render_event_sets(ctx.format, &[info]));
+    println!("{}", render_aggregate_types(ctx.format, &[info]));
     Ok(())
 }
 
-async fn partitions(ctx: &Ctx, args: &AggregateEventSetArgs) -> Result<()> {
+async fn partitions(ctx: &Ctx, args: &AggregateTypeArgs) -> Result<()> {
     let mut client = connect(ctx).await?;
     let partitions = client
-        .list_partitions(event_set(&args.business_space, &args.aggregate_type))
+        .list_partitions(aggregate_type(&args.business_space, &args.aggregate_type))
         .await?;
     match ctx.format {
         Format::Json => println!(
@@ -577,7 +579,7 @@ async fn group_create(ctx: &Ctx, args: &AggregateGroupCreateArgs) -> Result<()> 
     let mut client = connect(ctx).await?;
     let group = client
         .create_group(CreateAggregateGroupRequest {
-            event_set: Some(event_set(&args.business_space, &args.aggregate_type)),
+            aggregate_type: Some(aggregate_type(&args.business_space, &args.aggregate_type)),
             name: args.name.clone(),
             start: Some(AggregateGroupStart { kind: Some(start) }),
             settings: merged_group_settings(&args.settings, None),
@@ -592,13 +594,13 @@ async fn group_update(ctx: &Ctx, args: &AggregateGroupUpdateArgs) -> Result<()> 
     if !args.reset_beginning && !args.reset_now && !has_group_settings(&args.settings) {
         bail!("update 至少需要一个 settings 参数或 reset 参数");
     }
-    let identity = event_set(&args.business_space, &args.aggregate_type);
+    let identity = aggregate_type(&args.business_space, &args.aggregate_type);
     let mut client = connect(ctx).await?;
     let current = if has_group_settings(&args.settings) {
         Some(
             client
                 .get_group(GetAggregateGroupRequest {
-                    event_set: Some(identity.clone()),
+                    aggregate_type: Some(identity.clone()),
                     name: args.name.clone(),
                 })
                 .await?,
@@ -619,7 +621,7 @@ async fn group_update(ctx: &Ctx, args: &AggregateGroupUpdateArgs) -> Result<()> 
     };
     let group = client
         .update_group(UpdateAggregateGroupRequest {
-            event_set: Some(identity),
+            aggregate_type: Some(identity),
             name: args.name.clone(),
             expected_revision: args.expected_revision,
             start,
@@ -638,7 +640,7 @@ async fn group_delete(ctx: &Ctx, args: &AggregateGroupDeleteArgs) -> Result<()> 
     connect(ctx)
         .await?
         .delete_group(DeleteAggregateGroupRequest {
-            event_set: Some(event_set(&args.business_space, &args.aggregate_type)),
+            aggregate_type: Some(aggregate_type(&args.business_space, &args.aggregate_type)),
             name: args.name.clone(),
             expected_revision: args.expected_revision,
             operation_id: operation_id(&args.operation_id)?.as_bytes().to_vec(),
@@ -654,10 +656,10 @@ async fn group_delete(ctx: &Ctx, args: &AggregateGroupDeleteArgs) -> Result<()> 
     Ok(())
 }
 
-async fn group_list(ctx: &Ctx, args: &AggregateEventSetArgs) -> Result<()> {
+async fn group_list(ctx: &Ctx, args: &AggregateTypeArgs) -> Result<()> {
     let groups = connect(ctx)
         .await?
-        .list_groups(event_set(&args.business_space, &args.aggregate_type))
+        .list_groups(aggregate_type(&args.business_space, &args.aggregate_type))
         .await?;
     println!("{}", render_groups(ctx.format, &groups));
     Ok(())
@@ -667,7 +669,7 @@ async fn group_fetch(ctx: &Ctx, args: &AggregateGroupFetchArgs) -> Result<()> {
     let response = connect(ctx)
         .await?
         .fetch_group(FetchAggregateGroupRequest {
-            event_set: Some(event_set(&args.business_space, &args.aggregate_type)),
+            aggregate_type: Some(aggregate_type(&args.business_space, &args.aggregate_type)),
             name: args.name.clone(),
             consumer_id: args.consumer.clone(),
             max_events: args.max_events,
@@ -758,7 +760,7 @@ async fn group_settle(ctx: &Ctx, args: &AggregateGroupSettleArgs) -> Result<()> 
     let response = connect(ctx)
         .await?
         .settle_group(SettleAggregateGroupRequest {
-            event_set: Some(event_set(&args.business_space, &args.aggregate_type)),
+            aggregate_type: Some(aggregate_type(&args.business_space, &args.aggregate_type)),
             name: args.name.clone(),
             consumer_id: args.consumer.clone(),
             settlements: vec![AggregateGroupSettlement {
@@ -812,13 +814,15 @@ pub async fn run(ctx: &Ctx, action: &AggregateAction) -> Result<()> {
             );
             Ok(())
         }
-        AggregateAction::Create(args) => create(ctx, args).await,
-        AggregateAction::List => {
-            let infos = connect(ctx).await?.list_event_sets().await?;
-            println!("{}", render_event_sets(ctx.format, &infos));
-            Ok(())
-        }
-        AggregateAction::Get(args) => get(ctx, args).await,
+        AggregateAction::Type(args) => match &args.action {
+            AggregateTypeAction::Register(args) => register(ctx, args).await,
+            AggregateTypeAction::List => {
+                let infos = connect(ctx).await?.list_aggregate_types().await?;
+                println!("{}", render_aggregate_types(ctx.format, &infos));
+                Ok(())
+            }
+            AggregateTypeAction::Get(args) => get(ctx, args).await,
+        },
         AggregateAction::Append(args) => append(ctx, args).await,
         AggregateAction::Follow(args) => follow(ctx, args).await,
         AggregateAction::State(args) => match &args.action {
@@ -840,9 +844,9 @@ pub async fn run(ctx: &Ctx, action: &AggregateAction) -> Result<()> {
                 "{}",
                 serde_json::json!({
                     "catalog_revision": value.catalog_revision,
-                    "event_set_count": value.event_set_count,
-                    "creating_event_set_count": value.creating_event_set_count,
-                    "active_event_set_count": value.active_event_set_count,
+                    "aggregate_type_count": value.aggregate_type_count,
+                    "registering_aggregate_type_count": value.registering_aggregate_type_count,
+                    "active_aggregate_type_count": value.active_aggregate_type_count,
                 })
             );
             Ok(())
@@ -857,7 +861,7 @@ mod tests {
 
     fn group_info(start: Option<aggregate_group_start::Kind>) -> AggregateGroupInfo {
         AggregateGroupInfo {
-            event_set: Some(event_set("orders", "order")),
+            aggregate_type: Some(aggregate_type("orders", "order")),
             name: "workers".into(),
             revision: 2,
             epoch: 3,
@@ -873,9 +877,9 @@ mod tests {
         }
     }
 
-    fn event_set_info(status: i32) -> AggregateEventSetInfo {
-        AggregateEventSetInfo {
-            event_set: Some(event_set("orders", "order")),
+    fn aggregate_type_info(status: i32) -> AggregateTypeInfo {
+        AggregateTypeInfo {
+            aggregate_type: Some(aggregate_type("orders", "order")),
             partition_count: 256,
             hash_algorithm: "xxh3-v1".into(),
             status,
@@ -988,17 +992,17 @@ mod tests {
     }
 
     #[test]
-    fn event_set_and_group_rendering_cover_all_formats_and_missing_fields() {
-        let active = event_set_info(AggregateEventSetStatus::AggregateEventSetActive as i32);
+    fn aggregate_type_and_group_rendering_cover_all_formats_and_missing_fields() {
+        let active = aggregate_type_info(AggregateTypeStatus::AggregateTypeActive as i32);
         for format in [Format::Json, Format::Table, Format::Simple] {
-            let rendered = render_event_sets(format, std::slice::from_ref(&active));
+            let rendered = render_aggregate_types(format, std::slice::from_ref(&active));
             assert!(rendered.contains("orders"));
             assert!(rendered.contains("order"));
         }
-        let mut unknown = event_set_info(i32::MAX);
-        unknown.event_set = None;
-        assert!(render_event_sets(Format::Simple, &[unknown.clone()]).contains("UNKNOWN"));
-        assert!(render_event_sets(Format::Table, &[unknown]).contains("UNKNOWN"));
+        let mut unknown = aggregate_type_info(i32::MAX);
+        unknown.aggregate_type = None;
+        assert!(render_aggregate_types(Format::Simple, &[unknown.clone()]).contains("UNKNOWN"));
+        assert!(render_aggregate_types(Format::Table, &[unknown]).contains("UNKNOWN"));
 
         let beginning = group_info(Some(aggregate_group_start::Kind::Beginning(Empty {})));
         let now = group_info(Some(aggregate_group_start::Kind::Now(Empty {})));
@@ -1009,7 +1013,7 @@ mod tests {
             assert!(rendered.contains("now"));
         }
         let mut missing = group_info(None);
-        missing.event_set = None;
+        missing.aggregate_type = None;
         missing.settings = None;
         assert_eq!(group_json(&missing)["start"], "unknown");
         assert!(group_json(&missing)["settings"].is_null());

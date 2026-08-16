@@ -6,12 +6,14 @@ use crate::cli::{Format, StatusArgs};
 use crate::commands::Ctx;
 use crate::output;
 
+type StatusRow = (String, bool, Vec<u64>, Vec<u64>, u64);
+
 pub async fn run(ctx: &Ctx, _args: &StatusArgs) -> Result<()> {
     let scope = ctx.shards().await?;
     let shard_ids = scope.all_ids();
 
     // 每端点 × 分片探测 GetRaftState，聚合可达性、leader 归属、term
-    let mut rows: Vec<(String, bool, Vec<u64>, Vec<u64>, u64)> = Vec::new();
+    let mut rows: Vec<StatusRow> = Vec::new();
     let mut any_reachable = false;
 
     for ep in ctx.cluster.endpoints() {
@@ -21,17 +23,14 @@ pub async fn run(ctx: &Ctx, _args: &StatusArgs) -> Result<()> {
         let mut max_term = 0u64;
 
         for shard_id in &shard_ids {
-            match ctx.cluster.get_raft_state_via(ep, *shard_id).await {
-                Ok(state) => {
-                    reachable = true;
-                    max_term = max_term.max(state.current_term);
-                    if state.is_leader {
-                        leader_of.push(*shard_id);
-                    } else if state.has_leader {
-                        following_of.push(*shard_id);
-                    }
+            if let Ok(state) = ctx.cluster.get_raft_state_via(ep, *shard_id).await {
+                reachable = true;
+                max_term = max_term.max(state.current_term);
+                if state.is_leader {
+                    leader_of.push(*shard_id);
+                } else if state.has_leader {
+                    following_of.push(*shard_id);
                 }
-                Err(_) => {} // 该分片不可达/未初始化：不计数
             }
         }
 

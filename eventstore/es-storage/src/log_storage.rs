@@ -182,9 +182,9 @@ impl EsStorage {
                     .map_err(|e| es_core::Error::Serde(format!("last_purged 反序列化失败: {e}")))?;
                 match log_id {
                     Some(id) => Ok(Some(id)),
-                    None => Err(es_core::Error::Serde(format!(
-                        "last_purged 损坏：key 存在但值编码为 None（写入方只写 Some）"
-                    ))),
+                    None => Err(es_core::Error::Serde(
+                        "last_purged 损坏：key 存在但值编码为 None（写入方只写 Some）".to_string(),
+                    )),
                 }
             }
         }

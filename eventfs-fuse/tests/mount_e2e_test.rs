@@ -9,8 +9,10 @@ use std::time::Duration;
 use es_proto::eventstore::aggregate_store_server::AggregateStoreServer;
 use es_server::Server;
 use es_server::config::{Config, NodeConfig, PlacementConfig, PlacementNode, StorageConfig};
-use eventfs_fuse::backend::{EventFsBackend, EventSet, GrpcBackend};
-use eventfs_fuse::codec::{EventEnvelope, ExpectedVersion, Settlement, SettlementAction};
+use eventfs_fuse::backend::{AggregateType, EventFsBackend, GrpcBackend};
+use eventfs_fuse::codec::{
+    AggregateVersionExpectation, EventEnvelope, Settlement, SettlementAction,
+};
 use eventfs_fuse::fuse::{EventFs, MountIdentity};
 use uuid::Uuid;
 
@@ -97,7 +99,7 @@ async fn start_server() -> (
     (endpoint, task, server, data_dir)
 }
 
-fn event(aggregate_id: &str, expected_version: ExpectedVersion) -> EventEnvelope {
+fn event(aggregate_id: &str, expected_version: AggregateVersionExpectation) -> EventEnvelope {
     EventEnvelope {
         aggregate_id: aggregate_id.into(),
         event_type: "order.changed".into(),
@@ -116,54 +118,66 @@ async fn grpc_backend_roundtrips_all_aggregate_store_operations() {
         .expect("连接 AggregateStore");
     let capabilities = backend.capabilities().await.expect("协商服务端能力");
     assert!(capabilities.max_event_bytes > 0);
-    assert!(EventSet::new("bad/path", "order").is_err());
+    assert!(AggregateType::new("bad/path", "order").is_err());
 
-    let event_set = EventSet::new("orders", "order").expect("事件集身份");
+    let aggregate_type = AggregateType::new("orders", "order").expect("聚合类型身份");
     assert!(
         backend
-            .list_event_sets()
+            .list_aggregate_types()
             .await
             .expect("空 catalog")
             .is_empty()
     );
     backend
-        .create_event_set(&event_set, Uuid::new_v4())
+        .register_aggregate_type(&aggregate_type, Uuid::new_v4())
         .await
-        .expect("创建事件集");
+        .expect("注册聚合类型");
     assert_eq!(
-        backend.list_event_sets().await.expect("列事件集"),
-        vec![event_set.clone()]
+        backend.list_aggregate_types().await.expect("列聚合类型"),
+        vec![aggregate_type.clone()]
     );
 
     assert_eq!(
         backend
-            .append(&event_set, &event("order-1", ExpectedVersion::NoAggregate))
+            .append(
+                &aggregate_type,
+                &event("order-1", AggregateVersionExpectation::NoAggregate),
+            )
             .await
             .expect("NoAggregate 追加"),
         0
     );
     assert_eq!(
         backend
-            .append(&event_set, &event("order-1", ExpectedVersion::Exists))
+            .append(
+                &aggregate_type,
+                &event("order-1", AggregateVersionExpectation::Exists),
+            )
             .await
             .expect("Exists 追加"),
         1
     );
     assert_eq!(
         backend
-            .append(&event_set, &event("order-1", ExpectedVersion::Exact(1)))
+            .append(
+                &aggregate_type,
+                &event("order-1", AggregateVersionExpectation::Exact(1)),
+            )
             .await
             .expect("Exact 追加"),
         2
     );
     for aggregate_id in ["order-2", "order-3", "order-4"] {
         backend
-            .append(&event_set, &event(aggregate_id, ExpectedVersion::Any))
+            .append(
+                &aggregate_type,
+                &event(aggregate_id, AggregateVersionExpectation::Any),
+            )
             .await
             .expect("Any 追加");
     }
 
-    let mut follow = backend.follow(&event_set).await.expect("跟随事件");
+    let mut follow = backend.follow(&aggregate_type).await.expect("跟随事件");
     let mut event_frames = 0;
     loop {
         let frame = tokio::time::timeout(Duration::from_secs(3), follow.recv())
@@ -183,26 +197,31 @@ async fn grpc_backend_roundtrips_all_aggregate_store_operations() {
 
     assert!(
         backend
-            .list_states(&event_set)
+            .list_states(&aggregate_type)
             .await
             .expect("空状态列表")
             .is_empty()
     );
     assert!(
         backend
-            .get_state(&event_set, "order-missing")
+            .get_state(&aggregate_type, "order-missing")
             .await
             .expect("读取不存在状态")
             .is_none()
     );
     let first_state = backend
-        .put_state(&event_set, "order-1", None, br#"{"balance":3}"#.to_vec())
+        .put_state(
+            &aggregate_type,
+            "order-1",
+            None,
+            br#"{"balance":3}"#.to_vec(),
+        )
         .await
         .expect("首次状态提交");
     assert_eq!(first_state.revision, 0);
     let second_state = backend
         .put_state(
-            &event_set,
+            &aggregate_type,
             "order-1",
             Some(first_state.revision),
             br#"{"balance":2}"#.to_vec(),
@@ -212,27 +231,30 @@ async fn grpc_backend_roundtrips_all_aggregate_store_operations() {
     assert_eq!(second_state.revision, 1);
     assert_eq!(
         backend
-            .get_state(&event_set, "order-1")
+            .get_state(&aggregate_type, "order-1")
             .await
             .expect("读取状态")
             .expect("状态存在"),
         second_state
     );
     assert_eq!(
-        backend.list_states(&event_set).await.expect("列状态"),
+        backend.list_states(&aggregate_type).await.expect("列状态"),
         vec!["order-1"]
     );
 
     backend
-        .create_group(&event_set, "workers", Uuid::new_v4())
+        .create_group(&aggregate_type, "workers", Uuid::new_v4())
         .await
         .expect("创建消费者组");
     assert_eq!(
-        backend.list_groups(&event_set).await.expect("列消费者组"),
+        backend
+            .list_groups(&aggregate_type)
+            .await
+            .expect("列消费者组"),
         vec!["workers"]
     );
     let fetched = backend
-        .fetch_group(&event_set, "workers", "consumer-a")
+        .fetch_group(&aggregate_type, "workers", "consumer-a")
         .await
         .expect("Fetch delivery");
     assert_eq!(fetched.deliveries.len(), 4);
@@ -242,7 +264,12 @@ async fn grpc_backend_roundtrips_all_aggregate_store_operations() {
         .map(|delivery| delivery.delivery_id.clone())
         .collect::<Vec<_>>();
     let renewed = backend
-        .renew_group(&event_set, "workers", "consumer-a", delivery_ids.clone())
+        .renew_group(
+            &aggregate_type,
+            "workers",
+            "consumer-a",
+            delivery_ids.clone(),
+        )
         .await
         .expect("续租 delivery");
     assert_eq!(renewed.results.len(), 4);
@@ -262,7 +289,7 @@ async fn grpc_backend_roundtrips_all_aggregate_store_operations() {
         })
         .collect::<Vec<_>>();
     let settled = backend
-        .settle_group(&event_set, "workers", "consumer-a", &settlements)
+        .settle_group(&aggregate_type, "workers", "consumer-a", &settlements)
         .await
         .expect("结算 delivery");
     assert_eq!(settled.results.len(), 4);
@@ -304,9 +331,9 @@ async fn real_mount_appends_follows_and_commits_state() {
     let session =
         fuser::spawn_mount(filesystem, mount_dir.path(), &fuse_config).expect("挂载 eventfs-fuse");
 
-    let event_set = mount_dir.path().join("orders/order");
-    std::fs::create_dir_all(&event_set).expect("通过 FUSE 创建事件集");
-    let events_path = event_set.join("events.jsonl");
+    let aggregate_type = mount_dir.path().join("orders/order");
+    std::fs::create_dir_all(&aggregate_type).expect("通过 FUSE 注册聚合类型");
+    let events_path = aggregate_type.join("events.jsonl");
     let mut event_file = std::fs::OpenOptions::new()
         .write(true)
         .truncate(true)
@@ -338,7 +365,7 @@ async fn real_mount_appends_follows_and_commits_state() {
     assert_eq!(frame["aggregate_id"], "order-1");
     assert_eq!(frame["data"]["amount"], 100);
 
-    let state_path = event_set.join("states/order-1.json");
+    let state_path = aggregate_type.join("states/order-1.json");
     let mut state = std::fs::File::create(&state_path).expect("创建状态文件");
     state.write_all(br#"{"balance":100}"#).expect("写状态");
     state.sync_all().expect("CAS 提交状态");

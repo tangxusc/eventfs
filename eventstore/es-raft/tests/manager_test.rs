@@ -181,14 +181,10 @@ async fn get_shard_missing_errors() {
 }
 
 #[tokio::test]
-async fn route_and_shard_ids() {
+async fn shard_ids_lists_registered_shards() {
     let manager = ShardManager::new(1, 2);
     make_shard(&manager, 0).await;
     make_shard(&manager, 1).await;
-
-    // route：根据 stream 哈希选分片（分片 0、1 都在）
-    let routed = manager.route_shard("any-stream").await.expect("路由");
-    assert!(routed.shard_id < 2);
 
     let ids = manager.shard_ids().await;
     let mut sorted = ids.clone();

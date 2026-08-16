@@ -20,7 +20,7 @@ use openraft::raft::{
 use openraft::{BasicNode, Config, Raft};
 use tokio::sync::RwLock;
 
-use es_core::{ExpectedVersion, Hlc, NewEvent};
+use es_core::{AggregateEvent, AggregateTypeId, ExpectedAggregateVersion, Hlc, NewAggregateEvent};
 use es_storage::{EsRequest, EsResponse, EsStorage, TypeConfig};
 
 /// 带「批量条数上限」注入的测试网络。
@@ -143,21 +143,20 @@ impl RaftNetwork<TypeConfig> for SplittingLink {
         // openraft 无退避地无限重试单条,烧 CPU);多条返回 PayloadTooLarge
         // 按 hint 拆小,hint 取当前条数的一半(二分收缩)。
         let limit = self.net.entries_limit(self.from, self.to).await;
-        if !req.entries.is_empty() {
-            if let Some(max) = limit {
-                if max == 0 || req.entries.len() > max {
-                    self.net.count_rejected().await;
-                    if req.entries.len() <= 1 {
-                        return Err(RPCError::Unreachable(openraft::error::Unreachable::new(
-                            &std::io::Error::other("单条 AppendEntries 超过消息上限"),
-                        )));
-                    }
-                    let hint = ((req.entries.len() as u64) / 2).max(1);
-                    return Err(RPCError::PayloadTooLarge(
-                        PayloadTooLarge::new_entries_hint(hint),
-                    ));
-                }
+        if !req.entries.is_empty()
+            && let Some(max) = limit
+            && (max == 0 || req.entries.len() > max)
+        {
+            self.net.count_rejected().await;
+            if req.entries.len() <= 1 {
+                return Err(RPCError::Unreachable(openraft::error::Unreachable::new(
+                    &std::io::Error::other("单条 AppendEntries 超过消息上限"),
+                )));
             }
+            let hint = ((req.entries.len() as u64) / 2).max(1);
+            return Err(RPCError::PayloadTooLarge(
+                PayloadTooLarge::new_entries_hint(hint),
+            ));
         }
 
         if self.net.is_cut(self.from, self.to).await {
@@ -342,16 +341,24 @@ impl Cluster {
     }
 
     /// 经指定节点写入一条事件
-    async fn write(&self, node: u64, stream: &str, data: &[u8]) -> Result<EsResponse, String> {
-        let req = EsRequest::Append {
-            stream_id: stream.to_string(),
-            expected_version: ExpectedVersion::Any,
-            events: vec![NewEvent {
+    async fn write(
+        &self,
+        node: u64,
+        aggregate_id: &str,
+        data: &[u8],
+    ) -> Result<EsResponse, String> {
+        let req = EsRequest::AggregateAppend {
+            aggregate_type: test_aggregate_type(),
+            partition_id: 0,
+            partition_generation: 0,
+            aggregate_id: aggregate_id.to_string(),
+            expected_version: ExpectedAggregateVersion::Any,
+            event: NewAggregateEvent {
                 event_id: uuid::Uuid::new_v4(),
                 event_type: "E".into(),
                 data: data.to_vec(),
                 metadata: vec![],
-            }],
+            },
             hlc: Hlc::now(),
         };
         self.rafts[&node]
@@ -361,11 +368,14 @@ impl Cluster {
             .map_err(|e| e.to_string())
     }
 
-    /// 读某节点本地状态机里的流
-    fn read(&self, node: u64, stream: &str) -> Vec<es_core::Event> {
+    /// 读取某节点本地状态机里的聚合实例事件。
+    fn read(&self, node: u64, aggregate_id: &str) -> Vec<AggregateEvent> {
         self.stores[&node]
-            .read_stream_events(stream, 0, 0)
-            .expect("读流")
+            .read_aggregate_partition_events(&test_aggregate_type(), 0, 0, 0)
+            .expect("读取聚合事件")
+            .into_iter()
+            .filter(|event| event.aggregate_id == aggregate_id)
+            .collect()
     }
 
     async fn shutdown(self) {
@@ -376,6 +386,10 @@ impl Cluster {
             let _ = s.close().await;
         }
     }
+}
+
+fn test_aggregate_type() -> AggregateTypeId {
+    AggregateTypeId::new("tests", "payload-shrink").expect("合法 AggregateType")
 }
 
 /// 超限批量被拆小重试后收敛:落后节点最终追平,数据一致。

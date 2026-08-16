@@ -15,12 +15,12 @@ pub struct EventEnvelope {
     pub data: Vec<u8>,
     pub metadata: Vec<u8>,
     pub event_id: Uuid,
-    pub expected_version: ExpectedVersion,
+    pub expected_version: AggregateVersionExpectation,
 }
 
 /// 实例级 OCC 条件。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExpectedVersion {
+pub enum AggregateVersionExpectation {
     Any,
     NoAggregate,
     Exists,
@@ -35,14 +35,14 @@ struct WireEventEnvelope {
     event_type: String,
     data: Value,
     event_id: Option<Uuid>,
-    expected_version: Option<WireExpectedVersion>,
+    expected_version: Option<WireExpectedAggregateVersion>,
     #[serde(default = "empty_object")]
     metadata: Value,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum WireExpectedVersion {
+enum WireExpectedAggregateVersion {
     Any,
     NoAggregate,
     Exists,
@@ -78,10 +78,12 @@ pub fn parse_event(bytes: &[u8], max_bytes: usize) -> Result<EventEnvelope, Code
         return Err(CodecError::InvalidField("metadata"));
     }
     let expected_version = match wire.expected_version {
-        None | Some(WireExpectedVersion::Any) => ExpectedVersion::Any,
-        Some(WireExpectedVersion::NoAggregate) => ExpectedVersion::NoAggregate,
-        Some(WireExpectedVersion::Exists) => ExpectedVersion::Exists,
-        Some(WireExpectedVersion::Exact { version }) => ExpectedVersion::Exact(version),
+        None | Some(WireExpectedAggregateVersion::Any) => AggregateVersionExpectation::Any,
+        Some(WireExpectedAggregateVersion::NoAggregate) => AggregateVersionExpectation::NoAggregate,
+        Some(WireExpectedAggregateVersion::Exists) => AggregateVersionExpectation::Exists,
+        Some(WireExpectedAggregateVersion::Exact { version }) => {
+            AggregateVersionExpectation::Exact(version)
+        }
     };
     Ok(EventEnvelope {
         aggregate_id: wire.aggregate_id,
@@ -306,7 +308,10 @@ mod tests {
         .unwrap();
         assert_eq!(event.data, br#"{"amount":50}"#);
         assert_eq!(event.metadata, b"{}");
-        assert_eq!(event.expected_version, ExpectedVersion::Exact(0));
+        assert_eq!(
+            event.expected_version,
+            AggregateVersionExpectation::Exact(0)
+        );
 
         assert!(
             parse_event(

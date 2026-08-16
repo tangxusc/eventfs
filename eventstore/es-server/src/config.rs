@@ -37,21 +37,15 @@ pub struct Config {
 pub struct LimitsSection {
     /// 单事件 data+metadata 上限（字节），默认 1MiB。
     ///
-    /// 一条 append 批在 raft 里是一条日志条目；openraft 对单条超限的
+    /// 一条 Aggregate append 在 Raft 里是一条日志条目；openraft 对单条超限的
     /// AppendEntries 没有拆小路径，必须从源头限制单事件大小。
     pub max_event_bytes: u64,
-    /// 单次 append 请求上限（字节，proto 编码后精确值），默认 7MiB。
-    ///
-    /// 8MB 传输上限减去 1MiB 余量（逐事件 proto 头 + gRPC 信封），
-    /// 保证「总和达标」的请求不会在传输层被拒。
-    pub max_append_batch_bytes: u64,
 }
 
 impl Default for LimitsSection {
     fn default() -> Self {
         Self {
             max_event_bytes: es_core::limits::MAX_EVENT_PAYLOAD_BYTES as u64,
-            max_append_batch_bytes: es_core::limits::MAX_APPEND_BATCH_BYTES as u64,
         }
     }
 }
@@ -210,7 +204,7 @@ impl Config {
             }
         }
 
-        if !(1 * 1024 * 1024..=16 * 1024 * 1024).contains(&self.storage.memtable_arena_bytes) {
+        if !(1024 * 1024..=16 * 1024 * 1024).contains(&self.storage.memtable_arena_bytes) {
             return Err(format!(
                 "[storage] memtable_arena_bytes 必须 ∈ [1048576, 16777216]，当前 {}",
                 self.storage.memtable_arena_bytes
@@ -220,19 +214,13 @@ impl Config {
         if self.snapshot.keep == 0 {
             return Err("[snapshot] keep 必须 ≥ 1（keep=0 会删光全部快照）".to_string());
         }
-        if self.limits.max_event_bytes == 0 {
-            return Err("[limits] max_event_bytes 必须 ≥ 1".to_string());
-        }
-        if self.limits.max_append_batch_bytes == 0
-            || self.limits.max_append_batch_bytes > es_core::limits::MAX_APPEND_BATCH_BYTES as u64
+        if self.limits.max_event_bytes == 0
+            || self.limits.max_event_bytes > es_core::limits::MAX_AGGREGATE_EVENT_BYTES as u64
         {
             return Err(format!(
-                "[limits] max_append_batch_bytes 必须 ∈ [1, {}]（8MB 传输上限减去余量）",
-                es_core::limits::MAX_APPEND_BATCH_BYTES
+                "[limits] max_event_bytes 必须 ∈ [1, {}]（8MB 传输上限减去余量）",
+                es_core::limits::MAX_AGGREGATE_EVENT_BYTES
             ));
-        }
-        if self.limits.max_event_bytes > self.limits.max_append_batch_bytes {
-            return Err("[limits] max_event_bytes 不能大于 max_append_batch_bytes".to_string());
         }
         if self.snapshot.max_chunk_size == 0
             || self.snapshot.max_chunk_size > es_core::limits::MAX_SNAPSHOT_CHUNK_BYTES as u64
@@ -773,10 +761,7 @@ mod tests {
     #[test]
     fn limits_event_zero_rejected() {
         let config = Config {
-            limits: LimitsSection {
-                max_event_bytes: 0,
-                ..Default::default()
-            },
+            limits: LimitsSection { max_event_bytes: 0 },
             ..Default::default()
         };
         let err = config.validate().expect_err("max_event_bytes=0 应报错");
@@ -787,47 +772,14 @@ mod tests {
     }
 
     #[test]
-    fn limits_batch_over_cap_rejected() {
+    fn limits_event_over_transport_cap_rejected() {
         let config = Config {
             limits: LimitsSection {
-                max_append_batch_bytes: es_core::limits::MAX_APPEND_BATCH_BYTES as u64 + 1,
-                ..Default::default()
+                max_event_bytes: es_core::limits::MAX_AGGREGATE_EVENT_BYTES as u64 + 1,
             },
             ..Default::default()
         };
         let err = config.validate().expect_err("超出上限应报错");
-        assert!(
-            err.contains("max_append_batch_bytes"),
-            "错误应说明 max_append_batch_bytes: {err}"
-        );
-    }
-
-    #[test]
-    fn limits_batch_zero_rejected() {
-        let config = Config {
-            limits: LimitsSection {
-                max_append_batch_bytes: 0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let err = config.validate().expect_err("batch=0 应报错");
-        assert!(
-            err.contains("max_append_batch_bytes"),
-            "错误应说明 max_append_batch_bytes: {err}"
-        );
-    }
-
-    #[test]
-    fn limits_event_greater_than_batch_rejected() {
-        let config = Config {
-            limits: LimitsSection {
-                max_event_bytes: 4096,
-                max_append_batch_bytes: 2048,
-            },
-            ..Default::default()
-        };
-        let err = config.validate().expect_err("单事件大于批次上限应报错");
         assert!(
             err.contains("max_event_bytes"),
             "错误应说明 max_event_bytes: {err}"
@@ -839,7 +791,6 @@ mod tests {
         let config = Config {
             limits: LimitsSection {
                 max_event_bytes: 1024,
-                max_append_batch_bytes: 4096,
             },
             ..Default::default()
         };
@@ -909,7 +860,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_node_requires_internal_ownership_addresses() {
+    fn multi_node_requires_internal_rpc_addresses() {
         let mut config = valid_config();
         config.node.internal_listen_addr = None;
         let error = config.validate().expect_err("多节点必须监听内部协议");
@@ -945,10 +896,6 @@ primary = [0]
         assert_eq!(
             config.limits.max_event_bytes,
             es_core::limits::MAX_EVENT_PAYLOAD_BYTES as u64
-        );
-        assert_eq!(
-            config.limits.max_append_batch_bytes,
-            es_core::limits::MAX_APPEND_BATCH_BYTES as u64
         );
         assert_eq!(config.snapshot.max_chunk_size, 3 * 1024 * 1024);
     }

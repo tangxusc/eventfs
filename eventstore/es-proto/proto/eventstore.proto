@@ -2,76 +2,77 @@ syntax = "proto3";
 
 package eventstore.v1;
 
-// 客户端 API：事件溯源读写与订阅
-service EventStore {
-  // 追加事件，携带乐观并发期望版本
-  rpc Append(AppendRequest) returns (AppendResponse);
-  // 读取单个流的事件区间，流式返回
-  rpc ReadStream(ReadStreamRequest) returns (stream ReadEventsResponse);
-  // 读取分片内 $all 流；跨分片仅按 (shard_id, position) 归并，非严格全序
-  rpc ReadAll(ReadAllRequest) returns (stream ReadEventsResponse);
-  // 订阅：先补齐历史（catch-up），追平后转为实时推送
-  rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
-  // 查询流元数据（当前版本等）
-  rpc GetStreamMeta(GetStreamMetaRequest) returns (GetStreamMetaResponse);
-  // 显式创建流：服务端分配 shard（大致最少流），返回流归属
-  rpc CreateStream(CreateStreamRequest) returns (CreateStreamResponse);
-}
-
-// 持久化拉取订阅：服务端保存竞争消费者组、checkpoint、租约与失败状态。
-service PersistentSubscriptions {
-  rpc CreatePersistentSubscription(CreatePersistentSubscriptionRequest) returns (PersistentSubscriptionInfo);
-  rpc UpdatePersistentSubscription(UpdatePersistentSubscriptionRequest) returns (PersistentSubscriptionInfo);
-  rpc DeletePersistentSubscription(DeletePersistentSubscriptionRequest) returns (Empty);
-  rpc GetPersistentSubscription(GetPersistentSubscriptionRequest) returns (PersistentSubscriptionInfo);
-  rpc ListPersistentSubscriptions(ListPersistentSubscriptionsRequest) returns (ListPersistentSubscriptionsResponse);
-  // unary 长轮询；消费者用条数、字节与等待时间主动施加背压。
-  rpc FetchPersistentSubscription(FetchPersistentSubscriptionRequest) returns (FetchPersistentSubscriptionResponse);
-  // 一次结算多个 delivery，每条独立返回结果。
-  rpc SettlePersistentSubscription(SettlePersistentSubscriptionRequest) returns (SettlePersistentSubscriptionResponse);
-  rpc ListParkedPersistentSubscription(ListParkedPersistentSubscriptionRequest) returns (ListParkedPersistentSubscriptionResponse);
-  rpc ReplayParkedPersistentSubscription(ReplayParkedPersistentSubscriptionRequest) returns (ReplayParkedPersistentSubscriptionResponse);
-}
-
-// 聚合类型事件集 API；与 EventStore Stream 数据和版本语义完全隔离。
+// AggregateStore 公共客户端接口：聚合事件、状态文档与消费者组。
+//
+// 聚合实例由 (business_space, aggregate_type, aggregate_id) 唯一标识。单实例事件按
+// aggregate_version 严格递增；不同实例之间不承诺全序。类型级 feed 由 opaque cursor
+// 表示续读位置，调用方不得解析 cursor。除特别说明外，非法参数返回 InvalidArgument，
+// 目标不存在返回 NotFound，OCC/CAS 冲突返回 FailedPrecondition，非 leader 返回
+// Unavailable 并在消息中携带 leader 提示。
 service AggregateStore {
+  // 返回协议版本、固定分区数和 payload 上限；请求无参数，结果不改变服务器状态。
   rpc GetAggregateStoreCapabilities(GetAggregateStoreCapabilitiesRequest) returns (AggregateStoreCapabilities);
-  rpc CreateEventSet(CreateEventSetRequest) returns (AggregateEventSetInfo);
-  rpc ListEventSets(ListEventSetsRequest) returns (ListEventSetsResponse);
-  rpc GetEventSet(GetEventSetRequest) returns (AggregateEventSetInfo);
+  // 幂等注册聚合类型；参数为类型身份和 16 字节 operation_id，成功返回激活后的定义。
+  // 同一 operation_id 可安全重试，复用于不同请求时返回 AlreadyExists 或 FailedPrecondition。
+  rpc RegisterAggregateType(RegisterAggregateTypeRequest) returns (AggregateTypeInfo);
+  // 按 (business_space, aggregate_type) 升序返回全部聚合类型及其生命周期状态。
+  rpc ListAggregateTypes(ListAggregateTypesRequest) returns (ListAggregateTypesResponse);
+  // 返回指定聚合类型；参数缺失或非法返回 InvalidArgument，不存在返回 NotFound。
+  rpc GetAggregateType(GetAggregateTypeRequest) returns (AggregateTypeInfo);
+  // 以实例级期望版本追加一条事件，成功返回新 aggregate_version。
+  // 相同 event_id 与相同内容幂等返回原版本；内容不同返回 AlreadyExists。
   rpc AppendAggregateEvent(AppendAggregateEventRequest) returns (AppendAggregateEventResponse);
-  // 从 Beginning、Now 或 opaque cursor 追平后持续跟随。
-  rpc ReadAggregateEvents(ReadAggregateEventsRequest) returns (stream ReadAggregateEventsResponse);
+  // 从 Beginning、Now 或 opaque cursor 追平后持续跟随类型级事件 feed。
+  // 每个实例保持 aggregate_version 顺序，不同实例之间不承诺全序；每帧 cursor 是消费该帧
+  // 后的续读位置。源暂不可用时发送 degraded，恢复后发送 recovered。
+  rpc FollowAggregateTypeEvents(FollowAggregateTypeEventsRequest) returns (stream FollowAggregateTypeEventsResponse);
+  // 分页返回存在状态文档的 aggregate_id，按 aggregate_id 字节序稳定排序。
+  // page_token 只能原样续传；任一分区不可用时整个请求返回 Unavailable。
   rpc ListAggregateStates(ListAggregateStatesRequest) returns (ListAggregateStatesResponse);
+  // 返回指定实例的最新状态、revision 和提交时间；状态不存在返回 NotFound。
   rpc GetAggregateState(GetAggregateStateRequest) returns (GetAggregateStateResponse);
+  // 以 absent 或 exact revision 执行状态 CAS 覆盖，成功返回递增 revision 和提交时间。
   rpc PutAggregateState(PutAggregateStateRequest) returns (PutAggregateStateResponse);
+  // 返回 catalog revision 及聚合类型数量；请求无参数且不改变服务器状态。
   rpc GetAggregateStoreStatus(GetAggregateStoreStatusRequest) returns (AggregateStoreStatus);
+  // 按 partition_id 升序返回固定 256 个虚拟分区的内部放置；仅供运维诊断。
   rpc ListAggregatePartitions(ListAggregatePartitionsRequest) returns (ListAggregatePartitionsResponse);
+  // 幂等创建消费者组；参数含起点、设置和 operation_id，返回 revision=1 的定义。
   rpc CreateAggregateGroup(CreateAggregateGroupRequest) returns (AggregateGroupInfo);
+  // 以 expected_revision CAS 更新消费者组并递增 revision；reset 起点时同时递增 epoch。
   rpc UpdateAggregateGroup(UpdateAggregateGroupRequest) returns (AggregateGroupInfo);
+  // 以 expected_revision CAS 删除消费者组；成功返回 Empty，未确认投递随后失效。
   rpc DeleteAggregateGroup(DeleteAggregateGroupRequest) returns (Empty);
+  // 返回指定消费者组；不存在返回 NotFound。
   rpc GetAggregateGroup(GetAggregateGroupRequest) returns (AggregateGroupInfo);
+  // 按组名升序返回指定聚合类型下的消费者组。
   rpc ListAggregateGroups(ListAggregateGroupsRequest) returns (ListAggregateGroupsResponse);
+  // 长轮询领取一批投递；同一聚合实例同一时刻最多租给一个消费成员。
+  // 返回顺序遵循各分区位置，但不同分区之间不承诺全序；delivery_id 为 opaque token。
   rpc FetchAggregateGroup(FetchAggregateGroupRequest) returns (FetchAggregateGroupResponse);
+  // 对 delivery 执行 Ack/Retry/Park/Skip；逐项返回结果，重复结算不重复推进进度。
   rpc SettleAggregateGroup(SettleAggregateGroupRequest) returns (SettleAggregateGroupResponse);
+  // 为仍由同一 consumer 持有的 delivery 续租；逐项返回新 deadline 或拒绝原因。
   rpc RenewAggregateGroup(RenewAggregateGroupRequest) returns (RenewAggregateGroupResponse);
 }
 
-message AggregateEventSetRef {
+// 聚合类型身份；两个字段均为 1..=128 字节的受限 ASCII 标识符。
+message AggregateTypeRef {
   string business_space = 1;
   string aggregate_type = 2;
 }
 
-enum AggregateEventSetStatus {
-  AGGREGATE_EVENT_SET_CREATING = 0;
-  AGGREGATE_EVENT_SET_ACTIVE = 1;
+enum AggregateTypeStatus {
+  AGGREGATE_TYPE_REGISTERING = 0;
+  AGGREGATE_TYPE_ACTIVE = 1;
 }
 
-message AggregateEventSetInfo {
-  AggregateEventSetRef event_set = 1;
+// catalog 中的聚合类型定义；partition_count 固定为 256，注册后不可改变。
+message AggregateTypeInfo {
+  AggregateTypeRef aggregate_type = 1;
   uint32 partition_count = 2;
   string hash_algorithm = 3;
-  AggregateEventSetStatus status = 4;
+  AggregateTypeStatus status = 4;
   uint64 catalog_revision = 5;
 }
 
@@ -87,16 +88,18 @@ message AggregateStoreCapabilities {
   bool state_modified_time = 7;
 }
 
-message CreateEventSetRequest {
-  AggregateEventSetRef event_set = 1;
+// 注册请求；operation_id 必须是 16 字节 UUID，模糊重试必须复用。
+message RegisterAggregateTypeRequest {
+  AggregateTypeRef aggregate_type = 1;
   // 16 字节 UUID；中断重试必须复用。
   bytes operation_id = 2;
 }
 
-message ListEventSetsRequest {}
-message ListEventSetsResponse { repeated AggregateEventSetInfo event_sets = 1; }
-message GetEventSetRequest { AggregateEventSetRef event_set = 1; }
+message ListAggregateTypesRequest {}
+message ListAggregateTypesResponse { repeated AggregateTypeInfo aggregate_types = 1; }
+message GetAggregateTypeRequest { AggregateTypeRef aggregate_type = 1; }
 
+// 事件追加的 OCC 条件；未提供时按 any 处理。
 message ExpectedAggregateVersion {
   oneof kind {
     Empty any = 1;
@@ -106,6 +109,7 @@ message ExpectedAggregateVersion {
   }
 }
 
+// 客户端提交的事件；event_id 必须是 16 字节 UUID，版本和 HLC 由服务端分配。
 message NewAggregateEvent {
   bytes event_id = 1;
   string event_type = 2;
@@ -113,6 +117,7 @@ message NewAggregateEvent {
   bytes metadata = 4;
 }
 
+// 已提交事件；aggregate_version 仅在同一聚合实例内严格递增。
 message AggregateEvent {
   string aggregate_id = 1;
   uint64 aggregate_version = 2;
@@ -124,7 +129,7 @@ message AggregateEvent {
 }
 
 message AppendAggregateEventRequest {
-  AggregateEventSetRef event_set = 1;
+  AggregateTypeRef aggregate_type = 1;
   string aggregate_id = 2;
   ExpectedAggregateVersion expected_version = 3;
   NewAggregateEvent event = 4;
@@ -132,7 +137,8 @@ message AppendAggregateEventRequest {
 
 message AppendAggregateEventResponse { uint64 aggregate_version = 1; }
 
-message AggregateReadStart {
+// 类型级 feed 首次连接起点；cursor 是上次响应返回的 opaque 字节。
+message AggregateFollowStart {
   oneof kind {
     Empty beginning = 1;
     Empty now = 2;
@@ -140,9 +146,9 @@ message AggregateReadStart {
   }
 }
 
-message ReadAggregateEventsRequest {
-  AggregateEventSetRef event_set = 1;
-  AggregateReadStart start = 2;
+message FollowAggregateTypeEventsRequest {
+  AggregateTypeRef aggregate_type = 1;
+  AggregateFollowStart start = 2;
 }
 
 message AggregateReadDegraded {
@@ -150,7 +156,8 @@ message AggregateReadDegraded {
   bool retrying = 2;
 }
 
-message ReadAggregateEventsResponse {
+// 类型级 feed frame；event/caught_up/degraded/recovered 四者恰有其一。
+message FollowAggregateTypeEventsResponse {
   oneof payload {
     AggregateEvent event = 1;
     Empty caught_up = 2;
@@ -162,11 +169,12 @@ message ReadAggregateEventsResponse {
 }
 
 message ListAggregateStatesRequest {
-  AggregateEventSetRef event_set = 1;
+  AggregateTypeRef aggregate_type = 1;
   uint32 page_size = 2;
   bytes page_token = 3;
 }
 
+// 状态目录项；不包含状态正文。
 message AggregateStateInfo {
   string aggregate_id = 1;
   uint64 revision = 2;
@@ -179,7 +187,7 @@ message ListAggregateStatesResponse {
 }
 
 message GetAggregateStateRequest {
-  AggregateEventSetRef event_set = 1;
+  AggregateTypeRef aggregate_type = 1;
   string aggregate_id = 2;
 }
 
@@ -189,6 +197,7 @@ message GetAggregateStateResponse {
   uint64 modified_unix_millis = 3;
 }
 
+// 状态覆盖的 CAS 条件；必须显式提供 absent 或 exact。
 message ExpectedStateRevision {
   oneof kind {
     Empty absent = 1;
@@ -197,7 +206,7 @@ message ExpectedStateRevision {
 }
 
 message PutAggregateStateRequest {
-  AggregateEventSetRef event_set = 1;
+  AggregateTypeRef aggregate_type = 1;
   string aggregate_id = 2;
   ExpectedStateRevision expected_revision = 3;
   bytes data = 4;
@@ -211,12 +220,12 @@ message GetAggregateStoreStatusRequest {}
 
 message AggregateStoreStatus {
   uint64 catalog_revision = 1;
-  uint32 event_set_count = 2;
-  uint32 creating_event_set_count = 3;
-  uint32 active_event_set_count = 4;
+  uint32 aggregate_type_count = 2;
+  uint32 registering_aggregate_type_count = 3;
+  uint32 active_aggregate_type_count = 4;
 }
 
-message ListAggregatePartitionsRequest { AggregateEventSetRef event_set = 1; }
+message ListAggregatePartitionsRequest { AggregateTypeRef aggregate_type = 1; }
 
 message AggregatePartitionInfo {
   uint32 partition_id = 1;
@@ -235,6 +244,7 @@ message AggregateGroupStart {
   }
 }
 
+// 消费者组流控、租约与重试设置；服务端校验各字段边界。
 message AggregateGroupSettings {
   uint32 max_unacked_per_consumer = 1;
   uint32 max_unacked_per_group = 2;
@@ -245,7 +255,7 @@ message AggregateGroupSettings {
 }
 
 message AggregateGroupInfo {
-  AggregateEventSetRef event_set = 1;
+  AggregateTypeRef aggregate_type = 1;
   string name = 2;
   uint64 revision = 3;
   uint64 epoch = 4;
@@ -254,7 +264,7 @@ message AggregateGroupInfo {
 }
 
 message CreateAggregateGroupRequest {
-  AggregateEventSetRef event_set = 1;
+  AggregateTypeRef aggregate_type = 1;
   string name = 2;
   AggregateGroupStart start = 3;
   AggregateGroupSettings settings = 4;
@@ -262,7 +272,7 @@ message CreateAggregateGroupRequest {
 }
 
 message UpdateAggregateGroupRequest {
-  AggregateEventSetRef event_set = 1;
+  AggregateTypeRef aggregate_type = 1;
   string name = 2;
   uint64 expected_revision = 3;
   AggregateGroupStart start = 4;
@@ -271,20 +281,21 @@ message UpdateAggregateGroupRequest {
 }
 
 message DeleteAggregateGroupRequest {
-  AggregateEventSetRef event_set = 1;
+  AggregateTypeRef aggregate_type = 1;
   string name = 2;
   uint64 expected_revision = 3;
   bytes operation_id = 4;
 }
 
 message GetAggregateGroupRequest {
-  AggregateEventSetRef event_set = 1;
+  AggregateTypeRef aggregate_type = 1;
   string name = 2;
 }
 
-message ListAggregateGroupsRequest { AggregateEventSetRef event_set = 1; }
+message ListAggregateGroupsRequest { AggregateTypeRef aggregate_type = 1; }
 message ListAggregateGroupsResponse { repeated AggregateGroupInfo groups = 1; }
 
+// 一次带租约的投递；delivery_id 只能传给 settle/renew，不得解析或持久构造。
 message AggregateGroupDelivery {
   bytes delivery_id = 1;
   AggregateEvent event = 2;
@@ -294,7 +305,7 @@ message AggregateGroupDelivery {
 }
 
 message FetchAggregateGroupRequest {
-  AggregateEventSetRef event_set = 1;
+  AggregateTypeRef aggregate_type = 1;
   string name = 2;
   string consumer_id = 3;
   uint32 max_events = 4;
@@ -336,7 +347,7 @@ message AggregateGroupSettlementResult {
 }
 
 message SettleAggregateGroupRequest {
-  AggregateEventSetRef event_set = 1;
+  AggregateTypeRef aggregate_type = 1;
   string name = 2;
   string consumer_id = 3;
   repeated AggregateGroupSettlement settlements = 4;
@@ -347,7 +358,7 @@ message SettleAggregateGroupResponse {
 }
 
 message RenewAggregateGroupRequest {
-  AggregateEventSetRef event_set = 1;
+  AggregateTypeRef aggregate_type = 1;
   string name = 2;
   string consumer_id = 3;
   repeated bytes delivery_ids = 4;
@@ -357,335 +368,13 @@ message RenewAggregateGroupResponse {
   repeated AggregateGroupSettlementResult results = 1;
 }
 
-// 创建流请求
-message CreateStreamRequest {
-  string stream_id = 1;
-}
-
-// 创建流响应
-message CreateStreamResponse {
-  // 分配的 shard；exists=true 时表示已有归属（幂等）
-  uint64 shard_id = 1;
-  // 该 shard 的 leader 地址（http(s)://host:port，可用于直连），
-  // 未知时为空字符串（调用方可经常规重定向路径定位）
-  string leader_addr = 2;
-  // true 表示流已存在（本次调用未新建）
-  bool exists = 3;
-}
-
 // 混合逻辑时钟：由 leader 在写入前分配并随事件落盘
 message Hlc {
   uint64 wall = 1;    // 物理时间，毫秒
   uint32 logical = 2; // 同毫秒内逻辑计数
 }
 
-// 乐观并发期望版本
-message ExpectedVersion {
-  oneof kind {
-    Empty any = 1;           // 不校验
-    Empty no_stream = 2;     // 要求流不存在
-    Empty stream_exists = 3; // 要求流已存在
-    uint64 exact = 4;        // 要求当前版本恰为该值
-  }
-}
-
 message Empty {}
-
-// 待写入事件，version/position/hlc 由服务端分配
-message NewEvent {
-  bytes event_id = 1;    // 16 字节 UUID，用于幂等去重
-  string event_type = 2;
-  bytes data = 3;
-  bytes metadata = 4;
-}
-
-// 已持久化事件
-message Event {
-  string stream_id = 1;
-  uint64 version = 2;
-  bytes event_id = 3;
-  string event_type = 4;
-  bytes data = 5;
-  bytes metadata = 6;
-  Hlc hlc = 7;
-  uint64 position = 8; // 分片内提交位置
-  uint64 shard_id = 9;
-}
-
-message AppendRequest {
-  string stream_id = 1;
-  ExpectedVersion expected_version = 2;
-  repeated NewEvent events = 3;
-}
-
-message AppendResponse {
-  uint64 next_expected_version = 1; // 追加后的当前版本
-  uint64 first_position = 2;        // 本批首条事件的分片内位置
-  uint64 last_position = 3;
-  uint64 shard_id = 4;
-}
-
-// 读取方向
-enum Direction {
-  DIRECTION_FORWARD = 0;
-  DIRECTION_BACKWARD = 1;
-}
-
-message ReadStreamRequest {
-  string stream_id = 1;
-  uint64 from_version = 2;
-  // 0 表示不限量，由服务端按流控上限截断
-  uint64 max_count = 3;
-  Direction direction = 4;
-}
-
-// 单个分片的读取游标
-message ShardPosition {
-  uint64 shard_id = 1;
-  // 起始 position（含）
-  uint64 from_position = 2;
-  // 反向读尽标记：该分片反向已消费到 position 0（最早事件），不再有更早
-  // 的事件可读。仅反向翻页由服务端置 true；true 时服务端对该分片返回
-  // 空页且游标保持不变。正向（或其它用法）恒为 false。
-  bool ended = 3;
-}
-
-message ReadAllRequest {
-  repeated uint64 shard_ids = 1;
-  // 所有分片统一的起始 position。
-  // 各分片的 position 序列相互独立，此字段表示「每个分片都从该值开始读」，
-  // 仅适合首页查询。翻页请用 from_positions。
-  uint64 from_position = 2;
-  uint64 max_count = 3;
-  Direction direction = 4;
-  // 逐分片游标。非空时覆盖 shard_ids 与 from_position。
-  //
-  // 翻页必须用它：跨分片归并后，各分片被消费到的位置不同，
-  // 用单一 from_position 续读会重复或漏掉事件。
-  // 首页可不传（用 shard_ids + from_position），续页请把上一页响应里的
-  // next_positions 原样透传，不要自行构造——服务端才知道每分片实际读到的边界。
-  repeated ShardPosition from_positions = 5;
-}
-
-message ReadEventsResponse {
-  repeated Event events = 1;
-  // 仅 ReadAll 填充：每分片一条，为「该分片下一页的续读起点」。
-  // 正序 = 本页最后一条 position + 1；倒序 = 本页最小 position - 1。
-  // 本页未读到事件的分片起点不变；倒序消费到 position 0 的分片置
-  // ended=true（该分片已读尽，不再有更早事件）。客户端翻页时原样
-  // 透传为 ReadAllRequest.from_positions。
-  repeated ShardPosition next_positions = 2;
-}
-
-// 公共订阅目标：客户端只面向 stream，不感知内部 shard。
-message SubscribeStreams {
-  repeated string stream_ids = 1;
-}
-
-message SubscribeRequest {
-  oneof target {
-    SubscribeStreams streams = 1; // 订阅一个或多个 stream
-    Empty all = 2;               // 订阅当前集群全部 stream
-  }
-}
-
-// 订阅公开事件：不暴露内部 shard 或分片 position。
-message SubscriptionEvent {
-  string stream_id = 1;
-  uint64 version = 2;
-  bytes event_id = 3;
-  string event_type = 4;
-  bytes data = 5;
-  bytes metadata = 6;
-  Hlc hlc = 7;
-}
-
-message SubscribeResponse {
-  oneof payload {
-    SubscriptionEvent event = 1;
-    // catch-up 阶段结束、转入实时推送的分界信号
-    Empty caught_up = 2;
-    // 部分内部来源不可用；不包含 shard、节点或路由细节。
-    Empty degraded = 3;
-  }
-}
-
-// 持久化订阅目标；与临时 Subscribe 一样不向客户端暴露 shard。
-message PersistentSubscriptionTarget {
-  oneof target {
-    SubscribeStreams streams = 1;
-    Empty all = 2;
-  }
-}
-
-enum PersistentStartDefault {
-  PERSISTENT_START_BEGINNING = 0;
-  PERSISTENT_START_NOW = 1;
-}
-
-// 创建起点：默认策略 + 逐 Stream inclusive next_version 覆盖。
-message PersistentStartSpec {
-  PersistentStartDefault default = 1;
-  map<string, uint64> next_versions = 2;
-}
-
-message PersistentSubscriptionSettings {
-  // 0 使用服务端默认值。
-  uint32 max_unacked_per_consumer = 1;
-  uint32 max_unacked_per_group = 2;
-  uint64 ack_timeout_ms = 3;
-  uint32 max_retries = 4;
-  uint64 retry_min_ms = 5;
-  uint64 retry_max_ms = 6;
-}
-
-message CreatePersistentSubscriptionRequest {
-  string name = 1;
-  PersistentSubscriptionTarget target = 2;
-  PersistentStartSpec start = 3;
-  PersistentSubscriptionSettings settings = 4;
-}
-
-message PersistentStreamReset {
-  string stream_id = 1;
-  oneof start {
-    Empty beginning = 2;
-    Empty now = 3;
-    uint64 next_version = 4;
-  }
-}
-
-message UpdatePersistentSubscriptionRequest {
-  string name = 1;
-  uint64 expected_revision = 2;
-  // 缺失表示不修改。
-  PersistentSubscriptionTarget target = 3;
-  // 缺失表示不修改。
-  PersistentSubscriptionSettings settings = 4;
-  repeated PersistentStreamReset resets = 5;
-}
-
-message DeletePersistentSubscriptionRequest {
-  string name = 1;
-  uint64 expected_revision = 2;
-}
-
-message GetPersistentSubscriptionRequest { string name = 1; }
-message ListPersistentSubscriptionsRequest {}
-
-message PersistentSubscriptionInfo {
-  string name = 1;
-  uint64 revision = 2;
-  uint64 epoch = 3;
-  PersistentSubscriptionTarget target = 4;
-  PersistentSubscriptionSettings settings = 5;
-  uint64 stream_count = 6;
-  uint64 active_delivery_count = 7;
-  uint64 parked_count = 8;
-}
-
-message ListPersistentSubscriptionsResponse {
-  repeated PersistentSubscriptionInfo subscriptions = 1;
-}
-
-message FetchPersistentSubscriptionRequest {
-  string name = 1;
-  string consumer_id = 2;
-  // 0 使用默认值；服务端分别限制为 1000 条、7 MiB、30 秒。
-  uint32 max_events = 3;
-  uint64 max_bytes = 4;
-  uint64 wait_ms = 5;
-}
-
-message PersistentDelivery {
-  bytes delivery_id = 1;
-  SubscriptionEvent event = 2;
-  uint32 attempt = 3;
-  uint64 lease_deadline_ms = 4;
-  uint64 group_epoch = 5;
-  bool replayed = 6;
-}
-
-message FetchPersistentSubscriptionResponse {
-  repeated PersistentDelivery deliveries = 1;
-  bool caught_up = 2;
-  bool throttled = 3;
-  uint64 retry_after_ms = 4;
-}
-
-enum PersistentSettlementAction {
-  PERSISTENT_SETTLEMENT_ACK = 0;
-  PERSISTENT_SETTLEMENT_RETRY = 1;
-  PERSISTENT_SETTLEMENT_PARK = 2;
-  PERSISTENT_SETTLEMENT_SKIP = 3;
-}
-
-message PersistentSettlement {
-  bytes delivery_id = 1;
-  PersistentSettlementAction action = 2;
-  string reason = 3;
-}
-
-message SettlePersistentSubscriptionRequest {
-  string name = 1;
-  string consumer_id = 2;
-  uint64 group_epoch = 3;
-  repeated PersistentSettlement settlements = 4;
-}
-
-enum PersistentSettlementStatus {
-  PERSISTENT_SETTLEMENT_APPLIED = 0;
-  PERSISTENT_SETTLEMENT_ALREADY_SETTLED = 1;
-  PERSISTENT_SETTLEMENT_STALE_LEASE = 2;
-  PERSISTENT_SETTLEMENT_WRONG_CONSUMER = 3;
-}
-
-message PersistentSettlementResult {
-  bytes delivery_id = 1;
-  PersistentSettlementStatus status = 2;
-}
-
-message SettlePersistentSubscriptionResponse {
-  repeated PersistentSettlementResult results = 1;
-}
-
-message ListParkedPersistentSubscriptionRequest {
-  string name = 1;
-  uint32 offset = 2;
-  uint32 limit = 3; // 0 使用默认 100，上限 1000
-}
-
-message ParkedPersistentEvent {
-  bytes parked_id = 1;
-  SubscriptionEvent event = 2;
-  uint32 attempts = 3;
-  string reason = 4;
-  uint64 parked_at_ms = 5;
-}
-
-message ListParkedPersistentSubscriptionResponse {
-  repeated ParkedPersistentEvent events = 1;
-  uint32 next_offset = 2;
-}
-
-message ReplayParkedPersistentSubscriptionRequest { string name = 1; }
-message ReplayParkedPersistentSubscriptionResponse { uint64 replayed_count = 1; }
-
-// ============================================================================
-// InternalSubscription：节点间分片订阅转发，绝不作为客户端契约使用。
-// ============================================================================
-
-service InternalSubscription {
-  rpc SubscribeInternal(InternalSubscribeRequest) returns (stream InternalSubscribeResponse);
-  // 控制 Shard 协调器按 Stream checkpoint 批量读取远程数据 Shard。
-  rpc ReadPersistentBatch(InternalPersistentReadRequest) returns (InternalPersistentReadResponse);
-}
-
-// 归属共识与 fencing 的节点间协议，只能注册到内部监听端口。
-service OwnershipInternal {
-  rpc CommitOwnership(CommitOwnershipRequest) returns (CommitOwnershipResponse);
-  rpc InstallOwnershipFence(InstallOwnershipFenceRequest) returns (InstallOwnershipFenceResponse);
-}
 
 // AggregateStore 的节点间显式 Shard 协议，只注册到内部监听端口。
 service AggregateStoreInternal {
@@ -714,7 +403,7 @@ message CommitAggregateCatalogInternalResponse {
 
 message InstallAggregatePartitionFenceInternalRequest {
   uint64 shard_id = 1;
-  AggregateEventSetRef event_set = 2;
+  AggregateTypeRef aggregate_type = 2;
   uint32 partition_id = 3;
   uint64 generation = 4;
 }
@@ -728,7 +417,7 @@ message AggregatePartitionCursor {
 
 message SubscribeAggregatePartitionsInternalRequest {
   uint64 shard_id = 1;
-  AggregateEventSetRef event_set = 2;
+  AggregateTypeRef aggregate_type = 2;
   repeated AggregatePartitionCursor cursors = 3;
   bool from_now = 4;
 }
@@ -758,7 +447,7 @@ message AggregateStatePartitionCursor {
 
 message ListAggregatePartitionStatesInternalRequest {
   uint64 shard_id = 1;
-  AggregateEventSetRef event_set = 2;
+  AggregateTypeRef aggregate_type = 2;
   repeated AggregateStatePartitionCursor cursors = 3;
   uint32 limit_per_partition = 4;
 }
@@ -794,54 +483,6 @@ message ApplyAggregateGroupPartitionInternalRequest {
   bytes payload = 2;
 }
 message ApplyAggregateGroupPartitionInternalResponse { bytes payload = 1; }
-
-message InternalSubscribeRequest {
-  uint64 shard_id = 1;
-  // 空列表表示该 shard 内全部 stream；否则只推送列出的 stream。
-  repeated string stream_ids = 2;
-}
-
-message InternalSubscribeResponse {
-  oneof payload {
-    Event event = 1;
-    Empty caught_up = 2;
-  }
-}
-
-message InternalPersistentCursor {
-  string stream_id = 1;
-  uint64 from_version = 2;
-  uint32 max_count = 3;
-}
-
-message InternalPersistentReadRequest {
-  uint64 shard_id = 1;
-  repeated InternalPersistentCursor cursors = 2;
-  uint32 max_events = 3;
-  uint64 max_bytes = 4;
-}
-
-message InternalPersistentReadResponse {
-  repeated Event events = 1;
-  repeated InternalPersistentHead heads = 2;
-}
-
-message InternalPersistentHead {
-  string stream_id = 1;
-  bool exists = 2;
-  uint64 current_version = 3;
-}
-
-message GetStreamMetaRequest {
-  string stream_id = 1;
-}
-
-message GetStreamMetaResponse {
-  bool exists = 1;
-  // 仅当 exists 为 true 时有意义
-  uint64 current_version = 2;
-  uint64 shard_id = 3;
-}
 
 // ============================================================================
 // Raft 内部 RPC：节点间复制与选举（不暴露给客户端）
@@ -918,157 +559,6 @@ message ListShardsResponse {
   repeated uint64 shard_ids = 2;
 }
 
-// ============================================================================
-// Migration 服务：路由表同步与在线迁移原语（节点间，不暴露给客户端）
-// ============================================================================
-
-// 流路由表同步与迁移辅助服务。
-// 路由表（stream → shard）是「专门文件 + 热更新」的分布式实现：
-// 变更节点落盘本地 routes.json 后整表广播，接收方按版本号仲裁采纳。
-// 迁移原语按显式 shard 寻址（不走路由表），供在线迁移工具（esctl migrate）使用。
-service Migration {
-  // 拉取路由表（重启恢复 / 探测用）
-  rpc GetRouteTable(GetRouteTableRequest) returns (GetRouteTableResponse);
-  // 推送路由表（整表广播；version 不大于本地的会被忽略）
-  rpc PushRouteTable(PushRouteTableRequest) returns (PushRouteTableResponse);
-  // 原子切换流归属（迁移切换点），返回切换后的路由表
-  rpc SetStreamShard(SetStreamShardRequest) returns (SetStreamShardResponse);
-  // 校准 per-shard 流计数（recount）
-  rpc RecountStreams(RecountStreamsRequest) returns (RecountStreamsResponse);
-  // 迁移复制写入：显式 shard + 保留源 HLC（不走路由表、不做隐式建流）
-  rpc AppendMigrated(AppendMigratedRequest) returns (AppendMigratedResponse);
-  // 迁移清尾：删除源 shard 上的流（幂等 no-op）
-  rpc DeleteStreamFromShard(DeleteStreamFromShardRequest) returns (DeleteStreamFromShardResponse);
-  // 显式 shard 读流（迁移排水/校验用；不走路由表，路由表已切换时仍可读源）
-  rpc ReadStreamFromShard(ReadStreamFromShardRequest) returns (stream ReadEventsResponse);
-  // 显式 shard 读流元数据
-  rpc GetStreamMetaFromShard(GetStreamMetaFromShardRequest) returns (GetStreamMetaResponse);
-  // 列出 shard 上的全部流（迁移枚举 / route check 孤儿检测）
-  rpc ListStreams(ListStreamsRequest) returns (ListStreamsResponse);
-}
-
-// 路由表快照（与 es-core::route::RouteTable 字段一一对应）
-message RouteTable {
-  uint64 version = 1;
-  map<string, uint64> streams = 2;
-  map<uint64, uint64> shard_stream_counts = 3;
-  // 可选归属代次；旧节点与旧 routes.json 缺失时按 generation=1 导入。
-  map<string, uint64> stream_generations = 4;
-  // 可选单 Stream revision；旧节点缺失时按整表 version 导入。
-  map<string, uint64> stream_revisions = 5;
-}
-
-message CommitOwnershipRequest {
-  // 承载归属权威的控制 Shard。
-  uint64 control_shard_id = 1;
-  // bincode 编码的 es_core::OwnershipCommand。
-  bytes payload = 2;
-}
-
-message CommitOwnershipResponse {
-  // bincode 编码的 es_core::OwnershipApply。
-  bytes payload = 1;
-}
-
-message InstallOwnershipFenceRequest {
-  uint64 shard_id = 1;
-  string stream_id = 2;
-  uint64 generation = 3;
-}
-
-message InstallOwnershipFenceResponse {
-  uint64 generation = 1;
-}
-
-message GetRouteTableRequest {}
-
-message GetRouteTableResponse {
-  RouteTable table = 1;
-}
-
-message PushRouteTableRequest {
-  RouteTable table = 1;
-}
-
-message PushRouteTableResponse {}
-
-message SetStreamShardRequest {
-  string stream_id = 1;
-  uint64 shard_id = 2;
-  // 迁移任务在复制开始前观察到的归属；服务端按此执行 CAS。
-  uint64 expected_shard_id = 3;
-  uint64 expected_generation = 4;
-  // 16 字节 UUID；超时重试必须复用，保证 PrepareMove 幂等。
-  bytes operation_id = 5;
-}
-
-message SetStreamShardResponse {
-  RouteTable table = 1;
-}
-
-message RecountStreamsRequest {}
-
-message RecountStreamsResponse {
-  // 校准后的路由表
-  RouteTable table = 1;
-}
-
-// 迁移复制写入：单事件一条 raft 日志（hlc 由请求携带保留源时间戳），
-// 按显式 shard 寻址（不查路由表、不隐式建流）。逐条写入使幂等索引
-// 逐事件记录，重放安全；迁移工具按期望版本链驱动。
-message AppendMigratedRequest {
-  uint64 shard_id = 1;
-  string stream_id = 2;
-  ExpectedVersion expected_version = 3;
-  MigratedEvent event = 4;
-}
-
-// 迁移事件：NewEvent + hlc
-message MigratedEvent {
-  bytes event_id = 1;
-  string event_type = 2;
-  bytes data = 3;
-  bytes metadata = 4;
-  Hlc hlc = 5;
-}
-
-message AppendMigratedResponse {
-  // 追加后的当前版本
-  uint64 next_expected_version = 1;
-  // 与 AppendResponse 同语义（迁移工具用于版本链续写）
-  uint64 first_position = 2;
-  uint64 last_position = 3;
-  uint64 shard_id = 4;
-}
-
-message DeleteStreamFromShardRequest {
-  uint64 shard_id = 1;
-  string stream_id = 2;
-}
-
-message DeleteStreamFromShardResponse {}
-
-message ReadStreamFromShardRequest {
-  uint64 shard_id = 1;
-  string stream_id = 2;
-  uint64 from_version = 3;
-  uint64 max_count = 4;
-}
-
-message GetStreamMetaFromShardRequest {
-  uint64 shard_id = 1;
-  string stream_id = 2;
-}
-
-message ListStreamsRequest {
-  uint64 shard_id = 1;
-}
-
-message ListStreamsResponse {
-  repeated string stream_ids = 1;
-}
-
-// 集群成员：node_id 与其 Raft RPC 地址
 message RaftMember {
   uint64 node_id = 1;
   // 形如 "http://127.0.0.1:50051"，供其它节点回连

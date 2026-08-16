@@ -75,15 +75,11 @@ impl ShardManager {
             .ok_or_else(|| Error::NotFound(format!("shard {} not found", shard_id)))
     }
 
-    /// 根据 stream_id 路由到分片（哈希提示用；写路径权威是路由表）
-    pub async fn route_shard(&self, stream_id: &str) -> Result<Arc<Shard>> {
-        let shard_id = es_core::routing::route(stream_id, self.num_shards());
-        self.get_shard(shard_id).await
-    }
-
-    /// 获取所有已注册的分片 ID
+    /// 按数值升序获取所有已注册的分片 ID。
     pub async fn shard_ids(&self) -> Vec<u64> {
         let shards = self.shards.read().await;
-        shards.keys().copied().collect()
+        let mut ids = shards.keys().copied().collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
     }
 }

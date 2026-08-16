@@ -18,7 +18,7 @@ use openraft::raft::{
 use openraft::{BasicNode, Config, Raft};
 use tokio::sync::RwLock;
 
-use es_core::{ExpectedVersion, Hlc, NewEvent};
+use es_core::{AggregateEvent, AggregateTypeId, ExpectedAggregateVersion, Hlc, NewAggregateEvent};
 use es_storage::{EsRequest, EsResponse, EsStorage, TypeConfig};
 
 /// 进程内测试网络：持有各节点的 Raft 句柄，并维护一张有向链路通断矩阵。
@@ -391,16 +391,24 @@ impl Cluster {
     }
 
     /// 经指定节点写入一条事件
-    async fn write(&self, node: u64, stream: &str, data: &[u8]) -> Result<EsResponse, String> {
-        let req = EsRequest::Append {
-            stream_id: stream.to_string(),
-            expected_version: ExpectedVersion::Any,
-            events: vec![NewEvent {
+    async fn write(
+        &self,
+        node: u64,
+        aggregate_id: &str,
+        data: &[u8],
+    ) -> Result<EsResponse, String> {
+        let req = EsRequest::AggregateAppend {
+            aggregate_type: test_aggregate_type(),
+            partition_id: 0,
+            partition_generation: 0,
+            aggregate_id: aggregate_id.to_string(),
+            expected_version: ExpectedAggregateVersion::Any,
+            event: NewAggregateEvent {
                 event_id: uuid::Uuid::new_v4(),
                 event_type: "E".into(),
                 data: data.to_vec(),
                 metadata: vec![],
-            }],
+            },
             hlc: Hlc::now(),
         };
         self.rafts[&node]
@@ -410,11 +418,14 @@ impl Cluster {
             .map_err(|e| e.to_string())
     }
 
-    /// 读某节点本地状态机里的流
-    fn read(&self, node: u64, stream: &str) -> Vec<es_core::Event> {
+    /// 读取某节点本地状态机里的聚合实例事件。
+    fn read(&self, node: u64, aggregate_id: &str) -> Vec<AggregateEvent> {
         self.stores[&node]
-            .read_stream_events(stream, 0, 0)
-            .expect("读流")
+            .read_aggregate_partition_events(&test_aggregate_type(), 0, 0, 0)
+            .expect("读取聚合事件")
+            .into_iter()
+            .filter(|event| event.aggregate_id == aggregate_id)
+            .collect()
     }
 
     async fn shutdown(self) {
@@ -425,6 +436,10 @@ impl Cluster {
             let _ = s.close().await;
         }
     }
+}
+
+fn test_aggregate_type() -> AggregateTypeId {
+    AggregateTypeId::new("tests", "partition").expect("合法 AggregateType")
 }
 
 /// 隔离 leader 后：多数派选出更高 term 的新 leader，少数派无法提交。
@@ -664,9 +679,11 @@ async fn lagging_node_snapshot_catchup() {
 
     // 确认 leader 真的建了快照并清了日志
     let snap_exists = c.stores[&leader]
-        .read_stream_events("snap", 0, 0)
-        .expect("读流")
-        .len();
+        .read_aggregate_partition_events(&test_aggregate_type(), 0, 0, 0)
+        .expect("读取类型分区")
+        .into_iter()
+        .filter(|event| event.aggregate_id == "snap")
+        .count();
     assert_eq!(snap_exists, 31, "leader 应有 31 条事件(1 基线 + 30)");
 
     // 恢复网络。laggard 缺的日志已被 purge,只能靠快照追赶。
@@ -685,7 +702,7 @@ async fn lagging_node_snapshot_catchup() {
     assert_eq!(events[30].data, b"v29");
 
     // 版本连续无空洞——快照安装不能丢事件
-    let versions: Vec<u64> = events.iter().map(|e| e.version).collect();
+    let versions: Vec<u64> = events.iter().map(|e| e.aggregate_version).collect();
     let expected: Vec<u64> = (0..31).collect();
     assert_eq!(versions, expected, "版本须连续,快照不能丢事件");
 
@@ -730,7 +747,7 @@ async fn logs_purged_after_snapshot_data_intact() {
     for &id in &c.ids {
         let events = c.read(id, "purge");
         assert_eq!(events.len(), 20, "node{id} 应有 20 条事件");
-        let versions: Vec<u64> = events.iter().map(|e| e.version).collect();
+        let versions: Vec<u64> = events.iter().map(|e| e.aggregate_version).collect();
         let expected: Vec<u64> = (0..20).collect();
         assert_eq!(versions, expected, "node{id} 版本须连续");
     }
@@ -811,7 +828,7 @@ async fn multi_chunk_snapshot_transfer() {
     // 数据完整：25 条（1 基线 + 24），且每条数据未被压缩/解压破坏
     let events = c.read(laggard, "big");
     assert_eq!(events.len(), 25, "追赶后事件数须一致");
-    let versions: Vec<u64> = events.iter().map(|e| e.version).collect();
+    let versions: Vec<u64> = events.iter().map(|e| e.aggregate_version).collect();
     assert_eq!(versions, (0..25).collect::<Vec<u64>>(), "版本须连续");
     assert_eq!(events[0].data, b"base");
     // 大事件数据逐字节一致（分块传输 + 压缩解压不得损坏数据）

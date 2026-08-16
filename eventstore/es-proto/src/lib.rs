@@ -1,7 +1,7 @@
-//! EventStore gRPC 协议定义与生成代码。
+//! EventFS AggregateStore、Raft 与成员管理 gRPC 契约及生成代码。
 //!
 //! 两组服务：
-//! - [`eventstore`]：客户端 API（追加、读取、订阅）
+//! - [`eventstore`]：AggregateStore、Raft 管理与节点内部 API
 //! - [`raft`]：节点间 Raft 通信，消息带 `shard_id` 用于路由到对应 Raft 实例
 
 /// 客户端 API，对应 `proto/eventstore.proto`
@@ -29,37 +29,34 @@ pub use tls::{TlsClientConfig, apply_endpoint_tls};
 mod tests {
     use super::*;
 
-    /// 固化生成代码的对外契约：公共持久化订阅类型必须存在。
+    /// 固化生成代码的 Aggregate-only 对外契约。
     /// proto 改名或 package 变动会在此处编译失败，而非在下游 crate 里才暴露。
     #[test]
     fn generated_code_has_public_and_internal_service_types() {
         fn types_exist<T>() {}
-        types_exist::<eventstore::event_store_client::EventStoreClient<tonic::transport::Channel>>(
-        );
-        types_exist::<
-            eventstore::persistent_subscriptions_client::PersistentSubscriptionsClient<
-                tonic::transport::Channel,
-            >,
-        >();
         types_exist::<
             eventstore::aggregate_store_client::AggregateStoreClient<tonic::transport::Channel>,
         >();
+        types_exist::<
+            eventstore::aggregate_store_internal_client::AggregateStoreInternalClient<
+                tonic::transport::Channel,
+            >,
+        >();
+        types_exist::<eventstore::raft_admin_client::RaftAdminClient<tonic::transport::Channel>>();
         types_exist::<raft::raft_internal_client::RaftInternalClient<tonic::transport::Channel>>();
-        // server 侧为泛型包装，仅断言模块路径可达
-        let _ = std::any::type_name::<eventstore::AppendRequest>();
-        let _ = std::any::type_name::<eventstore::FetchPersistentSubscriptionRequest>();
         let _ = std::any::type_name::<eventstore::AppendAggregateEventRequest>();
+        let _ = std::any::type_name::<eventstore::FollowAggregateTypeEventsRequest>();
         let _ = std::any::type_name::<raft::RaftRequest>();
     }
 
-    /// oneof 字段生成为 Option<enum>，确认 ExpectedVersion 四种取值都可构造
+    /// Aggregate OCC oneof 的四种取值必须可构造并保真携带精确版本。
     #[test]
-    fn expected_version_four_variants_constructible() {
-        use eventstore::expected_version::Kind;
+    fn expected_aggregate_version_four_variants_constructible() {
+        use eventstore::expected_aggregate_version::Kind;
         let kinds = [
             Kind::Any(eventstore::Empty {}),
-            Kind::NoStream(eventstore::Empty {}),
-            Kind::StreamExists(eventstore::Empty {}),
+            Kind::NoAggregate(eventstore::Empty {}),
+            Kind::AggregateExists(eventstore::Empty {}),
             Kind::Exact(42),
         ];
         assert_eq!(kinds.len(), 4);

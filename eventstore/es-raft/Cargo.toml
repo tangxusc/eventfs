@@ -1,6 +1,6 @@
 [package]
 name = "es-raft"
-description = "EventStore 共识层：TypeConfig、multi-raft 分片管理、gRPC RaftNetwork"
+description = "EventFS 共识层：TypeConfig、multi-raft Shard 管理与 gRPC RaftNetwork"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

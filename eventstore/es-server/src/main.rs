@@ -1,14 +1,14 @@
-//! EventStore 服务端入口。
+//! EventFS 服务端入口。
 
 use anyhow::Result;
 use clap::Parser;
 use es_server::{Config, Server};
 use std::sync::Arc;
 
-/// EventStore 服务器命令行参数
+/// EventFS 服务器命令行参数。
 #[derive(Parser, Debug)]
 #[command(name = "eventstored")]
-#[command(about = "EventStore 分布式事件存储服务器", long_about = None)]
+#[command(about = "EventFS AggregateStore 分布式服务器", long_about = None)]
 struct Args {
     /// 配置文件路径
     #[arg(short, long, default_value = "config.toml")]
@@ -53,7 +53,7 @@ async fn main() -> Result<()> {
     // 命令行参数覆盖
     config = apply_overrides(config, args.node_id, args.listen);
 
-    tracing::info!("Starting EventStore server (node_id={})", config.node.id);
+    tracing::info!("Starting EventFS server (node_id={})", config.node.id);
     tracing::info!("Listen address: {}", config.node.listen_addr);
     tracing::info!(
         "TLS: {}",
@@ -76,19 +76,8 @@ async fn main() -> Result<()> {
     // 初始化
     server.init().await?;
 
-    // 配置与路由表热更新 watcher（动态 shard 创建 / routes.json 热生效）。
-    // notify 只能 watch 已存在的文件：先确保路由表文件存在（缺失时落盘空表）
-    if let Err(e) = server.route_table().ensure_file().await {
-        tracing::error!("路由表文件初始化失败（动态扩容不可用）：{e}");
-    }
-    let watcher = match es_server::watcher::spawn(
-        std::path::PathBuf::from(&args.config),
-        es_server::route_table::routes_path(&server.config().storage.data_dir),
-        server.route_table().clone(),
-        server.ownership().clone(),
-        server.shard_manager().clone(),
-        server.config().node.id, // --node-id 覆盖后的实际节点
-    ) {
+    // 配置热更新 watcher（运行期动态创建新增 Shard）。
+    let watcher = match server.spawn_config_watcher(std::path::PathBuf::from(&args.config)) {
         Ok(w) => Some(w),
         Err(e) => {
             tracing::error!("watcher 启动失败（动态扩容不可用，其余功能正常）：{e}");

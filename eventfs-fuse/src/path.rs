@@ -9,7 +9,7 @@ use es_core::validate_aggregate_identifier;
 pub enum Node {
     Root,
     BusinessSpace(String),
-    EventSet {
+    AggregateType {
         business_space: String,
         aggregate_type: String,
     },
@@ -89,12 +89,12 @@ impl Node {
             }
             Self::BusinessSpace(business_space) => {
                 identifier("aggregate_type", name)?;
-                Ok(Self::EventSet {
+                Ok(Self::AggregateType {
                     business_space: business_space.clone(),
                     aggregate_type: name.into(),
                 })
             }
-            Self::EventSet {
+            Self::AggregateType {
                 business_space,
                 aggregate_type,
             } => match name {
@@ -161,17 +161,17 @@ impl Node {
             self,
             Self::Root
                 | Self::BusinessSpace(_)
-                | Self::EventSet { .. }
+                | Self::AggregateType { .. }
                 | Self::States { .. }
                 | Self::Groups { .. }
                 | Self::Group { .. }
         )
     }
 
-    /// 返回节点所在事件集；根和业务空间没有事件集。
-    pub fn event_set(&self) -> Option<(&str, &str)> {
+    /// 返回节点所在聚合类型；根和业务空间没有聚合类型。
+    pub fn aggregate_type(&self) -> Option<(&str, &str)> {
         match self {
-            Self::EventSet {
+            Self::AggregateType {
                 business_space,
                 aggregate_type,
             }
@@ -282,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn node_kinds_report_directory_and_event_set_membership() {
+    fn node_kinds_report_directory_and_aggregate_type_membership() {
         let paths = [
             "/",
             "/orders",
@@ -304,10 +304,10 @@ mod tests {
         assert!(!nodes[5].is_directory());
         assert!(nodes[6..8].iter().all(Node::is_directory));
         assert!(!nodes[8].is_directory());
-        assert!(nodes[0].event_set().is_none());
-        assert!(nodes[1].event_set().is_none());
+        assert!(nodes[0].aggregate_type().is_none());
+        assert!(nodes[1].aggregate_type().is_none());
         for node in &nodes[2..] {
-            assert_eq!(node.event_set(), Some(("orders", "order")));
+            assert_eq!(node.aggregate_type(), Some(("orders", "order")));
         }
 
         for leaf in [&nodes[3], &nodes[5], &nodes[8]] {

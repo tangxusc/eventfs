@@ -1,14 +1,25 @@
-//! 聚合事件集消费者组领域模型。
+//! 聚合类型消费者组领域模型。
 //!
 //! 控制 Shard 仅保存组定义；高频 checkpoint、delivery 与实例 lease 按虚拟
-//! 事件分区保存。该拆分让组状态规模随固定分区数扩展，而不是集中到单个控制流。
+//! 事件分区保存。该拆分让组状态规模随固定分区数扩展，而不是集中到控制 Shard。
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{EventSetId, Hlc, validate_aggregate_identifier};
+use crate::{AggregateTypeId, Hlc, validate_aggregate_identifier};
+
+/// 单次消费者组拉取的默认事件数。
+pub const DEFAULT_AGGREGATE_GROUP_FETCH_EVENTS: u32 = 100;
+/// 单次消费者组拉取允许的最大事件数。
+pub const MAX_AGGREGATE_GROUP_FETCH_EVENTS: u32 = 1000;
+/// 单次消费者组拉取的默认 payload 字节数。
+pub const DEFAULT_AGGREGATE_GROUP_FETCH_BYTES: u64 = 4 * 1024 * 1024;
+/// 单次消费者组拉取允许的最大 payload 字节数。
+pub const MAX_AGGREGATE_GROUP_FETCH_BYTES: u64 = 7 * 1024 * 1024;
+/// 消费者组长轮询允许的最长等待时间（毫秒）。
+pub const MAX_AGGREGATE_GROUP_FETCH_WAIT_MS: u64 = 30_000;
 
 /// 消费者组创建起点。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,7 +90,7 @@ impl AggregateGroupSettings {
 /// 控制 Shard 保存的消费者组定义。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregateGroupDefinition {
-    pub event_set: EventSetId,
+    pub aggregate_type: AggregateTypeId,
     pub name: String,
     pub revision: u64,
     pub epoch: u64,
@@ -93,7 +104,7 @@ pub struct AggregateGroupDefinition {
 
 impl AggregateGroupDefinition {
     fn validate(&self, partition_count: u16) -> Result<(), String> {
-        self.event_set
+        self.aggregate_type
             .validate()
             .map_err(|error| error.to_string())?;
         validate_aggregate_identifier("group_name", &self.name)
@@ -112,9 +123,9 @@ impl AggregateGroupDefinition {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregateGroupCatalog {
     pub revision: u64,
-    pub groups: BTreeMap<(EventSetId, String), AggregateGroupDefinition>,
+    pub groups: BTreeMap<(AggregateTypeId, String), AggregateGroupDefinition>,
     /// 每个已删除组保留最后一次操作，保证删除 RPC 重试幂等。
-    pub deleted_operations: BTreeMap<(EventSetId, String), Uuid>,
+    pub deleted_operations: BTreeMap<(AggregateTypeId, String), Uuid>,
 }
 
 /// 消费者组 catalog 命令。
@@ -132,7 +143,7 @@ pub enum AggregateGroupCatalogCommand {
         reset: bool,
     },
     Delete {
-        event_set: EventSetId,
+        aggregate_type: AggregateTypeId,
         name: String,
         expected_revision: u64,
         operation_id: Uuid,
@@ -173,7 +184,7 @@ impl AggregateGroupCatalog {
                 mut definition,
                 partition_count,
             } => {
-                let key = (definition.event_set.clone(), definition.name.clone());
+                let key = (definition.aggregate_type.clone(), definition.name.clone());
                 match definition.validate(partition_count) {
                     Err(reason) => AggregateGroupCatalogOutcome::Invalid { reason },
                     Ok(()) => match self.groups.get(&key) {
@@ -203,7 +214,7 @@ impl AggregateGroupCatalog {
                 partition_count,
                 reset,
             } => {
-                let key = (definition.event_set.clone(), definition.name.clone());
+                let key = (definition.aggregate_type.clone(), definition.name.clone());
                 match definition.validate(partition_count) {
                     Err(reason) => AggregateGroupCatalogOutcome::Invalid { reason },
                     Ok(()) => match self.groups.get(&key) {
@@ -234,12 +245,12 @@ impl AggregateGroupCatalog {
                 }
             }
             AggregateGroupCatalogCommand::Delete {
-                event_set,
+                aggregate_type,
                 name,
                 expected_revision,
                 operation_id,
             } => {
-                let key = (event_set, name);
+                let key = (aggregate_type, name);
                 let invalid = key
                     .0
                     .validate()
@@ -335,7 +346,7 @@ pub struct AggregateInstanceLease {
     pub deadline_ms: u64,
 }
 
-/// 单个 `(事件集, group, partition)` 的高频消费状态。
+/// 单个 `(聚合类型, group, partition)` 的高频消费状态。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregateGroupPartition {
     pub epoch: u64,
@@ -419,6 +430,8 @@ impl AggregateGroupPartition {
     ///
     /// # 错误
     /// 本方法不返回错误；非法消费者、时间或零额度会返回空结果。
+    // 这些参数分别属于租约、流控和候选集，拆成位置参数可保持状态机调用可审计。
+    #[allow(clippy::too_many_arguments)]
     pub fn claim(
         &mut self,
         consumer_id: &str,
@@ -677,7 +690,7 @@ impl AggregateGroupPartition {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregateDeliveryToken {
     pub version: u8,
-    pub event_set: EventSetId,
+    pub aggregate_type: AggregateTypeId,
     pub group_name: String,
     pub partition_id: u16,
     pub group_epoch: u64,
@@ -725,7 +738,7 @@ mod tests {
 
     fn definition(operation_id: Uuid) -> AggregateGroupDefinition {
         AggregateGroupDefinition {
-            event_set: EventSetId::new("orders", "order").unwrap(),
+            aggregate_type: AggregateTypeId::new("orders", "order").unwrap(),
             name: "workers".into(),
             revision: 0,
             epoch: 0,
@@ -824,11 +837,11 @@ mod tests {
             AggregateGroupCatalogOutcome::NotFound
         ));
 
-        let event_set = EventSetId::new("orders", "order").unwrap();
+        let aggregate_type = AggregateTypeId::new("orders", "order").unwrap();
         assert!(matches!(
             catalog
                 .apply(AggregateGroupCatalogCommand::Delete {
-                    event_set: event_set.clone(),
+                    aggregate_type: aggregate_type.clone(),
                     name: "missing".into(),
                     expected_revision: 1,
                     operation_id: Uuid::new_v4(),
@@ -839,7 +852,7 @@ mod tests {
         assert!(matches!(
             catalog
                 .apply(AggregateGroupCatalogCommand::Delete {
-                    event_set,
+                    aggregate_type,
                     name: "workers".into(),
                     expected_revision: 9,
                     operation_id: Uuid::new_v4(),
@@ -899,7 +912,7 @@ mod tests {
             partition_count: crate::EVENT_PARTITION_COUNT,
         });
         let command = || AggregateGroupCatalogCommand::Delete {
-            event_set: EventSetId::new("orders", "order").unwrap(),
+            aggregate_type: AggregateTypeId::new("orders", "order").unwrap(),
             name: "workers".into(),
             expected_revision: 1,
             operation_id: delete_id,
@@ -1150,11 +1163,23 @@ mod tests {
             reason: String::new(),
         };
         assert_eq!(
-            state.settle("consumer-a", 1, 1, &config, &[settlement.clone()]),
+            state.settle(
+                "consumer-a",
+                1,
+                1,
+                &config,
+                std::slice::from_ref(&settlement)
+            ),
             vec![AggregateSettlementResult::StaleLease]
         );
         assert_eq!(
-            state.settle("consumer-b", 2, 1, &config, &[settlement.clone()]),
+            state.settle(
+                "consumer-b",
+                2,
+                1,
+                &config,
+                std::slice::from_ref(&settlement)
+            ),
             vec![AggregateSettlementResult::WrongConsumer]
         );
         assert_eq!(
@@ -1166,7 +1191,13 @@ mod tests {
             vec![AggregateSettlementResult::WrongConsumer]
         );
         assert_eq!(
-            state.settle("consumer-a", 2, 1, &config, &[settlement.clone()]),
+            state.settle(
+                "consumer-a",
+                2,
+                1,
+                &config,
+                std::slice::from_ref(&settlement)
+            ),
             vec![AggregateSettlementResult::Applied]
         );
         assert_eq!(

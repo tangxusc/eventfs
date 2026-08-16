@@ -7,19 +7,27 @@ use tokio_stream::StreamExt;
 use tonic::Code;
 use uuid::Uuid;
 
-use crate::codec::{self, EventEnvelope, ExpectedVersion, Settlement, SettlementAction};
+use crate::codec::{
+    self, AggregateVersionExpectation, EventEnvelope, Settlement, SettlementAction,
+};
 
-/// 聚合事件集身份。
+/// 聚合类型身份。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct EventSet {
+pub struct AggregateType {
     /// 业务空间。
     pub business_space: String,
     /// 聚合根类型。
     pub aggregate_type: String,
 }
 
-impl EventSet {
-    /// 构造并校验事件集身份。
+impl AggregateType {
+    /// 构造并校验聚合类型身份。
+    ///
+    /// # 参数
+    /// `business_space` 与 `aggregate_type` 是路径和 RPC 共用的身份字段。
+    ///
+    /// # 返回
+    /// 返回已校验、可转换为 protobuf 的聚合类型身份。
     ///
     /// # 错误
     /// 任一标识符不符合公共路径规则时返回 [`BackendError::InvalidArgument`]。
@@ -31,13 +39,13 @@ impl EventSet {
             business_space: business_space.into(),
             aggregate_type: aggregate_type.into(),
         };
-        es_core::EventSetId::new(&value.business_space, &value.aggregate_type)
+        es_core::AggregateTypeId::new(&value.business_space, &value.aggregate_type)
             .map_err(|error| BackendError::InvalidArgument(error.to_string()))?;
         Ok(value)
     }
 
-    fn proto(&self) -> AggregateEventSetRef {
-        AggregateEventSetRef {
+    fn proto(&self) -> AggregateTypeRef {
+        AggregateTypeRef {
             business_space: self.business_space.clone(),
             aggregate_type: self.aggregate_type.clone(),
         }
@@ -101,33 +109,82 @@ pub type BackendResult<T> = Result<T, BackendError>;
 /// FUSE 所需的最小 AggregateStore 接口。
 #[async_trait]
 pub trait EventFsBackend: Send + Sync + 'static {
-    /// 协商协议能力；不满足 FUSE 必需语义时返回错误。
+    /// 协商协议能力。
+    ///
+    /// # 返回
+    /// 返回 payload 上限；服务端必须支持 256 分区、状态 CAS 和显式结算。
+    ///
+    /// # 错误
+    /// 连接失败或能力不满足 FUSE 契约时返回 [`BackendError`]。
     async fn capabilities(&self) -> BackendResult<Capabilities>;
-    /// 枚举已激活事件集。
-    async fn list_event_sets(&self) -> BackendResult<Vec<EventSet>>;
-    /// 幂等创建并激活事件集。
-    async fn create_event_set(&self, event_set: &EventSet, operation_id: Uuid)
-    -> BackendResult<()>;
+    /// 枚举已激活聚合类型，按服务端 catalog 顺序返回。
+    ///
+    /// # 错误
+    /// catalog 不可用或响应身份非法时返回 [`BackendError`]。
+    async fn list_aggregate_types(&self) -> BackendResult<Vec<AggregateType>>;
+    /// 幂等注册并激活聚合类型。
+    ///
+    /// # 参数
+    /// `operation_id` 在结果未知的重试中必须保持不变。
+    ///
+    /// # 错误
+    /// 身份非法、操作冲突或 catalog 不可用时返回 [`BackendError`]。
+    async fn register_aggregate_type(
+        &self,
+        aggregate_type: &AggregateType,
+        operation_id: Uuid,
+    ) -> BackendResult<()>;
     /// 追加单条事件，服务端执行实例级 OCC。
-    async fn append(&self, event_set: &EventSet, event: &EventEnvelope) -> BackendResult<u64>;
-    /// 从 Beginning 跟随事件，返回已编码 JSONL frame。
+    ///
+    /// # 返回
+    /// 返回新分配的实例内 aggregate version。
+    ///
+    /// # 错误
+    /// OCC、幂等、payload 或可用性失败时返回 [`BackendError`]。
+    async fn append(
+        &self,
+        aggregate_type: &AggregateType,
+        event: &EventEnvelope,
+    ) -> BackendResult<u64>;
+    /// 从 Beginning 跟随类型级事件，保持各实例内版本顺序。
+    ///
+    /// # 返回
+    /// 返回承载 event/caught-up/degraded/recovered JSONL frame 的有界接收端。
+    ///
+    /// # 错误
+    /// 首次建流失败时返回 [`BackendError`]；建流后错误作为接收端元素返回。
     async fn follow(
         &self,
-        event_set: &EventSet,
+        aggregate_type: &AggregateType,
     ) -> BackendResult<tokio::sync::mpsc::Receiver<BackendResult<Vec<u8>>>>;
-    /// 分页枚举状态身份；`page_token` 只能原样传回服务端。
+    /// 分页枚举状态身份。
+    ///
+    /// # 参数
+    /// `page_token` 只能原样续传；`page_size` 是本页最大条目数。
+    ///
+    /// # 返回
+    /// 返回稳定排序的实例 ID 和下一页 opaque token。
+    ///
+    /// # 错误
+    /// token 非法或任一数据分区不可用时返回 [`BackendError`]。
     async fn list_states_page(
         &self,
-        event_set: &EventSet,
+        aggregate_type: &AggregateType,
         page_token: Vec<u8>,
         page_size: u32,
     ) -> BackendResult<StatePage>;
     /// 枚举全部状态身份；只供管理和测试使用，FUSE `readdir` 必须使用分页接口。
-    async fn list_states(&self, event_set: &EventSet) -> BackendResult<Vec<String>> {
+    ///
+    /// # 返回
+    /// 返回服务端全部状态实例 ID。
+    ///
+    /// # 错误
+    /// 任一分页请求失败时返回 [`BackendError`]。
+    async fn list_states(&self, aggregate_type: &AggregateType) -> BackendResult<Vec<String>> {
         let mut token = Vec::new();
         let mut states = Vec::new();
         loop {
-            let page = self.list_states_page(event_set, token, 1_000).await?;
+            let page = self.list_states_page(aggregate_type, token, 1_000).await?;
             states.extend(page.aggregate_ids);
             if page.next_page_token.is_empty() {
                 return Ok(states);
@@ -135,48 +192,90 @@ pub trait EventFsBackend: Send + Sync + 'static {
             token = page.next_page_token;
         }
     }
-    /// 读取状态；不存在时返回 `None`。
+    /// 读取一个聚合实例状态。
+    ///
+    /// # 返回
+    /// 状态存在时返回正文、revision 和修改时间，不存在时返回 `None`。
+    ///
+    /// # 错误
+    /// 参数非法或数据分区不可用时返回 [`BackendError`]。
     async fn get_state(
         &self,
-        event_set: &EventSet,
+        aggregate_type: &AggregateType,
         aggregate_id: &str,
     ) -> BackendResult<Option<StateDocument>>;
     /// 使用打开时 revision CAS 覆盖状态。
+    ///
+    /// # 参数
+    /// `revision=None` 表示状态必须不存在，`Some(n)` 表示精确匹配。
+    ///
+    /// # 返回
+    /// 返回提交后的状态 revision、正文和修改时间。
+    ///
+    /// # 错误
+    /// CAS 冲突、正文超限或数据分区不可用时返回 [`BackendError`]。
     async fn put_state(
         &self,
-        event_set: &EventSet,
+        aggregate_type: &AggregateType,
         aggregate_id: &str,
         revision: Option<u64>,
         data: Vec<u8>,
     ) -> BackendResult<StateDocument>;
-    /// 枚举消费者组名称。
-    async fn list_groups(&self, event_set: &EventSet) -> BackendResult<Vec<String>>;
+    /// 枚举聚合类型下的消费者组名称。
+    ///
+    /// # 错误
+    /// catalog 不可用时返回 [`BackendError`]。
+    async fn list_groups(&self, aggregate_type: &AggregateType) -> BackendResult<Vec<String>>;
     /// 从 Beginning 幂等创建消费者组。
+    ///
+    /// # 参数
+    /// `operation_id` 在结果未知的重试中必须保持不变。
+    ///
+    /// # 错误
+    /// 组已存在、标识符非法或 catalog 不可用时返回 [`BackendError`]。
     async fn create_group(
         &self,
-        event_set: &EventSet,
+        aggregate_type: &AggregateType,
         group_name: &str,
         operation_id: Uuid,
     ) -> BackendResult<()>;
-    /// 长轮询一批 delivery。
+    /// 为指定消费成员长轮询一批 delivery。
+    ///
+    /// # 返回
+    /// 返回带 opaque token 和租约的投递，顺序只保证到分区级。
+    ///
+    /// # 错误
+    /// 组不存在或数据分区不可用时返回 [`BackendError`]。
     async fn fetch_group(
         &self,
-        event_set: &EventSet,
+        aggregate_type: &AggregateType,
         group_name: &str,
         consumer_id: &str,
     ) -> BackendResult<FetchAggregateGroupResponse>;
     /// 显式结算一批 delivery。
+    ///
+    /// # 返回
+    /// 返回与输入顺序一致的逐项结算结果。
+    ///
+    /// # 错误
+    /// token 非法、组不存在或数据分区不可用时返回 [`BackendError`]。
     async fn settle_group(
         &self,
-        event_set: &EventSet,
+        aggregate_type: &AggregateType,
         group_name: &str,
         consumer_id: &str,
         settlements: &[Settlement],
     ) -> BackendResult<SettleAggregateGroupResponse>;
     /// 续租仍由当前读句柄持有的 delivery。
+    ///
+    /// # 返回
+    /// 返回与输入顺序一致的新 deadline 或逐项拒绝结果。
+    ///
+    /// # 错误
+    /// token 非法、组不存在或数据分区不可用时返回 [`BackendError`]。
     async fn renew_group(
         &self,
-        event_set: &EventSet,
+        aggregate_type: &AggregateType,
         group_name: &str,
         consumer_id: &str,
         delivery_ids: Vec<Vec<u8>>,
@@ -217,47 +316,57 @@ impl EventFsBackend for GrpcBackend {
         validate_capabilities(value)
     }
 
-    async fn list_event_sets(&self) -> BackendResult<Vec<EventSet>> {
-        let infos = self.client.clone().list_event_sets().await?;
+    async fn list_aggregate_types(&self) -> BackendResult<Vec<AggregateType>> {
+        let infos = self.client.clone().list_aggregate_types().await?;
         infos
             .into_iter()
-            .filter(|info| info.status == AggregateEventSetStatus::AggregateEventSetActive as i32)
+            .filter(|info| info.status == AggregateTypeStatus::AggregateTypeActive as i32)
             .map(|info| {
                 let identity = info
-                    .event_set
-                    .ok_or_else(|| BackendError::Internal("事件集缺少身份".into()))?;
-                EventSet::new(identity.business_space, identity.aggregate_type)
+                    .aggregate_type
+                    .ok_or_else(|| BackendError::Internal("聚合类型缺少身份".into()))?;
+                AggregateType::new(identity.business_space, identity.aggregate_type)
             })
             .collect()
     }
 
-    async fn create_event_set(
+    async fn register_aggregate_type(
         &self,
-        event_set: &EventSet,
+        aggregate_type: &AggregateType,
         operation_id: Uuid,
     ) -> BackendResult<()> {
         self.client
             .clone()
-            .create_event_set(CreateEventSetRequest {
-                event_set: Some(event_set.proto()),
+            .register_aggregate_type(RegisterAggregateTypeRequest {
+                aggregate_type: Some(aggregate_type.proto()),
                 operation_id: operation_id.as_bytes().to_vec(),
             })
             .await?;
         Ok(())
     }
 
-    async fn append(&self, event_set: &EventSet, event: &EventEnvelope) -> BackendResult<u64> {
+    async fn append(
+        &self,
+        aggregate_type: &AggregateType,
+        event: &EventEnvelope,
+    ) -> BackendResult<u64> {
         let kind = match event.expected_version {
-            ExpectedVersion::Any => expected_aggregate_version::Kind::Any(Empty {}),
-            ExpectedVersion::NoAggregate => expected_aggregate_version::Kind::NoAggregate(Empty {}),
-            ExpectedVersion::Exists => expected_aggregate_version::Kind::AggregateExists(Empty {}),
-            ExpectedVersion::Exact(version) => expected_aggregate_version::Kind::Exact(version),
+            AggregateVersionExpectation::Any => expected_aggregate_version::Kind::Any(Empty {}),
+            AggregateVersionExpectation::NoAggregate => {
+                expected_aggregate_version::Kind::NoAggregate(Empty {})
+            }
+            AggregateVersionExpectation::Exists => {
+                expected_aggregate_version::Kind::AggregateExists(Empty {})
+            }
+            AggregateVersionExpectation::Exact(version) => {
+                expected_aggregate_version::Kind::Exact(version)
+            }
         };
         let response = self
             .client
             .clone()
             .append(AppendAggregateEventRequest {
-                event_set: Some(event_set.proto()),
+                aggregate_type: Some(aggregate_type.proto()),
                 aggregate_id: event.aggregate_id.clone(),
                 expected_version: Some(ExpectedAggregateVersion { kind: Some(kind) }),
                 event: Some(NewAggregateEvent {
@@ -273,15 +382,15 @@ impl EventFsBackend for GrpcBackend {
 
     async fn follow(
         &self,
-        event_set: &EventSet,
+        aggregate_type: &AggregateType,
     ) -> BackendResult<tokio::sync::mpsc::Receiver<BackendResult<Vec<u8>>>> {
         let mut stream = self
             .client
             .clone()
-            .follow(ReadAggregateEventsRequest {
-                event_set: Some(event_set.proto()),
-                start: Some(AggregateReadStart {
-                    kind: Some(aggregate_read_start::Kind::Beginning(Empty {})),
+            .follow(FollowAggregateTypeEventsRequest {
+                aggregate_type: Some(aggregate_type.proto()),
+                start: Some(AggregateFollowStart {
+                    kind: Some(aggregate_follow_start::Kind::Beginning(Empty {})),
                 }),
             })
             .await?;
@@ -291,16 +400,19 @@ impl EventFsBackend for GrpcBackend {
                 let encoded = match frame {
                     Err(error) => Err(BackendError::from(error)),
                     Ok(frame) => match frame.payload {
-                        Some(read_aggregate_events_response::Payload::Event(event)) => {
+                        Some(follow_aggregate_type_events_response::Payload::Event(event)) => {
                             codec::event_frame(&event).map_err(BackendError::from)
                         }
-                        Some(read_aggregate_events_response::Payload::CaughtUp(_)) => {
+                        Some(follow_aggregate_type_events_response::Payload::CaughtUp(_)) => {
                             Ok(codec::status_frame("caught_up", None))
                         }
-                        Some(read_aggregate_events_response::Payload::Degraded(value)) => Ok(
-                            codec::status_frame("degraded", Some(value.unavailable_source_count)),
-                        ),
-                        Some(read_aggregate_events_response::Payload::Recovered(_)) => {
+                        Some(follow_aggregate_type_events_response::Payload::Degraded(value)) => {
+                            Ok(codec::status_frame(
+                                "degraded",
+                                Some(value.unavailable_source_count),
+                            ))
+                        }
+                        Some(follow_aggregate_type_events_response::Payload::Recovered(_)) => {
                             Ok(codec::status_frame("recovered", None))
                         }
                         None => continue,
@@ -316,7 +428,7 @@ impl EventFsBackend for GrpcBackend {
 
     async fn list_states_page(
         &self,
-        event_set: &EventSet,
+        aggregate_type: &AggregateType,
         page_token: Vec<u8>,
         page_size: u32,
     ) -> BackendResult<StatePage> {
@@ -324,7 +436,7 @@ impl EventFsBackend for GrpcBackend {
             .client
             .clone()
             .list_states(ListAggregateStatesRequest {
-                event_set: Some(event_set.proto()),
+                aggregate_type: Some(aggregate_type.proto()),
                 page_size,
                 page_token,
             })
@@ -341,14 +453,14 @@ impl EventFsBackend for GrpcBackend {
 
     async fn get_state(
         &self,
-        event_set: &EventSet,
+        aggregate_type: &AggregateType,
         aggregate_id: &str,
     ) -> BackendResult<Option<StateDocument>> {
         match self
             .client
             .clone()
             .get_state(GetAggregateStateRequest {
-                event_set: Some(event_set.proto()),
+                aggregate_type: Some(aggregate_type.proto()),
                 aggregate_id: aggregate_id.into(),
             })
             .await
@@ -368,7 +480,7 @@ impl EventFsBackend for GrpcBackend {
 
     async fn put_state(
         &self,
-        event_set: &EventSet,
+        aggregate_type: &AggregateType,
         aggregate_id: &str,
         revision: Option<u64>,
         data: Vec<u8>,
@@ -381,7 +493,7 @@ impl EventFsBackend for GrpcBackend {
             .client
             .clone()
             .put_state(PutAggregateStateRequest {
-                event_set: Some(event_set.proto()),
+                aggregate_type: Some(aggregate_type.proto()),
                 aggregate_id: aggregate_id.into(),
                 expected_revision: Some(ExpectedStateRevision { kind: Some(kind) }),
                 data,
@@ -394,11 +506,11 @@ impl EventFsBackend for GrpcBackend {
         })
     }
 
-    async fn list_groups(&self, event_set: &EventSet) -> BackendResult<Vec<String>> {
+    async fn list_groups(&self, aggregate_type: &AggregateType) -> BackendResult<Vec<String>> {
         Ok(self
             .client
             .clone()
-            .list_groups(event_set.proto())
+            .list_groups(aggregate_type.proto())
             .await?
             .into_iter()
             .map(|group| group.name)
@@ -407,14 +519,14 @@ impl EventFsBackend for GrpcBackend {
 
     async fn create_group(
         &self,
-        event_set: &EventSet,
+        aggregate_type: &AggregateType,
         group_name: &str,
         operation_id: Uuid,
     ) -> BackendResult<()> {
         self.client
             .clone()
             .create_group(CreateAggregateGroupRequest {
-                event_set: Some(event_set.proto()),
+                aggregate_type: Some(aggregate_type.proto()),
                 name: group_name.into(),
                 start: Some(AggregateGroupStart {
                     kind: Some(aggregate_group_start::Kind::Beginning(Empty {})),
@@ -428,14 +540,14 @@ impl EventFsBackend for GrpcBackend {
 
     async fn fetch_group(
         &self,
-        event_set: &EventSet,
+        aggregate_type: &AggregateType,
         group_name: &str,
         consumer_id: &str,
     ) -> BackendResult<FetchAggregateGroupResponse> {
         self.client
             .clone()
             .fetch_group(FetchAggregateGroupRequest {
-                event_set: Some(event_set.proto()),
+                aggregate_type: Some(aggregate_type.proto()),
                 name: group_name.into(),
                 consumer_id: consumer_id.into(),
                 max_events: 128,
@@ -449,7 +561,7 @@ impl EventFsBackend for GrpcBackend {
 
     async fn settle_group(
         &self,
-        event_set: &EventSet,
+        aggregate_type: &AggregateType,
         group_name: &str,
         consumer_id: &str,
         settlements: &[Settlement],
@@ -478,7 +590,7 @@ impl EventFsBackend for GrpcBackend {
         self.client
             .clone()
             .settle_group(SettleAggregateGroupRequest {
-                event_set: Some(event_set.proto()),
+                aggregate_type: Some(aggregate_type.proto()),
                 name: group_name.into(),
                 consumer_id: consumer_id.into(),
                 settlements,
@@ -489,7 +601,7 @@ impl EventFsBackend for GrpcBackend {
 
     async fn renew_group(
         &self,
-        event_set: &EventSet,
+        aggregate_type: &AggregateType,
         group_name: &str,
         consumer_id: &str,
         delivery_ids: Vec<Vec<u8>>,
@@ -497,7 +609,7 @@ impl EventFsBackend for GrpcBackend {
         self.client
             .clone()
             .renew_group(RenewAggregateGroupRequest {
-                event_set: Some(event_set.proto()),
+                aggregate_type: Some(aggregate_type.proto()),
                 name: group_name.into(),
                 consumer_id: consumer_id.into(),
                 delivery_ids,

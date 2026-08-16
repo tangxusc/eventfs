@@ -1,4 +1,4 @@
-//! EventStore 共识层：multi-raft 分片管理与网络通信。
+//! EventFS 共识层：multi-raft Shard 管理与网络通信。
 
 pub mod admin_service;
 pub mod manager;

@@ -9,16 +9,11 @@ use crate::commands::Ctx;
 use crate::output;
 
 /// 目标分片列表：--all-shards 用全部分片，否则单分片（默认 0）
-fn target_shards(
-    ctx: &Ctx,
-    args: &InitArgs,
-) -> impl std::future::Future<Output = Result<Vec<u64>>> {
-    async move {
-        if args.all_shards {
-            Ok(ctx.shards().await?.all_ids())
-        } else {
-            Ok(vec![args.shard.unwrap_or(0)])
-        }
+async fn target_shards(ctx: &Ctx, args: &InitArgs) -> Result<Vec<u64>> {
+    if args.all_shards {
+        Ok(ctx.shards().await?.all_ids())
+    } else {
+        Ok(vec![args.shard.unwrap_or(0)])
     }
 }
 

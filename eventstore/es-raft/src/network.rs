@@ -157,6 +157,7 @@ impl GrpcConnection {
     }
 
     /// 取出（必要时建立）gRPC 客户端
+    #[allow(clippy::result_large_err)]
     fn client<E>(
         &mut self,
     ) -> Result<RaftRpcClient<tonic::transport::Channel>, RPCError<u64, BasicNode, E>>
@@ -392,7 +393,7 @@ mod tests {
         }
     }
 
-    /// 传输链不变量:服务端最大合法 append(单事件 ≤1MiB、批次编码 ≤7MiB)
+    /// 传输链不变量：Aggregate 事件负载的 bincode 编码不超发送预算。
     /// 转换领域模型后 bincode 不超发送预算。
     ///
     /// 该不变量依赖 bincode 默认变长整数编码(bincode 2 standard()):
@@ -400,23 +401,21 @@ mod tests {
     /// 走 SingleEntryTooLarge → Unreachable → 复制停滞——正是本文件要防的故障。
     #[test]
     fn max_legal_append_bincode_within_budget() {
-        use es_core::{ExpectedVersion, Hlc, NewEvent};
+        use es_core::{AggregateTypeId, ExpectedAggregateVersion, Hlc, NewAggregateEvent};
         use es_storage::EsRequest;
 
-        // 6 条 × 1MiB:客户端估算 ≈ 6.3MiB 通过本地检查,服务端 encoded_len
-        // ≈ 6.3MiB ≤ 7MiB 接受(7 条会超 7MiB 被拒,有效上限 6 条)
-        let req = EsRequest::Append {
-            stream_id: "s".to_string(),
-            expected_version: ExpectedVersion::Any,
-            events: vec![
-                NewEvent {
-                    event_id: uuid::Uuid::new_v4(),
-                    event_type: "t".into(),
-                    data: vec![0u8; 1024 * 1024],
-                    metadata: vec![],
-                };
-                6
-            ],
+        let req = EsRequest::AggregateAppend {
+            aggregate_type: AggregateTypeId::new("orders", "order").expect("合法类型"),
+            partition_id: 0,
+            partition_generation: 1,
+            aggregate_id: "order-1".into(),
+            expected_version: ExpectedAggregateVersion::Any,
+            event: NewAggregateEvent {
+                event_id: uuid::Uuid::new_v4(),
+                event_type: "OrderUpdated".into(),
+                data: vec![0u8; 6 * 1024 * 1024],
+                metadata: vec![],
+            },
             hlc: Hlc::now(),
         };
         let payload = bincode::serde::encode_to_vec(&req, bincode::config::standard())

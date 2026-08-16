@@ -1,6 +1,6 @@
 [package]
 name = "es-proto"
-description = "EventStore gRPC 协议定义与生成代码"
+description = "EventFS AggregateStore、Raft 与成员管理 gRPC 契约"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

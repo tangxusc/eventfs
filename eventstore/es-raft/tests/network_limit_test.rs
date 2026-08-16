@@ -15,7 +15,7 @@ use openraft::raft::{AppendEntriesRequest, AppendEntriesResponse};
 use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId, Vote};
 use tokio::net::TcpListener;
 
-use es_core::{ExpectedVersion, Hlc, NewEvent};
+use es_core::{AggregateTypeId, ExpectedAggregateVersion, Hlc, NewAggregateEvent};
 use es_proto::eventstore::raft_rpc_server::{RaftRpc, RaftRpcServer};
 use es_proto::eventstore::{
     RaftAppendEntriesRequest, RaftAppendEntriesResponse, RaftInstallSnapshotRequest,
@@ -112,15 +112,19 @@ fn append_req(entries: usize, data_len: usize) -> AppendEntriesRequest<TypeConfi
         entries: (0..entries as u64)
             .map(|i| Entry {
                 log_id: LogId::new(CommittedLeaderId::new(1, 1), i + 1),
-                payload: EntryPayload::Normal(EsRequest::Append {
-                    stream_id: "s".into(),
-                    expected_version: ExpectedVersion::Any,
-                    events: vec![NewEvent {
+                payload: EntryPayload::Normal(EsRequest::AggregateAppend {
+                    aggregate_type: AggregateTypeId::new("tests", "network-limit")
+                        .expect("合法 AggregateType"),
+                    partition_id: 0,
+                    partition_generation: 0,
+                    aggregate_id: format!("aggregate-{i}"),
+                    expected_version: ExpectedAggregateVersion::Any,
+                    event: NewAggregateEvent {
                         event_id: uuid::Uuid::new_v4(),
                         event_type: "t".into(),
                         data: vec![0u8; data_len],
                         metadata: vec![],
-                    }],
+                    },
                     hlc: Hlc::now(),
                 }),
             })

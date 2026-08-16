@@ -11,10 +11,9 @@ use std::sync::Arc;
 
 use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
 
+use crate::EsStorage;
 use crate::raft_type::TypeConfig;
 use crate::snapshot::SnapshotConfig;
-use crate::{EsRequest, EsStorage};
-use es_core::{ExpectedVersion, NewEvent};
 
 /// 在临时目录建一个存储实例。TempDir 必须由调用方持有，drop 即删目录。
 pub(crate) fn new_storage(shard_id: u64) -> (EsStorage, tempfile::TempDir) {
@@ -69,40 +68,11 @@ pub(crate) fn log_id(term: u64, index: u64) -> LogId<u64> {
     LogId::new(CommittedLeaderId::new(term, 0), index)
 }
 
-/// 构造一条 Append 日志条目
-pub(crate) fn entry(term: u64, index: u64, stream: &str) -> Entry<TypeConfig> {
-    entry_with(term, index, stream, ExpectedVersion::Any, vec![])
-}
-
-/// 造一个新事件
-pub(crate) fn new_event(event_type: &str, data: &[u8]) -> NewEvent {
-    NewEvent {
-        event_id: uuid::Uuid::new_v4(),
-        event_type: event_type.to_string(),
-        data: data.to_vec(),
-        metadata: vec![],
-    }
-}
-
-/// 构造带具体事件与期望版本的日志条目
-pub(crate) fn entry_with(
-    term: u64,
-    index: u64,
-    stream: &str,
-    expected: ExpectedVersion,
-    events: Vec<NewEvent>,
-) -> Entry<TypeConfig> {
+/// 构造一条用于日志存储测试的空日志条目。
+pub(crate) fn entry(term: u64, index: u64, _label: &str) -> Entry<TypeConfig> {
     Entry {
         log_id: log_id(term, index),
-        payload: EntryPayload::Normal(EsRequest::Append {
-            stream_id: stream.to_string(),
-            expected_version: expected,
-            events,
-            hlc: es_core::Hlc {
-                wall: 0,
-                logical: 0,
-            }, // 默认 0，测试里按需覆盖
-        }),
+        payload: EntryPayload::Blank,
     }
 }
 

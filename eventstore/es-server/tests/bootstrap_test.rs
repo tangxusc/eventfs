@@ -2,7 +2,7 @@
 //! 多进程测试一致），但全部在测试进程内运行——默认套件即可执行，且可被
 //! 覆盖率统计（多进程测试的节点进程被 SIGKILL 强杀，LLVM profile 无法落盘）。
 //!
-//! 多进程版自动组建测试见 multi_node_test.rs（`three_node_peers_bootstrap_replicate` 等）。
+//! 本文件覆盖三节点正常、乱序和 TLS 自动组建场景。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -220,10 +220,8 @@ async fn wait_cluster_formed(
                 leader = Some(s.node_id);
             }
         }
-        if formed {
-            if let Some(l) = leader {
-                return l;
-            }
+        if formed && let Some(l) = leader {
+            return l;
         }
         if tokio::time::Instant::now() > deadline {
             panic!("等待集群自动组建超时（{timeout:?}），want_voters={want_voters}");
@@ -437,7 +435,7 @@ async fn inprocess_three_node_https_strict_bootstrap() {
     let _guard = BOOTSTRAP_TEST_LOCK.lock().await;
     init_tracing();
     eprintln!("\n=== 进程内 3 节点全 https（ca_file 严格校验）自动组建 ===");
-    let (nodes, leader, ca_all) = start_https_cluster(true).await;
+    let (nodes, leader, _ca_all) = start_https_cluster(true).await;
     eprintln!("✓ 全 https 严格校验自动组建完成，leader = node{leader}");
 
     // 校验 3 投票成员 + leader 唯一
@@ -461,39 +459,6 @@ async fn inprocess_three_node_https_strict_bootstrap() {
         }
     }
     assert_eq!(leaders.len(), 1, "只能有一个 leader: {leaders:?}");
-
-    // 用 es-client SDK 经 https write_and_read_back（覆盖客户端 API 的 TLS 链路）
-    eprintln!("\n=== es-client 经 https 写读 ===");
-    let leader_addr = nodes[(leader - 1) as usize].addr.clone();
-    let mut client = es_client::EventStoreClient::connect_with_tls(
-        vec![leader_addr],
-        Some(es_client::TlsClientConfig::Ca(ca_all.into_bytes())),
-    )
-    .await
-    .expect("SDK 连接 https 节点");
-
-    use es_proto::eventstore::*;
-    client
-        .append(
-            "tls-strict".to_string(),
-            ExpectedVersion {
-                kind: Some(expected_version::Kind::NoStream(Empty {})),
-            },
-            vec![NewEvent {
-                event_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
-                event_type: "E".to_string(),
-                data: b"via-tls".to_vec(),
-                metadata: vec![],
-            }],
-        )
-        .await
-        .expect("https 写入");
-    let events = client
-        .read_stream("tls-strict".to_string(), 0, 0, Direction::Forward)
-        .await
-        .expect("https 读取");
-    assert_eq!(events[0].data, b"via-tls");
-    eprintln!("✓ es-client 经 https 写读成功");
 }
 
 #[tokio::test]

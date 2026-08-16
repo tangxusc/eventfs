@@ -1,300 +1,183 @@
-# esctl：EventStore 命令行管理工具
+# esctl 手册
 
-`esctl` 是参照 [etcdctl](https://etcd.io/docs/latest/etcdctl/) 的 EventStore 管理工具，
-独立二进制（workspace 成员 `es-ctl`），覆盖数据面读写、订阅、集群组建与管理、
-端点健康、在线迁移、快照、持久化拉取订阅和 AggregateStore。
+`esctl` 管理 AggregateStore、Raft 成员和离线快照。全局参数必须位于子命令之前。
 
-## 构建
-
-```bash
-cargo build --bin esctl
-./target/debug/esctl --help
+```text
+esctl [GLOBAL_OPTIONS] <COMMAND>
 ```
 
-## 全局参数（位于子命令之前）
+## 全局参数
 
-| 参数 | 默认 | 说明 |
+| 参数 | 默认值 | 说明 |
 |---|---|---|
-| `--endpoints <ADDRS>` | `http://127.0.0.1:50051` | 集群节点 gRPC 地址列表，逗号分隔；裸地址自动补 `http://` 前缀 |
-| `--dial-timeout <SECS>` | 5 | 建立连接的超时时间（秒） |
-| `--timeout <SECS>` | 10 | 单次 RPC 请求超时（秒），0 表示不设；watch 长连接不受影响 |
-| `--cacert <FILE>` | 无 | 严格校验服务端证书的 CA 文件（PEM）；与 `--insecure-skip-tls-verify` 互斥；仅 https 端点生效 |
-| `--insecure-skip-tls-verify` | false | 跳过 https 端点证书校验（自签友好，默认行为）；仅 https 端点生效 |
-| `-w, --write-out <FMT>` | simple | 输出格式：`simple`（逐行文本）/ `table`（对齐表格）/ `json`（结构化） |
-| `--shards <N>` | 自动探测 | 分片范围：显式指定时 = `0..N`（不触网）；缺省时逐端点 `ListShards` 取**并集**（节点只承载放置表分配的部分分片，旧「GetRaftState 连续扫描」在部分承载布局下会误探到 0）；探测失败回退默认 8 并告警 |
+| `--endpoints <A,B>` | `http://127.0.0.1:50051` | 候选节点，逗号分隔 |
+| `--dial-timeout <S>` | 5 | 建连超时 |
+| `--timeout <S>` | 10 | 单次 RPC 超时，0 表示不限时 |
+| `--cacert <PEM>` | 无 | HTTPS CA，和跳过验证互斥 |
+| `--insecure-skip-tls-verify` | false | 跳过 HTTPS 校验 |
+| `-w, --write-out <FORMAT>` | `simple` | `simple` / `table` / `json` |
+| `--shards <N>` | 自动探测 | 集群 Shard 总数 |
 
-退出码：**0** 成功 / **1** 运行时失败（连接失败、无 leader、乐观并发冲突等）/ **2** 参数错误（clap）。
+## 命令树
 
-## 命令一览
-
-### 数据面
-
-```
-esctl append <STREAM> --event-type <TYPE> (--data <STR> | --data-file <PATH>)
-       [--metadata <STR> | --metadata-file <PATH>] [--event-id <UUID>]
-       [--expected-version any|nostream|exists|<N>]
-```
-
-每次写入 1 条事件。`--event-id` 缺省随机生成 v4（幂等去重依赖它）。`--expected-version`
-默认 `any`：`nostream` 要求流不存在（首次创建），`exists` 要求已存在，数字为精确版本。
-期望版本冲突时报错并退出码 1。
-
-```
-esctl create-stream <STREAM>
+```text
+esctl init
+esctl member add|remove|list
+esctl status
+esctl snapshot list|restore
+esctl aggregate capabilities
+esctl aggregate type register|list|get
+esctl aggregate append
+esctl aggregate follow
+esctl aggregate state list|get|put
+esctl aggregate group create|update|delete|list|fetch|settle
+esctl aggregate status
+esctl aggregate partitions
 ```
 
-显式创建流：服务端分配 shard（大致最少流）并记录路由表，返回 `shard_id` 与
-目标分片 leader 地址（尽力探测，未知为空串）。幂等：流已存在时返回现有归属
-（`exists=true`），不重复分配。**append 未知名流会隐式建流**（服务端分配并
-记录归属），但读（`read`/`meta`）未创建流返回 NotFound（显式分配语义）。
-预显示的「路由分片」仅为提示，以服务端落盘归属为准。
+不存在通用 append/read/watch/meta、persistent、route 或 migrate 命令。
 
-```
-esctl read <STREAM> [--from-version <N=0>] [--max-count <N=0>] [--backward]
-esctl readall [--from-position <N=0>] [--from-positions <"shard:pos,...">]
-       [--max-count <N=0>] [--backward] [--shard-ids <"0,1,3">]
-esctl meta <STREAM>
-```
-
-- `read` 与 `readall` 走本地副本，follower 也可读（任一可达端点即可）
-- `read` 读未创建（路由表无记录）的流 → NotFound（退出码 1）；`meta` 读未创建流 → `exists: false`（退出码 0）
-- `--max-count 0` 表示不限量；`--backward` 反向读，未指定 `--from-version` 时从最新开始
-- `readall` 的 `--from-positions` 非空时覆盖 `--from-position` 与 `--shard-ids`；
-  `--max-count` 取满时输出下一页续读游标（json 为 `next_from_positions` 字段，
-  simple/table 为 stderr 提示行）。**续读游标由服务端驱动**（覆盖全部分片，
-  本页被跨分片归并丢弃的分片也会推进），把提示的游标原样传给 `--from-positions`
-  即续读——不要自行从本页事件推算游标，页内缺失分片的事件会永久读不到
-- **反向终止**：`--backward` 反向读到分片最早事件（position 0）后，该分片游标
-  带 `ended` 标记（已读尽，不再出现在续读提示中）；继续翻页会得到空页
-  ——**空页即终止**，正反两个方向一致
-- 事件行格式（simple）：`{version}\t{RFC3339}\t[{event_type}]\t{data}`，
-  data 非 UTF-8 时输出 `hex:..`
-
-### 订阅
-
-```
-esctl watch --stream <STREAM> [--stream <STREAM>...] [--once]
-esctl watch --all [--once]
-```
-
-先补齐历史（catch-up），追平后显示「已追平，进入实时推送」并转为实时推送。
-`--once` 追平即退出（退出码 0），供脚本与测试使用；不带 `--once` 持续运行，Ctrl-C 终止。
-客户端订阅只面向 stream：可重复 `--stream` 建立多流聚合订阅，或用 `--all` 订阅
-当前集群全部 stream；二者互斥。分片路由、跨节点转发和聚合均由服务端处理，订阅输出
-不含 shard 或分片 position。`--all` 会自动纳入订阅建立后在既有 shard 上新建并写入的
-stream。跨 stream 不承诺顺序，但每个 stream 内 version 严格有序。
-
-服务端任一内部来源不可用或中断时会输出 `degraded` 状态，仍继续转发健康来源；`--once`
-在发生降级时以退出码 1 结束，避免把不完整的 catch-up 误判为成功。
-
-### 持久化拉取订阅
-
-```bash
-esctl persistent create <GROUP> (--stream <STREAM>... | --all) [--now]
-       [--next <STREAM=VERSION>] [--max-unacked-per-consumer <N>]
-esctl persistent update <GROUP> --expected-revision <REV>
-       [--stream <STREAM>... | --all] [--reset <STREAM=beginning|now|VERSION>]
-esctl persistent get <GROUP>
-esctl persistent list
-esctl persistent delete <GROUP> --expected-revision <REV>
-
-esctl persistent fetch <GROUP> --consumer <ID>
-       [--max-events <N=100>] [--max-bytes <N=4194304>] [--wait-ms <N=15000>]
-esctl persistent settle <GROUP> --consumer <ID> --epoch <EPOCH>
-       --delivery <UUID> --action <ack|retry|park|skip> [--reason <TEXT>]
-esctl persistent parked <GROUP> [--offset <N>] [--limit <N=100>]
-esctl persistent replay <GROUP>
-```
-
-`fetch` 是 unary long-poll，不在 CLI 中后台预取。响应中的 `delivery` 与 `epoch` 必须原样
-用于 `settle`；服务端同时按请求条数/字节预算、单 consumer 未确认额度和全组未确认额度
-施加背压。未确认 delivery 在 ack timeout 后退避重投，超过重试次数进入 parked。
-`retry` 保留 checkpoint，`park`/`skip`/`ack` 解决主队列位置；parked 重放可能晚于更新事件，
-响应以 `replayed=true` 标识。组更新和删除使用 revision CAS，reset 必须逐 Stream 显式给起点。
-
-### AggregateStore
+## 聚合类型
 
 ```bash
 esctl aggregate capabilities
-esctl aggregate create <BUSINESS_SPACE> <AGGREGATE_TYPE> [--operation-id <UUID>]
-esctl aggregate list
-esctl aggregate get <BUSINESS_SPACE> <AGGREGATE_TYPE>
-esctl aggregate append <BUSINESS_SPACE> <AGGREGATE_TYPE> <AGGREGATE_ID> \
-  --event-type <TYPE> (--data <JSON> | --data-file <PATH>) \
-  [--expected-version any|no-aggregate|exists|<N>] [--event-id <UUID>]
-esctl aggregate follow <BUSINESS_SPACE> <AGGREGATE_TYPE> [--now | --cursor <HEX>] [--once]
-
-esctl aggregate state list <BUSINESS_SPACE> <AGGREGATE_TYPE> [--page-size <N>] [--page-token <HEX>]
-esctl aggregate state get <BUSINESS_SPACE> <AGGREGATE_TYPE> <AGGREGATE_ID>
-esctl aggregate state put <BUSINESS_SPACE> <AGGREGATE_TYPE> <AGGREGATE_ID> \
-  (--data <JSON> | --data-file <PATH>) --expected-revision absent|<N>
-
-esctl aggregate group create <BUSINESS_SPACE> <AGGREGATE_TYPE> <GROUP> [--now]
-esctl aggregate group update <BUSINESS_SPACE> <AGGREGATE_TYPE> <GROUP> \
-  --expected-revision <REV> [--reset-beginning | --reset-now]
-esctl aggregate group delete <BUSINESS_SPACE> <AGGREGATE_TYPE> <GROUP> \
-  --expected-revision <REV>
-esctl aggregate group list <BUSINESS_SPACE> <AGGREGATE_TYPE>
-esctl aggregate group fetch <BUSINESS_SPACE> <AGGREGATE_TYPE> <GROUP> \
-  --consumer <ID> [--max-events <N>] [--max-bytes <N>] [--wait-ms <N>]
-esctl aggregate group settle <BUSINESS_SPACE> <AGGREGATE_TYPE> <GROUP> \
-  --consumer <ID> --delivery <HEX> --action ack|retry|park|skip [--reason <TEXT>]
-
+esctl aggregate type register orders order [--operation-id UUID]
+esctl aggregate type list
+esctl aggregate type get orders order
 esctl aggregate status
-esctl aggregate partitions <BUSINESS_SPACE> <AGGREGATE_TYPE>
+esctl aggregate partitions orders order
 ```
 
-事件集只按 `(business_space, aggregate_type)` 建立，聚合实例 ID 位于事件内容或状态路径中。
-同一实例使用 `aggregate_version` 做 OCC，不同实例不共享版本。`follow` 的 cursor 和消费者组
-`delivery` 都是不透明十六进制 token，只能原样回传。组 settings 更新只增加 revision；只有
-`--reset-beginning` 或 `--reset-now` 才提升 epoch 并使旧 delivery 失效。模糊重试 create、update
-或 delete 时应显式复用同一个 `--operation-id`。
+`register` 等待 256 个虚拟分区激活后返回。自动生成的 operation UUID 会显示在输出中；
+若命令结果未知，手工重试必须通过 `--operation-id` 复用原值。
 
-### 管理面
+`partitions` 是运维诊断接口，会显示内部 Shard placement 和 generation。业务客户端不能
+缓存这些值做路由。
 
-```
-esctl init [--shard <N> | --all-shards] --member <ID@ADDR>... [--yes]
-esctl member add [--shard <N> | --all-shards] --member <ID@ADDR>
-       [--no-blocking] [--learner-only]
-esctl member remove [--shard <N> | --all-shards] --node-id <ID> [--retain]
-esctl member list [--shards <N>]
-```
-
-- **每个分片是独立的 Raft group**：多分片集群必须对每个分片各自执行。
-  `--all-shards` 对全部分片执行相同操作（分片数来自 `--shards`/自动探测）
-- `init`：把给定成员写入首条 membership 日志，只需在一个节点调用一次；
-  initialize 不需要 leader；已初始化的分片报错（退出码 1）。
-  `--all-shards` 遇已初始化的分片**告警后继续补完其余分片**，最后整体报错
-- `member add`：先加为 learner（默认等待追平，`--no-blocking` 关闭），
-  再 `change_membership` 提升为投票成员；`--learner-only` 只加 learner 不提升。
-  `change_membership` 携带 CAS 期望快照（当前 voters 集合）：读-改-写窗口内
-  并发变更会使后到者返回 `FailedPrecondition`，esctl 自动重读重试
-- `member remove`：从投票成员中移除；`--retain` 降级为 learner 而非剔除。
-  **learner 无法移除**（RaftAdmin 无 remove_learner RPC）；目标不在 voters 时校验失败
-- `member list`：遍历 0..N × `--endpoints` 聚合 `GetRaftState`；
-  全部端点不可达时退出码 1（不把网络故障误报为"未初始化"）。
-  已知限制：RPC 不暴露成员地址与 learner 集合，故无地址列、无 learner 行
-
-### 端点健康
-
-```
-esctl status [--shards <N>]
-```
-
-对每个端点遍历全部分片探测 `GetRaftState`，输出可达性、leader 归属（leader_of /
-following_of）与 term。全部端点不可达时退出码 1。
-
-### 离线快照（snapshot list / restore）
-
-```
-esctl snapshot list <data_dir> [--snapshot-dir <DIR>]
-esctl snapshot restore <data_dir> <snapshot_file> [--snapshot-dir <DIR>] [--yes]
-```
-
-快照存独立文件（`{data_dir}/snapshots/snap-{shard}-{term}-{index}.esnap`，zstd/lz4 压缩）。
-`--snapshot-dir` 缺省 `{data_dir}/snapshots`；服务端配置了 `[snapshot].dir`
-自定义目录时须显式传入（否则 CLI 与服务器的快照视图不一致）。
-
-- **list**：列出全部快照文件（分片 / term / index / snapshot_id / 压缩算法 / 体积），
-  只读文件头不解压 payload；损坏文件标记「损坏」不中断。目录不存在时报错。
-- **restore**：把快照恢复到数据目录中对应分片（快照头记录分片号）。
-  **离线操作**：要求集群完全停机（LOCK 安全网，在线执行直接拒绝，退出码 1）；
-  非 `--yes` 时交互确认。恢复语义：该分片回到快照时刻——清空日志与状态机
-  （保留 vote），`raft_last_purged`/`raft_committed` 写回快照点，重启后以快照点
-  继续参与集群（单节点直接恢复领导；多节点由 leader 复制快照点之后的日志或新快照）。
-  与 etcd `snapshot restore` 等价但作用于单分片。
-
-### 流路由表
-
-```
-esctl route [--show] [--recount] [--check]
-```
-
-查看/校准流路由表（stream → shard 归属）。
-
-- 默认展示路由表：逐条 `stream -> shard N` + 表版本（`version=N`）；
-  json 格式含 `streams` 与 `shard_stream_counts`
-- `--recount`：校准 per-shard 流计数（从路由表重建，**版本 +1 并广播**——否则校准只对本节点生效），并输出校准后的表
-- `--check`（与 `--recount` 互斥）：**孤儿流检测**——枚举各分片实际存储的流
-  （`ListStreams`，打各 shard leader）与路由表对比：
-  - **孤儿**：存储中有但路由表无记录（隐式建流跨节点竞态等残留），
-    可用 `migrate --stream <s> --to <shard>` 合并修复
-  - **虚挂**：路由表指向的分片与存储实际所在不一致（迁移切换后未收敛或
-    路由表手工编辑出错），指向的写入会 NotFound
-
-### 在线迁移（取代旧 reshard）
-
-```
-esctl migrate (--stream <STREAM> | --shard <N>) --to <M>
-       [--dry-run] [--drain-quiet-rounds <N=2>] [--drain-timeout-secs <S=300>]
-```
-
-在线迁移流到目标分片，**流的数据处理不暂停**。`--stream` 迁移单个流；
-`--shard` 批量迁移整个分片的全部流（逐流独立状态机，失败隔离——失败的流
-可单独重跑，其余不受影响）。`--to` 目标分片；源与目标相同报错。
-`--dry-run` 只报告迁移计划与版本差，不执行。排水收敛判据 = 目标版本 ≥ 源版本
-且源连续 `--drain-quiet-rounds` 次（间隔 2s）无新增；超过
-`--drain-timeout-secs`（默认 300s）退出（数据无害，可重跑完成排水）。
-
-状态机 `Preparing → FullCopying → Tailing → Switching → Draining → Verifying → Finalizing`；
-切换点（SetStreamShard）后客户端新写直达目标，收敛后校验失败自动回切路由。
-复制按「目标当前版本」读源补差（Exact 版本链写目标，幂等索引防重放），
-**断点续传天然成立，重复执行无害**。完成后建议 `esctl route recount` 校准流计数。
-完整设计见 [migrate.md](migrate.md)。
-
-## 输出格式
-
-`-w simple`（默认）逐行文本；`-w table` 对齐表格（示例）：
-
-```
-$ esctl -w table member list
-SHARD  NODE  STATE     TERM  LEADER  LAST_APPLIED  VOTER
-0      1     Leader    3     1       128           yes
-0      2     Follower  3     1       128           yes
-```
-
-`-w json` 结构化输出，便于脚本解析（`jq` 等）。
-
-## 连接与 leader 发现策略
-
-- **连接**：端点归一化（裸地址补 `http://`，与节点间 Raft 网络同一规则）、
-  TLS 装配（`--cacert` 严格校验 / 默认跳过校验，仅 https 生效）、按端点惰性建连并缓存。
-  单个端点**建连失败会故障转移到下一个端点**（不会中止整个命令）
-- **数据面写**（append）：依序尝试各端点（轮询起点分散负载）→ 非 leader 返回
-  `Unavailable` 且 message 带 `leader_addr` 时优先重定向该地址 →
-  `leader unknown`（选举中）退避重试并轮换其它端点 → 乐观冲突（`FailedPrecondition`）
-  原样上抛。已知限制：openraft 不总填充 `leader_node` 信息（`leader_addr=` 为空），
-  此时无法重定向，靠端点列表轮换兜底——多端点部署建议 `--endpoints` 给出全部节点
-- **管理面写**（member add/remove）：管理面错误不带 leader 提示，先对每个端点
-  `GetRaftState` 找 `is_leader` 的端点再执行；leader 探测失败（选举中/端点不可达）
-  与 RPC 失败都重试，最多 3 轮（分片未初始化是永久错误，直接返回）
-- **读**（read/readall/meta）：任一可达端点即可
-
-## 与 etcdctl 对应关系
-
-| etcdctl | esctl | 说明 |
-|---|---|---|
-| `put` / `get` | `append` / `read` | 事件写读（带期望版本） |
-| `watch` | `watch` | 订阅（catch-up → live） |
-| `--endpoints` / `-w` / `--dial-timeout` | 同左 | 全局参数对齐 |
-| `member list` / `member add/remove` | `member list` / `member add/remove` | 成员管理（esctl 按分片） |
-| `endpoint health` / `endpoint status` | `status` | 端点健康视图 |
-| `snapshot save` | `snapshot list` | 快照已存独立文件，list 查看后可自行备份/拷贝 |
-| `snapshot restore` | `snapshot restore` | 离线恢复到快照点（作用于单分片，需停机） |
-| `auth enable` / `user add` 等 | — | eventstore 无认证机制 |
-
-## 测试
+## 追加事件
 
 ```bash
-# 默认套件（单测 + 进程内 e2e + 在线迁移 e2e）
-cargo test -p es-ctl --locked
-
-# 三节点真实进程组建（需先 cargo build --bin eventstored；串行）
-cargo test -p es-ctl --test multi_node_test -- --ignored --test-threads=1
+esctl aggregate append <BUSINESS_SPACE> <AGGREGATE_TYPE> <AGGREGATE_ID> \
+  --event-type <TYPE> \
+  (--data <JSON> | --data-file <PATH>) \
+  [--metadata <JSON>] \
+  [--event-id <UUID>] \
+  [--expected-version any|no-aggregate|exists|N]
 ```
 
-覆盖率（行/分支 ≥80%）验收：
+示例：
 
 ```bash
-cargo llvm-cov -p es-ctl --branch
+esctl aggregate append orders order order-42 \
+  --event-type OrderPlaced \
+  --data '{"sku":"A-1","quantity":2}' \
+  --expected-version no-aggregate
 ```
+
+成功输出新 `aggregate_version`。同一 event ID 和完整请求可安全重试；复用 ID 但改变事件
+类型、data、metadata、聚合身份或期望版本会返回幂等冲突。
+
+## 跟随类型级事件
+
+```bash
+esctl aggregate follow orders order
+esctl aggregate follow orders order --now
+esctl aggregate follow orders order --cursor <HEX>
+esctl aggregate follow orders order --once
+```
+
+默认从 Beginning 开始。`--now` 从连接时各分区 head 开始；`--cursor` 使用前次 frame 输出
+的十六进制 opaque cursor。`--once` 在收到 `caught_up` 后退出。
+
+输出事件包含 `aggregate_id`、`aggregate_version`、event ID、类型、data、metadata、HLC 和
+cursor。不同实例之间的输出顺序不是全序。出现 `degraded` 时不应丢弃最后 cursor；恢复后
+会出现 `recovered`。
+
+## 状态文档
+
+```bash
+esctl aggregate state list orders order [--page-size 100] [--page-token HEX]
+esctl aggregate state get orders order order-42
+esctl aggregate state put orders order order-42 \
+  (--data <JSON> | --data-file <PATH>) \
+  [--expected-revision absent|N]
+```
+
+首次创建使用 `absent`，覆盖使用当前 revision。成功返回新 revision 和服务端修改时间。
+列表 token 只允许原样传回，不能跨聚合类型使用。
+
+## 消费者组
+
+创建和管理：
+
+```bash
+esctl aggregate group create orders order projector [--now] [SETTINGS]
+esctl aggregate group update orders order projector \
+  --expected-revision 1 [--reset-beginning|--reset-now] [SETTINGS]
+esctl aggregate group delete orders order projector --expected-revision 2
+esctl aggregate group list orders order
+```
+
+可选设置：
+
+```text
+--max-unacked-per-consumer N
+--max-unacked-per-group N
+--ack-timeout-ms N
+--max-retries N
+--retry-min-ms N
+--retry-max-ms N
+```
+
+消费与结算：
+
+```bash
+esctl aggregate group fetch orders order projector \
+  --consumer worker-1 --max-events 100 --max-bytes 4194304 --wait-ms 15000
+
+esctl aggregate group settle orders order projector \
+  --consumer worker-1 --delivery <HEX> --action ack
+```
+
+`--action` 可为 `ack`、`retry`、`park`、`skip`；Retry/Park 可加 `--reason`。delivery token
+是不透明且有租约的，必须由 Fetch 使用的同一 consumer 结算。CLI 暂不暴露 renew，长期
+处理应使用 Rust SDK 或 protobuf API。
+
+## 集群管理
+
+手工初始化：
+
+```bash
+esctl init --shard 0 \
+  --member 1@node1:50051 --member 2@node2:50052 --member 3@node3:50053 --yes
+esctl --shards 8 init --all-shards --member 1@node1:50051 --yes
+```
+
+成员与状态：
+
+```bash
+esctl member add --shard 0 --member 4@node4:50054 --promote
+esctl member remove --shard 0 --node-id 2
+esctl member list
+esctl status
+```
+
+`member add` 先添加 learner，再按参数提升。成员变更使用当前 voter 集合做 CAS；并发冲突
+时命令重读后再决定是否重试。
+
+## 快照
+
+```bash
+esctl snapshot list <DATA_DIR> [--snapshot-dir PATH]
+esctl snapshot restore <DATA_DIR> <SNAPSHOT_FILE> [--snapshot-dir PATH] [--yes]
+```
+
+快照命令直接访问本地文件，restore 必须停机。详见 [snapshot.md](snapshot.md)。
+
+## 输出、重试与退出
+
+- `simple` 面向交互，`table` 面向检查，`json` 面向自动化。
+- 官方客户端会尝试 leader hint 和候选端点；Append 依赖 event ID 幂等，catalog 写依赖
+  operation ID 幂等。
+- OCC/CAS、非法参数和幂等冲突不会自动改写请求重试。
+- 非零退出表示参数、连接或服务端错误；脚本应解析 JSON 输出而不是人类文本。

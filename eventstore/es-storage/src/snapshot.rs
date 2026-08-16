@@ -367,6 +367,7 @@ pub fn for_each_record<R: Read>(
 ///
 /// - temp=true：incoming 临时文件（begin_receiving_snapshot 创建，install 成功后转正）
 /// - temp=false：正式快照文件（build 产物，或已转正）
+///
 /// Drop 时若仍为 temp 则删除——传输中断、被新流替换时自动清理残留。
 pub struct SnapshotFile {
     inner: tokio::fs::File,
@@ -614,10 +615,7 @@ impl SnapshotStore {
                 mtime: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
                 valid: false,
             };
-            match std::fs::File::open(&path)
-                .map_err(io::Error::from)
-                .and_then(|mut f| read_header(&mut f))
-            {
+            match std::fs::File::open(&path).and_then(|mut f| read_header(&mut f)) {
                 Ok((header, meta)) => {
                     entry.header = Some(header);
                     entry.meta = Some(meta);
@@ -655,14 +653,14 @@ impl SnapshotStore {
             };
             // 领先于 applied 的快照跳过（restore/崩溃残留）。applied 为 None
             // 不过滤：启动恢复场景（如刚装快照的新节点）正需要返回快照。
-            if let (Some(a), Some(m)) = (applied, meta.last_log_id) {
-                if (m.leader_id.term, m.index) > (a.leader_id.term, a.index) {
-                    tracing::warn!(
-                        "跳过领先于 applied 的快照 {}（残留的更新文件，状态机不一致）",
-                        entry.path.display()
-                    );
-                    continue;
-                }
+            if let (Some(a), Some(m)) = (applied, meta.last_log_id)
+                && (m.leader_id.term, m.index) > (a.leader_id.term, a.index)
+            {
+                tracing::warn!(
+                    "跳过领先于 applied 的快照 {}（残留的更新文件，状态机不一致）",
+                    entry.path.display()
+                );
+                continue;
             }
             let (term, index) = match meta.last_log_id {
                 Some(l) => (l.leader_id.term, l.index),
@@ -797,6 +795,7 @@ mod tests {
     }
 
     /// 从快照文件读回 (header, meta, entries)；自动校验 payload_len 与 end_marker
+    #[allow(clippy::type_complexity)]
     fn read_snap_file(
         path: &Path,
     ) -> (
@@ -833,7 +832,7 @@ mod tests {
             let big: Vec<(Vec<u8>, Vec<u8>)> = (0..500u64)
                 .map(|i| {
                     (
-                        format!("stream-{i}").into_bytes(),
+                        format!("aggregate-{i}").into_bytes(),
                         format!("payload-payload-payload-{i}").into_bytes(),
                     )
                 })
@@ -1330,6 +1329,70 @@ mod tests {
                 .contains("-00000000000000000100.esnap")
         );
     }
+
+    #[tokio::test]
+    async fn offline_restore_replaces_shard_and_handles_same_file() {
+        let root = tempfile::tempdir().expect("临时根目录");
+        let data_dir = root.path().join("data");
+        let snapshot_dir = root.path().join("snapshots");
+        std::fs::create_dir_all(&snapshot_dir).expect("创建快照目录");
+        let source = root
+            .path()
+            .join("snap-00000000-00000000000000000003-00000000000000000009.esnap");
+        let aggregate_type = es_core::AggregateTypeId::new("orders", "order").unwrap();
+        let event_key = crate::key::sm_aggregate_event(0, &aggregate_type, 7, "order-1", 0);
+        let entries = vec![
+            (event_key.clone(), b"event".to_vec()),
+            (
+                crate::key::sm_aggregate_state(0, &aggregate_type, 7, "order-1"),
+                b"state".to_vec(),
+            ),
+        ];
+        write_snap_file(&source, Compression::None, 3, 9, &entries);
+        let old =
+            snapshot_dir.join("snap-00000000-00000000000000000001-00000000000000000001.esnap");
+        write_snap_file(&old, Compression::None, 1, 1, &[]);
+
+        let tree = std::sync::Arc::new(
+            surrealkv::TreeBuilder::new()
+                .with_path(data_dir)
+                .build()
+                .expect("打开恢复 tree"),
+        );
+        let report = restore(tree.clone(), 0, &source, &snapshot_dir)
+            .await
+            .expect("离线恢复");
+        assert_eq!((report.term, report.index, report.events), (3, 9, 1));
+        assert!(!old.exists(), "旧快照应被清理");
+        {
+            let transaction = tree.begin().expect("开启读取事务");
+            assert_eq!(
+                transaction
+                    .get(event_key.clone())
+                    .expect("读取恢复事件")
+                    .map(|value| value.to_vec()),
+                Some(b"event".to_vec())
+            );
+        }
+        assert_eq!(
+            restore(tree.clone(), 0, &report.snapshot_file, &snapshot_dir)
+                .await
+                .expect("从规范位置重复恢复")
+                .snapshot_file,
+            report.snapshot_file,
+            "源与目标相同时不得截断快照"
+        );
+
+        let wrong_shard = root
+            .path()
+            .join("snap-00000001-00000000000000000003-00000000000000000009.esnap");
+        write_snap_file(&wrong_shard, Compression::None, 3, 9, &[]);
+        let error = restore(tree.clone(), 0, &wrong_shard, &snapshot_dir)
+            .await
+            .expect_err("跨分片恢复必须拒绝");
+        assert!(matches!(error, es_core::Error::InvalidInput(_)));
+        tree.close().await.expect("关闭恢复 tree");
+    }
 }
 
 /// 离线恢复报告
@@ -1490,8 +1553,8 @@ pub async fn restore(
     let mut events = 0usize;
     let mut total = 0usize;
     let read_bytes = for_each_record(&mut reader, |k, v| {
-        // 统计事件条数：key = [0x02][shard][0x01]... 的事件本体
-        if k.len() >= 10 && k[0] == 0x02 && k[9] == 0x01 {
+        // 统计 Aggregate 事件本体；具体 tag 布局由 key 模块统一维护。
+        if key::is_aggregate_event_key(shard_id, &k) {
             events += 1;
         }
         total += 1;

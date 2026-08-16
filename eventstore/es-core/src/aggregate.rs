@@ -1,4 +1,4 @@
-//! AggregateStore 领域模型：事件集、实例版本、虚拟分区与业务状态。
+//! AggregateStore 领域模型：聚合类型、实例版本、虚拟分区与业务状态。
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -10,7 +10,7 @@ use xxhash_rust::xxh3::Xxh3;
 
 use crate::{Hlc, Result};
 
-/// 首期事件集固定使用的虚拟事件分区数。
+/// 每个聚合类型固定使用的虚拟事件分区数。
 pub const EVENT_PARTITION_COUNT: u16 = 256;
 
 const MAX_IDENTIFIER_BYTES: usize = 128;
@@ -47,19 +47,19 @@ pub fn validate_aggregate_identifier(kind: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// 聚合类型事件集身份，由业务空间和聚合根类型共同构成。
+/// 聚合类型身份，由业务空间和聚合根类型共同构成。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct EventSetId {
+pub struct AggregateTypeId {
     business_space: String,
     aggregate_type: String,
 }
 
-impl EventSetId {
-    /// 构造并校验事件集身份。
+impl AggregateTypeId {
+    /// 构造并校验聚合类型身份。
     ///
     /// - `business_space`：业务空间，例如 `orders`。
     /// - `aggregate_type`：聚合根类型，例如 `order`。
-    /// - 返回：合法的事件集身份。
+    /// - 返回：合法的聚合类型身份。
     /// - 错误：任一段不符合公共标识符规则时返回 `InvalidInput`。
     pub fn new(
         business_space: impl Into<String>,
@@ -75,7 +75,7 @@ impl EventSetId {
         })
     }
 
-    /// 重新校验从持久化或网络反序列化得到的事件集身份。
+    /// 重新校验从持久化或网络反序列化得到的聚合类型身份。
     ///
     /// - 返回：两段均符合公共标识符规则时为 `Ok(())`。
     /// - 错误：发现旧数据或恶意输入绕过构造器时返回 `InvalidInput`。
@@ -100,23 +100,23 @@ impl EventSetId {
     }
 }
 
-impl fmt::Display for EventSetId {
+impl fmt::Display for AggregateTypeId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}/{}", self.business_space, self.aggregate_type)
     }
 }
 
-impl FromStr for EventSetId {
+impl FromStr for AggregateTypeId {
     type Err = crate::Error;
 
-    /// 从严格的 `business_space/aggregate_type` 形式解析事件集身份。
+    /// 从严格的 `business_space/aggregate_type` 形式解析聚合类型身份。
     fn from_str(value: &str) -> Result<Self> {
         let mut parts = value.split('/');
         let business_space = parts.next().unwrap_or_default();
         let aggregate_type = parts.next().unwrap_or_default();
         if parts.next().is_some() || business_space.is_empty() || aggregate_type.is_empty() {
             return Err(crate::Error::InvalidInput(
-                "事件集身份必须是 business_space/aggregate_type".into(),
+                "聚合类型身份必须是 business_space/aggregate_type".into(),
             ));
         }
         Self::new(business_space, aggregate_type)
@@ -133,9 +133,9 @@ pub enum EventPartitionHash {
 impl EventPartitionHash {
     /// 为聚合实例计算稳定的虚拟事件分区。
     ///
-    /// - `seed`：事件集创建时持久化的 128 位随机种子。
+    /// - `seed`：聚合类型注册时持久化的 128 位随机种子。
     /// - `aggregate_id`：聚合根实例 ID。
-    /// - `partition_count`：事件集不可变分区数。
+    /// - `partition_count`：聚合类型不可变分区数。
     /// - 返回：`0..partition_count` 内的分区编号。
     /// - 错误：实例 ID 非法或分区数为零时返回 `InvalidInput`。
     pub fn partition(
@@ -174,7 +174,7 @@ pub struct NewAggregateEvent {
 /// 已持久化的聚合事件。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregateEvent {
-    pub event_set: EventSetId,
+    pub aggregate_type: AggregateTypeId,
     pub partition_id: u16,
     pub aggregate_id: String,
     pub aggregate_version: u64,
@@ -245,11 +245,11 @@ pub struct AggregateAppendResult {
 
 /// 计算追加请求的稳定幂等指纹。
 ///
-/// - 参数包含事件集、实例、期望版本和完整事件内容。
+/// - 参数包含聚合类型、实例、期望版本和完整事件内容。
 /// - 返回：基于 XXH3-128 的稳定指纹，用于识别同一 `event_id` 的内容冲突。
 /// - 错误：本函数不失败；调用方仍须独立校验公共输入。
 pub fn aggregate_append_fingerprint(
-    event_set: &EventSetId,
+    aggregate_type: &AggregateTypeId,
     aggregate_id: &str,
     expected: ExpectedAggregateVersion,
     event: &NewAggregateEvent,
@@ -260,8 +260,8 @@ pub fn aggregate_append_fingerprint(
     }
 
     let mut hasher = Xxh3::new();
-    update_bytes(&mut hasher, event_set.business_space().as_bytes());
-    update_bytes(&mut hasher, event_set.aggregate_type().as_bytes());
+    update_bytes(&mut hasher, aggregate_type.business_space().as_bytes());
+    update_bytes(&mut hasher, aggregate_type.aggregate_type().as_bytes());
     update_bytes(&mut hasher, aggregate_id.as_bytes());
     match expected {
         ExpectedAggregateVersion::Any => hasher.update(&[0]),
@@ -279,11 +279,11 @@ pub fn aggregate_append_fingerprint(
     hasher.digest128()
 }
 
-/// 聚合类型事件集生命周期。
+/// 聚合类型生命周期。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EventSetStatus {
+pub enum AggregateTypeStatus {
     /// catalog 已提交，所有分区 fence 尚未确认安装。
-    Creating,
+    Registering,
     /// 全部分区可路由和写入。
     Active,
 }
@@ -306,33 +306,33 @@ pub struct PartitionPlacement {
     pub last_completed_operation: Option<Uuid>,
 }
 
-/// catalog 中的聚合类型事件集定义。
+/// catalog 中的聚合类型定义。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AggregateEventSet {
-    pub id: EventSetId,
+pub struct AggregateTypeDefinition {
+    pub id: AggregateTypeId,
     pub create_operation_id: Uuid,
     /// 原始创建请求的稳定指纹；后续迁移不能改变创建重试判定。
     pub create_plan_fingerprint: u128,
     pub seed: [u8; 16],
     pub partition_count: u16,
     pub hash_algorithm: EventPartitionHash,
-    pub status: EventSetStatus,
+    pub status: AggregateTypeStatus,
     pub placements: BTreeMap<u16, PartitionPlacement>,
 }
 
-impl AggregateEventSet {
+impl AggregateTypeDefinition {
     /// 计算聚合实例所属分区。
     ///
     /// - `aggregate_id`：合法聚合实例 ID。
     /// - 返回：稳定分区编号。
-    /// - 错误：实例 ID 或事件集分区配置非法时返回 `InvalidInput`。
+    /// - 错误：实例 ID 或聚合类型分区配置非法时返回 `InvalidInput`。
     pub fn partition_for(&self, aggregate_id: &str) -> Result<u16> {
         self.hash_algorithm
             .partition(&self.seed, aggregate_id, self.partition_count)
     }
 
     fn create(
-        id: EventSetId,
+        id: AggregateTypeId,
         operation_id: Uuid,
         seed: [u8; 16],
         placements: &BTreeMap<u16, u64>,
@@ -341,7 +341,7 @@ impl AggregateEventSet {
             || (0..EVENT_PARTITION_COUNT).any(|partition| !placements.contains_key(&partition))
         {
             return Err(format!(
-                "事件集必须完整提供 {EVENT_PARTITION_COUNT} 个分区放置"
+                "聚合类型必须完整提供 {EVENT_PARTITION_COUNT} 个分区放置"
             ));
         }
         let create_plan_fingerprint = create_plan_fingerprint(&seed, placements);
@@ -366,37 +366,37 @@ impl AggregateEventSet {
             seed,
             partition_count: EVENT_PARTITION_COUNT,
             hash_algorithm: EventPartitionHash::Xxh3V1,
-            status: EventSetStatus::Creating,
+            status: AggregateTypeStatus::Registering,
             placements,
         })
     }
 }
 
-/// 控制 Shard 持久化的事件集 catalog。
+/// 控制 Shard 持久化的聚合类型 catalog。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregateCatalog {
     pub revision: u64,
-    pub event_sets: BTreeMap<EventSetId, AggregateEventSet>,
+    pub aggregate_types: BTreeMap<AggregateTypeId, AggregateTypeDefinition>,
 }
 
 /// catalog 的线性化变更命令。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AggregateCatalogCommand {
-    /// 创建处于 `Creating` 状态的事件集定义和固定放置计划。
+    /// 创建处于 `Registering` 状态的聚合类型定义和固定放置计划。
     Create {
-        event_set: EventSetId,
+        aggregate_type: AggregateTypeId,
         operation_id: Uuid,
         seed: [u8; 16],
         placements: BTreeMap<u16, u64>,
     },
-    /// 全部分区安装初始 fence 后激活事件集。
+    /// 全部分区安装初始 fence 后激活聚合类型。
     Activate {
-        event_set: EventSetId,
+        aggregate_type: AggregateTypeId,
         operation_id: Uuid,
     },
     /// 条件准备迁移一个虚拟事件分区。
     PrepareMove {
-        event_set: EventSetId,
+        aggregate_type: AggregateTypeId,
         partition_id: u16,
         expected_generation: u64,
         target_shard: u64,
@@ -404,7 +404,7 @@ pub enum AggregateCatalogCommand {
     },
     /// 目标复制、追尾及双方新 fence 安装完成后切换权威归属。
     CompleteMove {
-        event_set: EventSetId,
+        aggregate_type: AggregateTypeId,
         partition_id: u16,
         operation_id: Uuid,
     },
@@ -414,8 +414,8 @@ pub enum AggregateCatalogCommand {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AggregateCatalogOutcome {
     /// 返回当前定义；`changed` 表示本次命令是否推进 revision。
-    EventSet {
-        event_set: AggregateEventSet,
+    AggregateType {
+        aggregate_type: AggregateTypeDefinition,
         changed: bool,
     },
     /// 目标不存在。
@@ -434,7 +434,7 @@ pub struct AggregateCatalogApply {
 }
 
 impl AggregateCatalog {
-    /// 在控制 Shard 串行应用事件集 catalog 命令。
+    /// 在控制 Shard 串行应用聚合类型 catalog 命令。
     ///
     /// - `command`：携带 CAS generation 和幂等 operation ID 的变更。
     /// - 返回：当前 catalog revision 与命令结果；业务冲突不会修改状态。
@@ -442,39 +442,39 @@ impl AggregateCatalog {
     pub fn apply(&mut self, command: AggregateCatalogCommand) -> AggregateCatalogApply {
         let outcome = match command {
             AggregateCatalogCommand::Create {
-                event_set,
+                aggregate_type,
                 operation_id,
                 seed,
                 placements,
-            } => match event_set.validate() {
+            } => match aggregate_type.validate() {
                 Err(error) => AggregateCatalogOutcome::Invalid {
                     reason: error.to_string(),
                 },
-                Ok(()) => match self.event_sets.get(&event_set) {
+                Ok(()) => match self.aggregate_types.get(&aggregate_type) {
                     Some(existing)
                         if existing.create_operation_id == operation_id
                             && existing.create_plan_fingerprint
                                 == create_plan_fingerprint(&seed, &placements) =>
                     {
-                        AggregateCatalogOutcome::EventSet {
-                            event_set: existing.clone(),
+                        AggregateCatalogOutcome::AggregateType {
+                            aggregate_type: existing.clone(),
                             changed: false,
                         }
                     }
                     Some(_) => AggregateCatalogOutcome::Conflict {
-                        reason: "事件集已由另一创建操作定义".into(),
+                        reason: "聚合类型已由另一注册操作定义".into(),
                     },
-                    None => match AggregateEventSet::create(
-                        event_set.clone(),
+                    None => match AggregateTypeDefinition::create(
+                        aggregate_type.clone(),
                         operation_id,
                         seed,
                         &placements,
                     ) {
                         Ok(created) => {
                             self.revision += 1;
-                            self.event_sets.insert(event_set, created.clone());
-                            AggregateCatalogOutcome::EventSet {
-                                event_set: created,
+                            self.aggregate_types.insert(aggregate_type, created.clone());
+                            AggregateCatalogOutcome::AggregateType {
+                                aggregate_type: created,
                                 changed: true,
                             }
                         }
@@ -483,49 +483,49 @@ impl AggregateCatalog {
                 },
             },
             AggregateCatalogCommand::Activate {
-                event_set,
+                aggregate_type,
                 operation_id,
-            } => match self.event_sets.get_mut(&event_set) {
+            } => match self.aggregate_types.get_mut(&aggregate_type) {
                 None => AggregateCatalogOutcome::NotFound,
                 Some(existing) if existing.create_operation_id != operation_id => {
                     AggregateCatalogOutcome::Conflict {
                         reason: "激活操作与创建 operation_id 不一致".into(),
                     }
                 }
-                Some(existing) if existing.status == EventSetStatus::Active => {
-                    AggregateCatalogOutcome::EventSet {
-                        event_set: existing.clone(),
+                Some(existing) if existing.status == AggregateTypeStatus::Active => {
+                    AggregateCatalogOutcome::AggregateType {
+                        aggregate_type: existing.clone(),
                         changed: false,
                     }
                 }
                 Some(existing) => {
-                    existing.status = EventSetStatus::Active;
-                    let event_set = existing.clone();
+                    existing.status = AggregateTypeStatus::Active;
+                    let aggregate_type = existing.clone();
                     self.revision += 1;
-                    AggregateCatalogOutcome::EventSet {
-                        event_set,
+                    AggregateCatalogOutcome::AggregateType {
+                        aggregate_type,
                         changed: true,
                     }
                 }
             },
             AggregateCatalogCommand::PrepareMove {
-                event_set,
+                aggregate_type,
                 partition_id,
                 expected_generation,
                 target_shard,
                 operation_id,
             } => self.prepare_move(
-                &event_set,
+                &aggregate_type,
                 partition_id,
                 expected_generation,
                 target_shard,
                 operation_id,
             ),
             AggregateCatalogCommand::CompleteMove {
-                event_set,
+                aggregate_type,
                 partition_id,
                 operation_id,
-            } => self.complete_move(&event_set, partition_id, operation_id),
+            } => self.complete_move(&aggregate_type, partition_id, operation_id),
         };
         AggregateCatalogApply {
             revision: self.revision,
@@ -535,23 +535,23 @@ impl AggregateCatalog {
 
     fn prepare_move(
         &mut self,
-        event_set_id: &EventSetId,
+        aggregate_type_id: &AggregateTypeId,
         partition_id: u16,
         expected_generation: u64,
         target_shard: u64,
         operation_id: Uuid,
     ) -> AggregateCatalogOutcome {
-        let Some(event_set) = self.event_sets.get_mut(event_set_id) else {
+        let Some(aggregate_type) = self.aggregate_types.get_mut(aggregate_type_id) else {
             return AggregateCatalogOutcome::NotFound;
         };
-        if event_set.status != EventSetStatus::Active {
+        if aggregate_type.status != AggregateTypeStatus::Active {
             return AggregateCatalogOutcome::Invalid {
-                reason: "只有 Active 事件集可以迁移分区".into(),
+                reason: "只有 Active 聚合类型可以移动分区".into(),
             };
         }
-        let Some(placement) = event_set.placements.get_mut(&partition_id) else {
+        let Some(placement) = aggregate_type.placements.get_mut(&partition_id) else {
             return AggregateCatalogOutcome::Invalid {
-                reason: "partition_id 超出事件集范围".into(),
+                reason: "partition_id 超出聚合类型范围".into(),
             };
         };
         if let Some(pending) = &placement.pending_move {
@@ -559,8 +559,8 @@ impl AggregateCatalog {
                 && pending.target_shard == target_shard
                 && pending.source_shard == placement.shard_id
             {
-                return AggregateCatalogOutcome::EventSet {
-                    event_set: event_set.clone(),
+                return AggregateCatalogOutcome::AggregateType {
+                    aggregate_type: aggregate_type.clone(),
                     changed: false,
                 };
             }
@@ -593,30 +593,30 @@ impl AggregateCatalog {
             next_generation,
         });
         self.revision += 1;
-        AggregateCatalogOutcome::EventSet {
-            event_set: event_set.clone(),
+        AggregateCatalogOutcome::AggregateType {
+            aggregate_type: aggregate_type.clone(),
             changed: true,
         }
     }
 
     fn complete_move(
         &mut self,
-        event_set_id: &EventSetId,
+        aggregate_type_id: &AggregateTypeId,
         partition_id: u16,
         operation_id: Uuid,
     ) -> AggregateCatalogOutcome {
-        let Some(event_set) = self.event_sets.get_mut(event_set_id) else {
+        let Some(aggregate_type) = self.aggregate_types.get_mut(aggregate_type_id) else {
             return AggregateCatalogOutcome::NotFound;
         };
-        let Some(placement) = event_set.placements.get_mut(&partition_id) else {
+        let Some(placement) = aggregate_type.placements.get_mut(&partition_id) else {
             return AggregateCatalogOutcome::Invalid {
-                reason: "partition_id 超出事件集范围".into(),
+                reason: "partition_id 超出聚合类型范围".into(),
             };
         };
         let Some(pending) = placement.pending_move.clone() else {
             return if placement.last_completed_operation == Some(operation_id) {
-                AggregateCatalogOutcome::EventSet {
-                    event_set: event_set.clone(),
+                AggregateCatalogOutcome::AggregateType {
+                    aggregate_type: aggregate_type.clone(),
                     changed: false,
                 }
             } else {
@@ -635,8 +635,8 @@ impl AggregateCatalog {
         placement.pending_move = None;
         placement.last_completed_operation = Some(operation_id);
         self.revision += 1;
-        AggregateCatalogOutcome::EventSet {
-            event_set: event_set.clone(),
+        AggregateCatalogOutcome::AggregateType {
+            aggregate_type: aggregate_type.clone(),
             changed: true,
         }
     }
@@ -658,8 +658,8 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    fn event_set() -> EventSetId {
-        EventSetId::new("orders", "order").expect("合法事件集")
+    fn aggregate_type() -> AggregateTypeId {
+        AggregateTypeId::new("orders", "order").expect("合法聚合类型")
     }
 
     fn placements() -> BTreeMap<u16, u64> {
@@ -670,7 +670,7 @@ mod tests {
 
     fn create_command(operation_id: Uuid) -> AggregateCatalogCommand {
         AggregateCatalogCommand::Create {
-            event_set: event_set(),
+            aggregate_type: aggregate_type(),
             operation_id,
             seed: [7; 16],
             placements: placements(),
@@ -678,20 +678,20 @@ mod tests {
     }
 
     #[test]
-    fn event_set_id_roundtrip_and_validation() {
-        let id = event_set();
+    fn aggregate_type_id_roundtrip_and_validation() {
+        let id = aggregate_type();
         assert_eq!(id.business_space(), "orders");
         assert_eq!(id.aggregate_type(), "order");
         assert_eq!(id.to_string(), "orders/order");
-        assert_eq!(id.to_string().parse::<EventSetId>().unwrap(), id);
+        assert_eq!(id.to_string().parse::<AggregateTypeId>().unwrap(), id);
 
         for invalid in ["", "/order", "orders/", "a/b/c", "orders/订单"] {
-            assert!(invalid.parse::<EventSetId>().is_err(), "{invalid}");
+            assert!(invalid.parse::<AggregateTypeId>().is_err(), "{invalid}");
         }
         for reserved in RESERVED_IDENTIFIERS {
-            assert!(EventSetId::new("orders", reserved).is_err());
+            assert!(AggregateTypeId::new("orders", reserved).is_err());
         }
-        let bypassed: EventSetId =
+        let bypassed: AggregateTypeId =
             serde_json::from_str(r#"{"business_space":"orders/bad","aggregate_type":"order"}"#)
                 .expect("serde 可读取旧持久化形态");
         assert!(bypassed.validate().is_err(), "反序列化后仍必须重新校验");
@@ -728,7 +728,7 @@ mod tests {
             metadata: b"{}".to_vec(),
         };
         let fingerprint = aggregate_append_fingerprint(
-            &event_set(),
+            &aggregate_type(),
             "order-1",
             ExpectedAggregateVersion::NoAggregate,
             &base,
@@ -738,7 +738,7 @@ mod tests {
         assert_ne!(
             fingerprint,
             aggregate_append_fingerprint(
-                &event_set(),
+                &aggregate_type(),
                 "order-1",
                 ExpectedAggregateVersion::NoAggregate,
                 &changed
@@ -747,20 +747,20 @@ mod tests {
         assert_ne!(
             fingerprint,
             aggregate_append_fingerprint(
-                &event_set(),
+                &aggregate_type(),
                 "order-1",
                 ExpectedAggregateVersion::Any,
                 &base
             )
         );
         let exists = aggregate_append_fingerprint(
-            &event_set(),
+            &aggregate_type(),
             "order-1",
             ExpectedAggregateVersion::AggregateExists,
             &base,
         );
         let exact = aggregate_append_fingerprint(
-            &event_set(),
+            &aggregate_type(),
             "order-1",
             ExpectedAggregateVersion::Exact(3),
             &base,
@@ -777,24 +777,24 @@ mod tests {
         assert_eq!(created.revision, 1);
         assert!(matches!(
             created.outcome,
-            AggregateCatalogOutcome::EventSet { changed: true, .. }
+            AggregateCatalogOutcome::AggregateType { changed: true, .. }
         ));
         let retried = catalog.apply(create_command(operation_id));
         assert_eq!(retried.revision, 1);
         assert!(matches!(
             retried.outcome,
-            AggregateCatalogOutcome::EventSet { changed: false, .. }
+            AggregateCatalogOutcome::AggregateType { changed: false, .. }
         ));
         let activated = catalog.apply(AggregateCatalogCommand::Activate {
-            event_set: event_set(),
+            aggregate_type: aggregate_type(),
             operation_id,
         });
         assert_eq!(activated.revision, 2);
         assert!(matches!(
             activated.outcome,
-            AggregateCatalogOutcome::EventSet {
-                event_set: AggregateEventSet {
-                    status: EventSetStatus::Active,
+            AggregateCatalogOutcome::AggregateType {
+                aggregate_type: AggregateTypeDefinition {
+                    status: AggregateTypeStatus::Active,
                     ..
                 },
                 changed: true
@@ -806,13 +806,13 @@ mod tests {
     fn catalog_rejects_incomplete_placement_without_mutation() {
         let mut catalog = AggregateCatalog::default();
         let result = catalog.apply(AggregateCatalogCommand::Create {
-            event_set: event_set(),
+            aggregate_type: aggregate_type(),
             operation_id: Uuid::new_v4(),
             seed: [0; 16],
             placements: BTreeMap::from([(0, 1)]),
         });
         assert_eq!(catalog.revision, 0);
-        assert!(catalog.event_sets.is_empty());
+        assert!(catalog.aggregate_types.is_empty());
         assert!(matches!(
             result.outcome,
             AggregateCatalogOutcome::Invalid { .. }
@@ -826,11 +826,11 @@ mod tests {
         let mut catalog = AggregateCatalog::default();
         catalog.apply(create_command(create_id));
         catalog.apply(AggregateCatalogCommand::Activate {
-            event_set: event_set(),
+            aggregate_type: aggregate_type(),
             operation_id: create_id,
         });
         let prepared = catalog.apply(AggregateCatalogCommand::PrepareMove {
-            event_set: event_set(),
+            aggregate_type: aggregate_type(),
             partition_id: 3,
             expected_generation: 1,
             target_shard: 9,
@@ -838,31 +838,31 @@ mod tests {
         });
         assert_eq!(prepared.revision, 3);
         let completed = catalog.apply(AggregateCatalogCommand::CompleteMove {
-            event_set: event_set(),
+            aggregate_type: aggregate_type(),
             partition_id: 3,
             operation_id: move_id,
         });
         assert_eq!(completed.revision, 4);
-        let placement = &catalog.event_sets[&event_set()].placements[&3];
+        let placement = &catalog.aggregate_types[&aggregate_type()].placements[&3];
         assert_eq!((placement.shard_id, placement.generation), (9, 2));
         assert!(placement.pending_move.is_none());
 
         let retried = catalog.apply(AggregateCatalogCommand::CompleteMove {
-            event_set: event_set(),
+            aggregate_type: aggregate_type(),
             partition_id: 3,
             operation_id: move_id,
         });
         assert_eq!(retried.revision, 4);
         assert!(matches!(
             retried.outcome,
-            AggregateCatalogOutcome::EventSet { changed: false, .. }
+            AggregateCatalogOutcome::AggregateType { changed: false, .. }
         ));
 
         let create_retry = catalog.apply(create_command(create_id));
         assert_eq!(create_retry.revision, 4);
         assert!(matches!(
             create_retry.outcome,
-            AggregateCatalogOutcome::EventSet { changed: false, .. }
+            AggregateCatalogOutcome::AggregateType { changed: false, .. }
         ));
     }
 
@@ -871,12 +871,12 @@ mod tests {
         let create_id = Uuid::new_v4();
         let mut catalog = AggregateCatalog::default();
 
-        let invalid_id = EventSetId {
+        let invalid_id = AggregateTypeId {
             business_space: "bad/path".into(),
             aggregate_type: "order".into(),
         };
         let invalid = catalog.apply(AggregateCatalogCommand::Create {
-            event_set: invalid_id,
+            aggregate_type: invalid_id,
             operation_id: create_id,
             seed: [0; 16],
             placements: placements(),
@@ -890,7 +890,7 @@ mod tests {
         assert!(matches!(
             catalog
                 .apply(AggregateCatalogCommand::Activate {
-                    event_set: event_set(),
+                    aggregate_type: aggregate_type(),
                     operation_id: create_id,
                 })
                 .outcome,
@@ -906,7 +906,7 @@ mod tests {
         let mut changed_plan = placements();
         changed_plan.insert(0, 99);
         let changed_plan = catalog.apply(AggregateCatalogCommand::Create {
-            event_set: event_set(),
+            aggregate_type: aggregate_type(),
             operation_id: create_id,
             seed: [7; 16],
             placements: changed_plan,
@@ -917,7 +917,7 @@ mod tests {
         ));
 
         let wrong_activate = catalog.apply(AggregateCatalogCommand::Activate {
-            event_set: event_set(),
+            aggregate_type: aggregate_type(),
             operation_id: Uuid::new_v4(),
         });
         assert!(matches!(
@@ -925,16 +925,16 @@ mod tests {
             AggregateCatalogOutcome::Conflict { .. }
         ));
         catalog.apply(AggregateCatalogCommand::Activate {
-            event_set: event_set(),
+            aggregate_type: aggregate_type(),
             operation_id: create_id,
         });
         let retry = catalog.apply(AggregateCatalogCommand::Activate {
-            event_set: event_set(),
+            aggregate_type: aggregate_type(),
             operation_id: create_id,
         });
         assert!(matches!(
             retry.outcome,
-            AggregateCatalogOutcome::EventSet { changed: false, .. }
+            AggregateCatalogOutcome::AggregateType { changed: false, .. }
         ));
         assert_eq!(catalog.revision, 2);
     }
@@ -945,25 +945,26 @@ mod tests {
         let mut catalog = AggregateCatalog::default();
         catalog.apply(create_command(create_id));
 
-        let prepare = |event_set, partition_id, expected_generation, target_shard, operation_id| {
-            AggregateCatalogCommand::PrepareMove {
-                event_set,
-                partition_id,
-                expected_generation,
-                target_shard,
-                operation_id,
-            }
-        };
+        let prepare =
+            |aggregate_type, partition_id, expected_generation, target_shard, operation_id| {
+                AggregateCatalogCommand::PrepareMove {
+                    aggregate_type,
+                    partition_id,
+                    expected_generation,
+                    target_shard,
+                    operation_id,
+                }
+            };
         assert!(matches!(
             catalog
-                .apply(prepare(event_set(), 0, 1, 9, Uuid::new_v4()))
+                .apply(prepare(aggregate_type(), 0, 1, 9, Uuid::new_v4()))
                 .outcome,
             AggregateCatalogOutcome::Invalid { .. }
         ));
         assert!(matches!(
             catalog
                 .apply(prepare(
-                    EventSetId::new("orders", "missing").unwrap(),
+                    AggregateTypeId::new("orders", "missing").unwrap(),
                     0,
                     1,
                     9,
@@ -973,24 +974,30 @@ mod tests {
             AggregateCatalogOutcome::NotFound
         ));
         catalog.apply(AggregateCatalogCommand::Activate {
-            event_set: event_set(),
+            aggregate_type: aggregate_type(),
             operation_id: create_id,
         });
 
         for command in [
-            prepare(event_set(), EVENT_PARTITION_COUNT, 1, 9, Uuid::new_v4()),
-            prepare(event_set(), 0, 2, 9, Uuid::new_v4()),
-            prepare(event_set(), 0, 1, 0, Uuid::new_v4()),
+            prepare(
+                aggregate_type(),
+                EVENT_PARTITION_COUNT,
+                1,
+                9,
+                Uuid::new_v4(),
+            ),
+            prepare(aggregate_type(), 0, 2, 9, Uuid::new_v4()),
+            prepare(aggregate_type(), 0, 1, 0, Uuid::new_v4()),
         ] {
             assert!(!matches!(
                 catalog.apply(command).outcome,
-                AggregateCatalogOutcome::EventSet { changed: true, .. }
+                AggregateCatalogOutcome::AggregateType { changed: true, .. }
             ));
         }
 
         catalog
-            .event_sets
-            .get_mut(&event_set())
+            .aggregate_types
+            .get_mut(&aggregate_type())
             .unwrap()
             .placements
             .get_mut(&1)
@@ -998,21 +1005,21 @@ mod tests {
             .generation = u64::MAX;
         assert!(matches!(
             catalog
-                .apply(prepare(event_set(), 1, u64::MAX, 9, Uuid::new_v4()))
+                .apply(prepare(aggregate_type(), 1, u64::MAX, 9, Uuid::new_v4()))
                 .outcome,
             AggregateCatalogOutcome::Invalid { .. }
         ));
 
         let move_id = Uuid::new_v4();
-        catalog.apply(prepare(event_set(), 2, 1, 9, move_id));
-        let retry = catalog.apply(prepare(event_set(), 2, 1, 9, move_id));
+        catalog.apply(prepare(aggregate_type(), 2, 1, 9, move_id));
+        let retry = catalog.apply(prepare(aggregate_type(), 2, 1, 9, move_id));
         assert!(matches!(
             retry.outcome,
-            AggregateCatalogOutcome::EventSet { changed: false, .. }
+            AggregateCatalogOutcome::AggregateType { changed: false, .. }
         ));
         assert!(matches!(
             catalog
-                .apply(prepare(event_set(), 2, 1, 10, Uuid::new_v4()))
+                .apply(prepare(aggregate_type(), 2, 1, 10, Uuid::new_v4()))
                 .outcome,
             AggregateCatalogOutcome::Conflict { .. }
         ));
@@ -1020,7 +1027,7 @@ mod tests {
         assert!(matches!(
             catalog
                 .apply(AggregateCatalogCommand::CompleteMove {
-                    event_set: EventSetId::new("orders", "missing").unwrap(),
+                    aggregate_type: AggregateTypeId::new("orders", "missing").unwrap(),
                     partition_id: 0,
                     operation_id: move_id,
                 })
@@ -1030,7 +1037,7 @@ mod tests {
         assert!(matches!(
             catalog
                 .apply(AggregateCatalogCommand::CompleteMove {
-                    event_set: event_set(),
+                    aggregate_type: aggregate_type(),
                     partition_id: EVENT_PARTITION_COUNT,
                     operation_id: move_id,
                 })
@@ -1040,7 +1047,7 @@ mod tests {
         assert!(matches!(
             catalog
                 .apply(AggregateCatalogCommand::CompleteMove {
-                    event_set: event_set(),
+                    aggregate_type: aggregate_type(),
                     partition_id: 3,
                     operation_id: move_id,
                 })
@@ -1050,7 +1057,7 @@ mod tests {
         assert!(matches!(
             catalog
                 .apply(AggregateCatalogCommand::CompleteMove {
-                    event_set: event_set(),
+                    aggregate_type: aggregate_type(),
                     partition_id: 2,
                     operation_id: Uuid::new_v4(),
                 })

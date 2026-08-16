@@ -22,9 +22,6 @@ mod commands;
 mod output;
 mod shards;
 
-#[cfg(test)]
-mod tests_e2e;
-
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -48,14 +45,6 @@ async fn run(cli: Cli) -> Result<()> {
     let ctx = Ctx::new(cluster, cli.global);
 
     match cli.command {
-        Command::Append(a) => commands::append::run(&ctx, &a).await,
-        Command::Read(a) => commands::read::run(&ctx, &a).await,
-        Command::ReadAll(a) => commands::read::run_all(&ctx, &a).await,
-        Command::Meta(a) => commands::meta::run(&ctx, &a).await,
-        Command::CreateStream(a) => commands::create_stream::run(&ctx, &a).await,
-        Command::Route(a) => commands::route::run(&ctx, &a).await,
-        Command::Migrate(a) => commands::migrate::run(&ctx, &a).await,
-        Command::Watch(a) => commands::watch::run(&ctx, &a).await,
         Command::Init(a) => commands::init::run(&ctx, &a).await,
         Command::Member(a) => commands::member::run(&ctx, &a).await,
         Command::Status(a) => commands::status::run(&ctx, &a).await,
@@ -67,7 +56,6 @@ async fn run(cli: Cli) -> Result<()> {
                 commands::snapshot::run_restore(ctx.format, &args).await
             }
         },
-        Command::Persistent(a) => commands::persistent::run(&ctx, &a.action).await,
         Command::Aggregate(a) => commands::aggregate::run(&ctx, &a.action).await,
     }
 }

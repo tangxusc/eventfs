@@ -5,7 +5,7 @@
 //!
 //! 注:写入需要完整 Raft 环境,此处只测读取与快照恢复。
 
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use es_storage::storage::EsStorage;
 use once_cell::sync::Lazy;
 use std::sync::Arc;
@@ -14,9 +14,9 @@ use tokio::runtime::Runtime;
 /// 全局 tokio runtime,供所有 benchmark 共享
 static RT: Lazy<Runtime> = Lazy::new(|| Runtime::new().unwrap());
 
-/// 读取基准:读取空流(最快路径)
-fn bench_read_empty_stream(c: &mut Criterion) {
-    c.bench_function("read_empty_stream", |b| {
+/// 读取基准：读取空 AggregateType 分区 feed（最快路径）。
+fn bench_read_empty_aggregate_feed(c: &mut Criterion) {
+    c.bench_function("read_empty_aggregate_feed", |b| {
         // 预建存储(在 bench 外,避免计入时间)
         let (_dir, storage) = RT.block_on(async {
             let dir = tempfile::tempdir().expect("临时目录");
@@ -40,12 +40,17 @@ fn bench_read_empty_stream(c: &mut Criterion) {
 
         b.iter(|| {
             let events = storage
-                .read_stream_events("nonexistent", 0, 0)
-                .expect("读空流");
+                .read_aggregate_partition_events(
+                    &es_core::AggregateTypeId::new("bench", "aggregate").unwrap(),
+                    0,
+                    0,
+                    0,
+                )
+                .expect("读取空 AggregateType feed");
             black_box(events);
         });
     });
 }
 
-criterion_group!(benches, bench_read_empty_stream,);
+criterion_group!(benches, bench_read_empty_aggregate_feed,);
 criterion_main!(benches);

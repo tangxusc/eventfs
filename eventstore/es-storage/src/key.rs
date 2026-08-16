@@ -2,7 +2,7 @@
 //!
 //! 核心约束：
 //! 1. 整数必须固定宽度大端编码（字节序 = 数值序）
-//! 2. stream_id 前必须加长度前缀，避免前缀包含时范围扫描串流
+//! 2. 可变标识符必须加长度前缀，避免前缀包含时范围扫描串数据
 //! 3. 不同命名空间用首字节 tag 隔离
 
 use std::io;
@@ -21,15 +21,7 @@ const RAFT_LAST_PURGED: u8 = 0x03;
 const RAFT_COMMITTED: u8 = 0x04;
 
 /// 状态机子类别
-const SM_EVENT: u8 = 0x01;
-const SM_STREAM_META: u8 = 0x02;
-const SM_POSITION_PTR: u8 = 0x03;
 const SM_APPLIED_STATE: u8 = 0x04;
-const SM_IDEMPOTENCY: u8 = 0x05;
-const SM_NEXT_POSITION: u8 = 0x06;
-const SM_OWNERSHIP_CATALOG: u8 = 0x07;
-const SM_OWNERSHIP_FENCE: u8 = 0x08;
-const SM_PERSISTENT_GROUP: u8 = 0x09;
 const SM_AGGREGATE_EVENT: u8 = 0x0A;
 const SM_AGGREGATE_META: u8 = 0x0B;
 const SM_AGGREGATE_PARTITION_INDEX: u8 = 0x0C;
@@ -117,43 +109,6 @@ pub fn raft_committed(shard_id: u64) -> Vec<u8> {
     k
 }
 
-/// 状态机 event key: [0x02][shard:BE8][0x01][slen:BE8][stream][version:BE8]
-pub fn sm_event(shard_id: u64, stream_id: &str, version: u64) -> Vec<u8> {
-    let stream_bytes = stream_id.as_bytes();
-    let slen = stream_bytes.len() as u64;
-    let mut k = Vec::with_capacity(26 + stream_bytes.len());
-    k.push(TAG_SM);
-    k.extend_from_slice(&encode_u64_be(shard_id));
-    k.push(SM_EVENT);
-    k.extend_from_slice(&encode_u64_be(slen));
-    k.extend_from_slice(stream_bytes);
-    k.extend_from_slice(&encode_u64_be(version));
-    k
-}
-
-/// 状态机 stream_meta key: [0x02][shard:BE8][0x02][slen:BE8][stream]
-pub fn sm_stream_meta(shard_id: u64, stream_id: &str) -> Vec<u8> {
-    let stream_bytes = stream_id.as_bytes();
-    let slen = stream_bytes.len() as u64;
-    let mut k = Vec::with_capacity(18 + stream_bytes.len());
-    k.push(TAG_SM);
-    k.extend_from_slice(&encode_u64_be(shard_id));
-    k.push(SM_STREAM_META);
-    k.extend_from_slice(&encode_u64_be(slen));
-    k.extend_from_slice(stream_bytes);
-    k
-}
-
-/// 状态机 position 指针 key: [0x02][shard:BE8][0x03][position:BE8]
-pub fn sm_position_ptr(shard_id: u64, position: u64) -> Vec<u8> {
-    let mut k = Vec::with_capacity(18);
-    k.push(TAG_SM);
-    k.extend_from_slice(&encode_u64_be(shard_id));
-    k.push(SM_POSITION_PTR);
-    k.extend_from_slice(&encode_u64_be(position));
-    k
-}
-
 /// 状态机 applied_state key: [0x02][shard:BE8][0x04]
 pub fn sm_applied_state(shard_id: u64) -> Vec<u8> {
     let mut k = Vec::with_capacity(10);
@@ -161,53 +116,6 @@ pub fn sm_applied_state(shard_id: u64) -> Vec<u8> {
     k.extend_from_slice(&encode_u64_be(shard_id));
     k.push(SM_APPLIED_STATE);
     k
-}
-
-/// 状态机 idempotency key: [0x02][shard:BE8][0x05][event_id:16B]
-pub fn sm_idempotency(shard_id: u64, event_id: &uuid::Uuid) -> Vec<u8> {
-    let mut k = Vec::with_capacity(26);
-    k.push(TAG_SM);
-    k.extend_from_slice(&encode_u64_be(shard_id));
-    k.push(SM_IDEMPOTENCY);
-    k.extend_from_slice(event_id.as_bytes());
-    k
-}
-
-/// 状态机 next_position 计数器 key: [0x02][shard:BE8][0x06]
-pub fn sm_next_position(shard_id: u64) -> Vec<u8> {
-    let mut k = Vec::with_capacity(10);
-    k.push(TAG_SM);
-    k.extend_from_slice(&encode_u64_be(shard_id));
-    k.push(SM_NEXT_POSITION);
-    k
-}
-
-/// 控制 Shard 的 Stream 归属权威状态 key。
-pub fn sm_ownership_catalog(shard_id: u64) -> Vec<u8> {
-    sm_sub_prefix(shard_id, SM_OWNERSHIP_CATALOG)
-}
-
-/// 数据 Shard 的 Stream 归属代次 fencing key。
-pub fn sm_ownership_fence(shard_id: u64, stream_id: &str) -> Vec<u8> {
-    let stream_bytes = stream_id.as_bytes();
-    let mut key = sm_sub_prefix(shard_id, SM_OWNERSHIP_FENCE);
-    key.extend_from_slice(&(stream_bytes.len() as u64).to_be_bytes());
-    key.extend_from_slice(stream_bytes);
-    key
-}
-
-/// 持久化订阅组 key：`[SM][shard][group-tag][len:BE8][group]`。
-pub fn sm_persistent_group(shard_id: u64, group: &str) -> Vec<u8> {
-    let bytes = group.as_bytes();
-    let mut key = sm_sub_prefix(shard_id, SM_PERSISTENT_GROUP);
-    key.extend_from_slice(&encode_u64_be(bytes.len() as u64));
-    key.extend_from_slice(bytes);
-    key
-}
-
-/// 持久化订阅组扫描前缀。
-pub fn sm_persistent_group_prefix(shard_id: u64) -> Vec<u8> {
-    sm_sub_prefix(shard_id, SM_PERSISTENT_GROUP)
 }
 
 fn append_len_prefixed(key: &mut Vec<u8>, bytes: &[u8]) {
@@ -218,12 +126,12 @@ fn append_len_prefixed(key: &mut Vec<u8>, bytes: &[u8]) {
 fn aggregate_partition_prefix(
     shard_id: u64,
     sub: u8,
-    event_set: &es_core::EventSetId,
+    aggregate_type: &es_core::AggregateTypeId,
     partition_id: u16,
 ) -> Vec<u8> {
-    let event_set = event_set.canonical_name();
+    let aggregate_type = aggregate_type.canonical_name();
     let mut key = sm_sub_prefix(shard_id, sub);
-    append_len_prefixed(&mut key, event_set.as_bytes());
+    append_len_prefixed(&mut key, aggregate_type.as_bytes());
     key.extend_from_slice(&partition_id.to_be_bytes());
     key
 }
@@ -231,24 +139,24 @@ fn aggregate_partition_prefix(
 fn aggregate_instance_prefix(
     shard_id: u64,
     sub: u8,
-    event_set: &es_core::EventSetId,
+    aggregate_type: &es_core::AggregateTypeId,
     partition_id: u16,
     aggregate_id: &str,
 ) -> Vec<u8> {
-    let mut key = aggregate_partition_prefix(shard_id, sub, event_set, partition_id);
+    let mut key = aggregate_partition_prefix(shard_id, sub, aggregate_type, partition_id);
     append_len_prefixed(&mut key, aggregate_id.as_bytes());
     key
 }
 
-/// 聚合事件 key：事件集、虚拟分区、实例 ID 和聚合版本共同定位。
+/// 聚合事件 key：聚合类型、虚拟分区、实例 ID 和聚合版本共同定位。
 pub fn sm_aggregate_event(
     shard_id: u64,
-    event_set: &es_core::EventSetId,
+    aggregate_type: &es_core::AggregateTypeId,
     partition_id: u16,
     aggregate_id: &str,
     aggregate_version: u64,
 ) -> Vec<u8> {
-    let mut key = sm_aggregate_event_prefix(shard_id, event_set, partition_id, aggregate_id);
+    let mut key = sm_aggregate_event_prefix(shard_id, aggregate_type, partition_id, aggregate_id);
     key.extend_from_slice(&encode_u64_be(aggregate_version));
     key
 }
@@ -256,30 +164,40 @@ pub fn sm_aggregate_event(
 /// 单聚合实例的事件扫描前缀。
 pub fn sm_aggregate_event_prefix(
     shard_id: u64,
-    event_set: &es_core::EventSetId,
+    aggregate_type: &es_core::AggregateTypeId,
     partition_id: u16,
     aggregate_id: &str,
 ) -> Vec<u8> {
     aggregate_instance_prefix(
         shard_id,
         SM_AGGREGATE_EVENT,
-        event_set,
+        aggregate_type,
         partition_id,
         aggregate_id,
     )
 }
 
+/// 判断 key 是否为指定 Shard 的聚合事件本体。
+///
+/// 快照恢复用它统计恢复事件数，避免在调用方复制状态机 tag 布局。
+pub(crate) fn is_aggregate_event_key(shard_id: u64, key: &[u8]) -> bool {
+    key.len() >= 10
+        && key[0] == TAG_SM
+        && key[1..9] == shard_id.to_be_bytes()
+        && key[9] == SM_AGGREGATE_EVENT
+}
+
 /// 单聚合实例的当前版本元数据 key。
 pub fn sm_aggregate_meta(
     shard_id: u64,
-    event_set: &es_core::EventSetId,
+    aggregate_type: &es_core::AggregateTypeId,
     partition_id: u16,
     aggregate_id: &str,
 ) -> Vec<u8> {
     aggregate_instance_prefix(
         shard_id,
         SM_AGGREGATE_META,
-        event_set,
+        aggregate_type,
         partition_id,
         aggregate_id,
     )
@@ -288,11 +206,11 @@ pub fn sm_aggregate_meta(
 /// 分区内提交位置到聚合事件定位符的索引 key。
 pub fn sm_aggregate_partition_index(
     shard_id: u64,
-    event_set: &es_core::EventSetId,
+    aggregate_type: &es_core::AggregateTypeId,
     partition_id: u16,
     partition_position: u64,
 ) -> Vec<u8> {
-    let mut key = sm_aggregate_partition_index_prefix(shard_id, event_set, partition_id);
+    let mut key = sm_aggregate_partition_index_prefix(shard_id, aggregate_type, partition_id);
     key.extend_from_slice(&encode_u64_be(partition_position));
     key
 }
@@ -300,13 +218,13 @@ pub fn sm_aggregate_partition_index(
 /// 单虚拟事件分区的提交位置索引前缀。
 pub fn sm_aggregate_partition_index_prefix(
     shard_id: u64,
-    event_set: &es_core::EventSetId,
+    aggregate_type: &es_core::AggregateTypeId,
     partition_id: u16,
 ) -> Vec<u8> {
     aggregate_partition_prefix(
         shard_id,
         SM_AGGREGATE_PARTITION_INDEX,
-        event_set,
+        aggregate_type,
         partition_id,
     )
 }
@@ -314,13 +232,13 @@ pub fn sm_aggregate_partition_index_prefix(
 /// 单虚拟事件分区的下一个提交位置计数器 key。
 pub fn sm_aggregate_next_position(
     shard_id: u64,
-    event_set: &es_core::EventSetId,
+    aggregate_type: &es_core::AggregateTypeId,
     partition_id: u16,
 ) -> Vec<u8> {
     aggregate_partition_prefix(
         shard_id,
         SM_AGGREGATE_NEXT_POSITION,
-        event_set,
+        aggregate_type,
         partition_id,
     )
 }
@@ -328,11 +246,12 @@ pub fn sm_aggregate_next_position(
 /// 聚合实例业务状态文档 key。
 pub fn sm_aggregate_state(
     shard_id: u64,
-    event_set: &es_core::EventSetId,
+    aggregate_type: &es_core::AggregateTypeId,
     partition_id: u16,
     aggregate_id: &str,
 ) -> Vec<u8> {
-    let mut key = aggregate_partition_prefix(shard_id, SM_AGGREGATE_STATE, event_set, partition_id);
+    let mut key =
+        aggregate_partition_prefix(shard_id, SM_AGGREGATE_STATE, aggregate_type, partition_id);
     // aggregate_id 受公共 ASCII 规则约束且 key 到此结束，可直接编码以保留词典序。
     key.extend_from_slice(aggregate_id.as_bytes());
     key
@@ -343,14 +262,14 @@ pub fn sm_aggregate_state(
 /// 与状态内容使用不同命名空间，避免改变已持久化 `AggregateState` 的 bincode 格式。
 pub fn sm_aggregate_state_modified(
     shard_id: u64,
-    event_set: &es_core::EventSetId,
+    aggregate_type: &es_core::AggregateTypeId,
     partition_id: u16,
     aggregate_id: &str,
 ) -> Vec<u8> {
     let mut key = aggregate_partition_prefix(
         shard_id,
         SM_AGGREGATE_STATE_MODIFIED,
-        event_set,
+        aggregate_type,
         partition_id,
     );
     key.extend_from_slice(aggregate_id.as_bytes());
@@ -360,10 +279,10 @@ pub fn sm_aggregate_state_modified(
 /// 单虚拟事件分区的业务状态扫描前缀。
 pub fn sm_aggregate_state_prefix(
     shard_id: u64,
-    event_set: &es_core::EventSetId,
+    aggregate_type: &es_core::AggregateTypeId,
     partition_id: u16,
 ) -> Vec<u8> {
-    aggregate_partition_prefix(shard_id, SM_AGGREGATE_STATE, event_set, partition_id)
+    aggregate_partition_prefix(shard_id, SM_AGGREGATE_STATE, aggregate_type, partition_id)
 }
 
 /// 从业务状态 key 解出聚合实例 ID。
@@ -372,10 +291,10 @@ pub fn decode_aggregate_state_key(key: &[u8]) -> Option<String> {
     if key.len() < HEAD + 8 + 2 + 1 || key.get(9) != Some(&SM_AGGREGATE_STATE) {
         return None;
     }
-    let event_set_len = decode_u64_be(&key[HEAD..HEAD + 8]).ok()? as usize;
+    let aggregate_type_len = decode_u64_be(&key[HEAD..HEAD + 8]).ok()? as usize;
     let aggregate_start = HEAD
         .checked_add(8)?
-        .checked_add(event_set_len)?
+        .checked_add(aggregate_type_len)?
         .checked_add(2)?;
     if aggregate_start >= key.len() {
         return None;
@@ -383,15 +302,19 @@ pub fn decode_aggregate_state_key(key: &[u8]) -> Option<String> {
     String::from_utf8(key[aggregate_start..].to_vec()).ok()
 }
 
-/// 聚合事件的幂等索引 key；作用域限制在事件集和虚拟分区内。
+/// 聚合事件的幂等索引 key；作用域限制在聚合类型和虚拟分区内。
 pub fn sm_aggregate_idempotency(
     shard_id: u64,
-    event_set: &es_core::EventSetId,
+    aggregate_type: &es_core::AggregateTypeId,
     partition_id: u16,
     event_id: &uuid::Uuid,
 ) -> Vec<u8> {
-    let mut key =
-        aggregate_partition_prefix(shard_id, SM_AGGREGATE_IDEMPOTENCY, event_set, partition_id);
+    let mut key = aggregate_partition_prefix(
+        shard_id,
+        SM_AGGREGATE_IDEMPOTENCY,
+        aggregate_type,
+        partition_id,
+    );
     key.extend_from_slice(event_id.as_bytes());
     key
 }
@@ -399,18 +322,18 @@ pub fn sm_aggregate_idempotency(
 /// 数据 Shard 上虚拟事件分区的 generation fence key。
 pub fn sm_aggregate_partition_fence(
     shard_id: u64,
-    event_set: &es_core::EventSetId,
+    aggregate_type: &es_core::AggregateTypeId,
     partition_id: u16,
 ) -> Vec<u8> {
     aggregate_partition_prefix(
         shard_id,
         SM_AGGREGATE_PARTITION_FENCE,
-        event_set,
+        aggregate_type,
         partition_id,
     )
 }
 
-/// 控制 Shard 上唯一的聚合事件集 catalog key。
+/// 控制 Shard 上唯一的聚合类型 catalog key。
 pub fn sm_aggregate_catalog(shard_id: u64) -> Vec<u8> {
     sm_sub_prefix(shard_id, SM_AGGREGATE_CATALOG)
 }
@@ -423,32 +346,18 @@ pub fn sm_aggregate_group_catalog(shard_id: u64) -> Vec<u8> {
 /// 数据 Shard 上单个事件分区的消费者组进度 key。
 pub fn sm_aggregate_group_partition(
     shard_id: u64,
-    event_set: &es_core::EventSetId,
+    aggregate_type: &es_core::AggregateTypeId,
     partition_id: u16,
     group_name: &str,
 ) -> Vec<u8> {
     let mut key = aggregate_partition_prefix(
         shard_id,
         SM_AGGREGATE_GROUP_PARTITION,
-        event_set,
+        aggregate_type,
         partition_id,
     );
     append_len_prefixed(&mut key, group_name.as_bytes());
     key
-}
-
-/// 从持久化订阅组 key 解出组名。
-pub fn decode_persistent_group_key(key: &[u8]) -> Option<String> {
-    const HEAD: usize = 10;
-    if key.len() < HEAD + 8 {
-        return None;
-    }
-    let len = decode_u64_be(&key[HEAD..HEAD + 8]).ok()? as usize;
-    let start = HEAD + 8;
-    if key.len() != start + len {
-        return None;
-    }
-    String::from_utf8(key[start..].to_vec()).ok()
 }
 
 /// 快照 key: [0x03][shard:BE8][0x01]
@@ -457,19 +366,6 @@ pub fn snapshot_current(shard_id: u64) -> Vec<u8> {
     k.push(TAG_SNAPSHOT);
     k.extend_from_slice(&encode_u64_be(shard_id));
     k.push(SNAPSHOT_CURRENT);
-    k
-}
-
-/// 构造某 stream 的事件扫描前缀: [0x02][shard:BE8][0x01][slen:BE8][stream]
-pub fn sm_event_prefix(shard_id: u64, stream_id: &str) -> Vec<u8> {
-    let stream_bytes = stream_id.as_bytes();
-    let slen = stream_bytes.len() as u64;
-    let mut k = Vec::with_capacity(18 + stream_bytes.len());
-    k.push(TAG_SM);
-    k.extend_from_slice(&encode_u64_be(shard_id));
-    k.push(SM_EVENT);
-    k.extend_from_slice(&encode_u64_be(slen));
-    k.extend_from_slice(stream_bytes);
     k
 }
 
@@ -495,7 +391,7 @@ pub fn raft_log_upper(shard_id: u64) -> Vec<u8> {
 ///
 /// 用于反向扫描的上界。**不能用 `successor(k)`**：k 末尾是定宽 BE 整数，
 /// 当该整数为 `u64::MAX` 时字节全为 0xFF，`successor` 会向前进位到
-/// stream / shard 部分，越界到别的 key 段。
+/// 业务前缀 / shard 部分，越界到别的 key 段。
 ///
 /// 追加 0x00 得到的键严格大于 k（同前缀但更长），又小于任何
 /// 「同前缀且整数更大」的键（差异在定宽整数的首个不同字节上决出），
@@ -514,37 +410,6 @@ fn sm_sub_prefix(shard_id: u64, sub: u8) -> Vec<u8> {
     k.extend_from_slice(&encode_u64_be(shard_id));
     k.push(sub);
     k
-}
-
-/// StreamMeta 区前缀，用于枚举分片内全部流
-pub fn sm_stream_meta_prefix(shard_id: u64) -> Vec<u8> {
-    sm_sub_prefix(shard_id, SM_STREAM_META)
-}
-
-/// position 指针区前缀，用于按提交序扫描
-pub fn sm_position_prefix(shard_id: u64) -> Vec<u8> {
-    sm_sub_prefix(shard_id, SM_POSITION_PTR)
-}
-
-/// 幂等索引区前缀，用于枚举全部幂等记录
-pub fn sm_idempotency_prefix(shard_id: u64) -> Vec<u8> {
-    sm_sub_prefix(shard_id, SM_IDEMPOTENCY)
-}
-
-/// 从 StreamMeta key 中解出 stream_id。
-///
-/// 布局 `[TAG][shard:BE8][SUB][slen:BE8][stream]`，据 slen 截取 stream 段。
-pub fn decode_stream_meta_key(k: &[u8]) -> Option<String> {
-    const HEAD: usize = 10; // TAG(1) + shard(8) + 子类别(1)
-    if k.len() < HEAD + 8 {
-        return None;
-    }
-    let slen = decode_u64_be(&k[HEAD..HEAD + 8]).ok()? as usize;
-    let start = HEAD + 8;
-    if k.len() != start + slen {
-        return None;
-    }
-    String::from_utf8(k[start..].to_vec()).ok()
 }
 
 /// 从日志 key 中解出 index。用于反向迭代取 last_log_id 时的校验。
@@ -617,45 +482,6 @@ mod tests {
     }
 
     #[test]
-    fn sm_event_ordered_by_version() {
-        let e0 = sm_event(1, "test", 0);
-        let e1 = sm_event(1, "test", 1);
-        let e100 = sm_event(1, "test", 100);
-        assert!(e0 < e1);
-        assert!(e1 < e100);
-    }
-
-    #[test]
-    fn length_prefix_isolates_streams() {
-        // stream "a" 与 "ab" 前缀包含,长度前缀必须将它们隔离
-        let _a0 = sm_event(1, "a", 0);
-        let a1 = sm_event(1, "a", 1);
-        let ab0 = sm_event(1, "ab", 0);
-        // "a" 的所有版本应小于 "ab" 的任何版本（因 slen 不同）
-        assert!(a1 < ab0, "长度前缀隔离失败");
-    }
-
-    #[test]
-    fn sm_event_prefix_covers_all_versions() {
-        let prefix = sm_event_prefix(1, "test");
-        let e0 = sm_event(1, "test", 0);
-        let e100 = sm_event(1, "test", 100);
-        assert!(e0.starts_with(&prefix));
-        assert!(e100.starts_with(&prefix));
-        // 其它 stream 不应匹配
-        let other = sm_event(1, "other", 0);
-        assert!(!other.starts_with(&prefix));
-    }
-
-    #[test]
-    fn shards_isolated() {
-        let s1 = sm_event(1, "test", 0);
-        let s2 = sm_event(2, "test", 0);
-        assert_ne!(s1, s2);
-        assert!(s1 < s2); // shard_id 在前,自然有序
-    }
-
-    #[test]
     fn log_upper_excludes_vote_key() {
         let upper = raft_log_upper(7);
         // 上界即 vote key，因 range 左闭右开，vote 本身不会被扫进来
@@ -677,109 +503,73 @@ mod tests {
     }
 
     #[test]
-    fn upper_including_max_boundary() {
-        // version = MAX 时 successor 会向前进位越界，upper_including 不会
-        let at_max = sm_event(3, "s", u64::MAX);
-        let upper = upper_including(&at_max);
-        assert!(upper > at_max, "上界须严格大于自身，才能把自身含进区间");
-
-        // 该上界不能吞掉别的 stream：它仍在本 stream 的前缀段内
-        let prefix = sm_event_prefix(3, "s");
-        assert!(upper.starts_with(&prefix));
-
-        // 对比 successor：它会进位改掉 stream 字节，越界到别处
-        let succ = successor(&at_max).expect("非全 FF");
-        assert!(
-            !succ.starts_with(&prefix),
-            "successor 在 MAX 处确实会越出本 stream 段，这正是不能用它的原因"
-        );
-    }
-
-    #[test]
-    fn upper_including_no_version_overflow() {
-        let k5 = sm_event(1, "s", 5);
-        let k6 = sm_event(1, "s", 6);
-        let upper = upper_including(&k5);
-        assert!(upper > k5, "应含 version 5");
-        assert!(upper < k6, "不应含 version 6");
-    }
-
-    #[test]
-    fn stream_meta_key_decode_roundtrip() {
-        for name in ["", "a", "订单-123", "a\u{0}b"] {
-            let k = sm_stream_meta(7, name);
-            assert_eq!(decode_stream_meta_key(&k).as_deref(), Some(name));
-        }
-        // 长度不符应返回 None，避免把别的 key 误判成 StreamMeta
-        assert_eq!(decode_stream_meta_key(&sm_event(7, "a", 0)), None);
-    }
-
-    #[test]
-    fn sub_prefixes_disjoint() {
-        let meta = sm_stream_meta_prefix(2);
-        let pos = sm_position_prefix(2);
-        let idem = sm_idempotency_prefix(2);
-        // 三个子区段各自独立，扫一个不会扫出另一个
-        assert!(sm_stream_meta(2, "x").starts_with(&meta));
-        assert!(!sm_stream_meta(2, "x").starts_with(&pos));
-        assert!(sm_position_ptr(2, 0).starts_with(&pos));
-        assert!(!sm_position_ptr(2, 0).starts_with(&idem));
-    }
-
-    #[test]
     fn aggregate_keys_are_partitioned_and_ordered() {
-        let event_set = es_core::EventSetId::new("orders", "order").unwrap();
-        let prefix = sm_aggregate_event_prefix(2, &event_set, 7, "order-1");
-        let zero = sm_aggregate_event(2, &event_set, 7, "order-1", 0);
-        let one = sm_aggregate_event(2, &event_set, 7, "order-1", 1);
+        let aggregate_type = es_core::AggregateTypeId::new("orders", "order").unwrap();
+        let prefix = sm_aggregate_event_prefix(2, &aggregate_type, 7, "order-1");
+        let zero = sm_aggregate_event(2, &aggregate_type, 7, "order-1", 0);
+        let one = sm_aggregate_event(2, &aggregate_type, 7, "order-1", 1);
         assert!(zero.starts_with(&prefix));
         assert!(zero < one);
-        assert!(!sm_aggregate_event(2, &event_set, 8, "order-1", 0).starts_with(&prefix));
-        assert!(!sm_aggregate_event(2, &event_set, 7, "order-10", 0).starts_with(&prefix));
+        assert!(!sm_aggregate_event(2, &aggregate_type, 8, "order-1", 0).starts_with(&prefix));
+        assert!(!sm_aggregate_event(2, &aggregate_type, 7, "order-10", 0).starts_with(&prefix));
+    }
+
+    #[test]
+    fn aggregate_event_key_detection_rejects_every_other_namespace() {
+        let aggregate_type = es_core::AggregateTypeId::new("orders", "order").unwrap();
+        let event = sm_aggregate_event(2, &aggregate_type, 7, "order-1", 0);
+        assert!(is_aggregate_event_key(2, &event));
+        assert!(!is_aggregate_event_key(2, &[]));
+        assert!(!is_aggregate_event_key(2, &event[..9]));
+        assert!(!is_aggregate_event_key(2, &raft_log_entry(2, 0)));
+        assert!(!is_aggregate_event_key(3, &event));
+        assert!(!is_aggregate_event_key(
+            2,
+            &sm_aggregate_state(2, &aggregate_type, 7, "order-1")
+        ));
     }
 
     #[test]
     fn aggregate_position_keys_keep_numeric_order() {
-        let event_set = es_core::EventSetId::new("orders", "order").unwrap();
-        let prefix = sm_aggregate_partition_index_prefix(4, &event_set, 255);
-        let low = sm_aggregate_partition_index(4, &event_set, 255, 255);
-        let high = sm_aggregate_partition_index(4, &event_set, 255, 256);
+        let aggregate_type = es_core::AggregateTypeId::new("orders", "order").unwrap();
+        let prefix = sm_aggregate_partition_index_prefix(4, &aggregate_type, 255);
+        let low = sm_aggregate_partition_index(4, &aggregate_type, 255, 255);
+        let high = sm_aggregate_partition_index(4, &aggregate_type, 255, 256);
         assert!(low.starts_with(&prefix));
         assert!(low < high);
     }
 
     #[test]
     fn aggregate_state_keys_preserve_identifier_order_and_decode() {
-        let event_set = es_core::EventSetId::new("orders", "order").unwrap();
-        let short = sm_aggregate_state(1, &event_set, 7, "a");
-        let long = sm_aggregate_state(1, &event_set, 7, "aa");
-        let next = sm_aggregate_state(1, &event_set, 7, "b");
+        let aggregate_type = es_core::AggregateTypeId::new("orders", "order").unwrap();
+        let short = sm_aggregate_state(1, &aggregate_type, 7, "a");
+        let long = sm_aggregate_state(1, &aggregate_type, 7, "aa");
+        let next = sm_aggregate_state(1, &aggregate_type, 7, "b");
         assert!(short < long && long < next);
         assert_eq!(decode_aggregate_state_key(&long).as_deref(), Some("aa"));
-        assert_eq!(decode_aggregate_state_key(&sm_event(1, "aa", 0)), None);
+        assert_eq!(decode_aggregate_state_key(&raft_vote(1)), None);
         assert_ne!(
-            sm_aggregate_state(1, &event_set, 7, "a"),
-            sm_aggregate_state_modified(1, &event_set, 7, "a")
+            sm_aggregate_state(1, &aggregate_type, 7, "a"),
+            sm_aggregate_state_modified(1, &aggregate_type, 7, "a")
         );
     }
 
     #[test]
-    fn aggregate_namespaces_do_not_overlap_legacy_keys() {
-        let event_set = es_core::EventSetId::new("orders", "order").unwrap();
+    fn aggregate_namespaces_are_disjoint() {
+        let aggregate_type = es_core::AggregateTypeId::new("orders", "order").unwrap();
         let keys = [
-            sm_aggregate_event(1, &event_set, 0, "order-1", 0),
-            sm_aggregate_meta(1, &event_set, 0, "order-1"),
-            sm_aggregate_partition_index(1, &event_set, 0, 0),
-            sm_aggregate_next_position(1, &event_set, 0),
-            sm_aggregate_state(1, &event_set, 0, "order-1"),
-            sm_aggregate_idempotency(1, &event_set, 0, &uuid::Uuid::nil()),
-            sm_aggregate_partition_fence(1, &event_set, 0),
+            sm_aggregate_event(1, &aggregate_type, 0, "order-1", 0),
+            sm_aggregate_meta(1, &aggregate_type, 0, "order-1"),
+            sm_aggregate_partition_index(1, &aggregate_type, 0, 0),
+            sm_aggregate_next_position(1, &aggregate_type, 0),
+            sm_aggregate_state(1, &aggregate_type, 0, "order-1"),
+            sm_aggregate_idempotency(1, &aggregate_type, 0, &uuid::Uuid::nil()),
+            sm_aggregate_partition_fence(1, &aggregate_type, 0),
             sm_aggregate_catalog(1),
         ];
         let mut unique = std::collections::BTreeSet::new();
         for key in &keys {
-            assert!(unique.insert(key[9]), "新状态机 tag 必须互不相同");
-            assert_ne!(*key, sm_event(1, "orders/order", 0));
+            assert!(unique.insert(key[9]), "聚合状态机 tag 必须互不相同");
         }
     }
 
@@ -799,13 +589,5 @@ mod tests {
             let err = decode_u64_be(bad).expect_err("长度 != 8 应报错");
             assert!(err.to_string().contains("期望 8 字节"), "{err}");
         }
-    }
-
-    #[test]
-    fn decode_stream_meta_key_short_returns_none() {
-        // HEAD(10) + slen(8) = 18 字节以下的 key 直接拒绝
-        assert_eq!(decode_stream_meta_key(&[]), None);
-        assert_eq!(decode_stream_meta_key(&[0u8; 10]), None);
-        assert_eq!(decode_stream_meta_key(&[0u8; 17]), None);
     }
 }

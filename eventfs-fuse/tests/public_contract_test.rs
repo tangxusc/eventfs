@@ -1,7 +1,7 @@
 use es_client::ClientError;
 use eventfs_fuse::backend::BackendError;
 use eventfs_fuse::codec::{
-    CodecError, ExpectedVersion, SettlementAction, parse_event, parse_settlements,
+    AggregateVersionExpectation, CodecError, SettlementAction, parse_event, parse_settlements,
 };
 use eventfs_fuse::handle::{BeginError, BufferedWrite, StreamBuffer, WriteError};
 use eventfs_fuse::path::{Node, PathError};
@@ -18,7 +18,7 @@ fn production_codec_rejects_every_ambiguous_input_boundary() {
     }"#;
     assert_eq!(
         parse_event(valid, valid.len()).unwrap().expected_version,
-        ExpectedVersion::Any
+        AggregateVersionExpectation::Any
     );
 
     for input in [

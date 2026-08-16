@@ -10,7 +10,8 @@ async fn log_range_keys_excluded_end_le_start_none() {
     // Excluded(end) <= start：5..5
     assert!(st.log_range_keys(&(5..5)).is_none());
     // Included(end) < start：5..=4
-    assert!(st.log_range_keys(&(5..=4)).is_none());
+    let reversed = std::ops::RangeInclusive::new(5, 4);
+    assert!(st.log_range_keys(&reversed).is_none());
 }
 
 #[tokio::test]
@@ -58,7 +59,8 @@ async fn collect_keys_empty_or_reversed() {
 async fn read_log_entries_empty_range() {
     let (st, _d) = new_storage(0);
     assert!(st.read_log_entries(&(5..5)).unwrap().is_empty());
-    assert!(st.read_log_entries(&(5..=4)).unwrap().is_empty());
+    let reversed = std::ops::RangeInclusive::new(5, 4);
+    assert!(st.read_log_entries(&reversed).unwrap().is_empty());
 }
 
 #[tokio::test]
