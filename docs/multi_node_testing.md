@@ -139,9 +139,8 @@ cargo test -p es-server --test multi_node_test -- --ignored --nocapture --test-t
 cargo test -p es-server --test multi_node_test 三节点选主并复制日志 -- --ignored --nocapture
 ```
 
-**为何标 ignore**：每个用例启动 3 个真实进程、约 4 秒，而默认测试套件
-70 项只需 1.1 秒。把它们排除在默认套件外可保持快速反馈，
-CI 中应作为独立阶段执行。
+**为何标 ignore**：每个用例都会启动 3 个真实进程，并占用端口与独立数据目录。
+把它们排除在默认套件外可保持快速反馈；CI 或验收时应作为独立串行阶段执行。
 
 ## 测试框架说明
 

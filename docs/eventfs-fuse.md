@@ -1,15 +1,11 @@
 # EventFS FUSE 设计
 
-状态：已确认，核心数据面与 FUSE 适配已实现，仍在完成迁移、真挂载和性能验收。本文记录 grilling 会话中逐项确认的设计；实现状态以本节测试证据为准。
+状态：AggregateStore 核心数据面、`esctl aggregate` 和 Linux FUSE 适配已实现。本文描述
+当前文件与 gRPC 契约；尚未实现的能力会明确标注，不作为可用接口。
 
-截至 2026-08-15：
-
-- AggregateStore catalog、256 虚拟分区、实例级 OCC、状态 CAS、跨 Shard follow 和显式结算消费者组已实现。
-- `esctl aggregate` 与 `eventfs-fuse` 已加入 workspace；Linux 条件编译和 36 项 FUSE 单元、契约及无挂载 gRPC e2e 通过。
-- 当前 workspace 使用匹配的 nightly LLVM 23 工具重算覆盖率：行 `90.98%`、分支 `81.40%`，均通过 80% 门禁。
-- 真挂载 e2e 已在带 `/dev/fuse` 与 `fusermount3` 的 Debian 容器通过；普通 hosted runner 仍不强制真实挂载。
-- Stream 在线迁移的数据复制、追尾、冻结切换与清理已实现并纳入多进程与 Docker 验收；AggregateStore partition 自动再平衡仍不在当前范围。
-- 状态最后提交时间已进入 proto，状态文件 `lookup/getattr` 返回服务端真实 `mtime`；旧状态缺少时间元数据时回退 Unix epoch。`--daemonize` 尚未实现，当前只支持前台挂载。
+当前实现包括 catalog、固定 256 个虚拟分区、实例级 OCC、状态 CAS、跨 Shard follow、
+显式结算消费者组和真挂载 e2e。AggregateStore 分区数据迁移与自动再平衡尚未实现；
+`eventfs-fuse` 只支持 Linux 前台挂载。
 
 ## 1. 目标与边界
 
@@ -30,6 +26,7 @@
 - 事件 TTL、裁剪、归档和业务删除。
 - 事件、状态和消费者结算之间的跨文件事务。
 - 在线改变事件集的 256 个虚拟分区数量。
+- AggregateStore 事件分区的数据迁移与自动再平衡。
 - 跨聚合实例严格全序。
 
 相关决策见 [ADR-0001](adr/0001-eventfs-fuse-may-extend-server-contract.md)、[ADR-0003](adr/0003-partition-aggregate-event-sets.md)、[ADR-0004](adr/0004-isolate-aggregate-store-from-event-store.md) 与 [ADR-0005](adr/0005-keep-eventfs-fuse-stateless.md)。
@@ -193,21 +190,22 @@ printf '{
 ```text
 GetAggregateStoreCapabilities
 CreateEventSet / ListEventSets / GetEventSet
-Append
-ReadEvents
-ListStates / GetState / PutState
-CreateGroup / UpdateGroup / DeleteGroup / ListGroups
-Fetch / Settle / Renew
-GetAggregateStoreStatus
-ListPartitions / MovePartition / RebalancePartitions
+AppendAggregateEvent / ReadAggregateEvents
+ListAggregateStates / GetAggregateState / PutAggregateState
+GetAggregateStoreStatus / ListAggregatePartitions
+CreateAggregateGroup / UpdateAggregateGroup / DeleteAggregateGroup
+GetAggregateGroup / ListAggregateGroups
+FetchAggregateGroup / SettleAggregateGroup / RenewAggregateGroup
 ```
 
 调用形态：
 
 - capabilities、事件集、状态、管理和结算调用使用 unary RPC。
-- `ReadEvents` 使用 server streaming，服务端隐藏跨分区 fan-out。
-- `ListStates` 使用分页 unary。
-- `Fetch` 使用 unary long polling，保持调用方背压。`PutState` 与 `Fetch` 在普通瞬时错误后不自动重放，只有响应携带明确 leader hint 时才重定向，避免模糊成功后的重复副作用。
+- `ReadAggregateEvents` 使用 server streaming，服务端隐藏跨分区 fan-out。
+- `ListAggregateStates` 使用分页 unary。
+- `FetchAggregateGroup` 使用 unary long polling，保持调用方背压。
+  `PutAggregateState` 与 `FetchAggregateGroup` 在普通瞬时错误后不自动重放，只有
+  响应携带明确 leader hint 时才重定向，避免模糊成功后的重复副作用。
 
 FUSE 到自有 gRPC 是 remote-but-owned seam：生产使用 gRPC Adapter，契约测试使用内存 Adapter。路由与版本计算留在 Module Implementation；Raft 与 surrealkv 是 local-substitutable 依赖，通过进程内测试和真实存储测试验证，不向公共 Interface 暴露内部端口。
 
@@ -222,7 +220,7 @@ partition = xxh3(event_set_seed || aggregate_id) % 256
 
 `hash_algorithm_id`、随机 seed 与分区数由控制 Shard 持久化，客户端不能推导或覆盖。控制面保存 `(event_set, partition) → (shard, generation)`，不保存逐实例归属。
 
-建议状态机 key 空间：
+状态机 key 空间：
 
 ```text
 aggregate_meta[event_set, partition, aggregate_id] -> current_aggregate_version
@@ -241,23 +239,26 @@ idempotency[event_set, partition, event_id] -> request digest + original result
 - 类型级 cursor 是版本化不透明 token，内部保存 256 个分区的 next position；调用方只能原样回传。
 - 单个极热聚合实例仍受一个 Raft leader 的串行上限约束，基础设施不能在保留线性 OCC 的同时透明拆分它。
 
-## 8. 生命周期、迁移与故障
+## 8. 生命周期与迁移边界
 
 事件集创建采用 `Creating → Active` 生命周期。`mkdir` 通过稳定 operation ID 幂等创建定义和 256 个分区放置；全部目标 Shard 安装 fencing 后才对目录可见。失败重试复用 seed 和创建计划。
 
-事件分区迁移复用“复制、追尾、短暂冻结、generation fencing、切换、清理”的原则：
+领域模型保存每个分区的 `shard_id`、`generation` 和可选 `pending_move`，并定义
+`PrepareMove` / `CompleteMove` 的 generation CAS。当前服务端没有分区事件、状态和
+消费者进度的数据复制编排，也没有对应的公共迁移或自动再平衡 RPC；`esctl aggregate`
+只能查询 `partitions`。因此不得仅修改 catalog 放置来搬迁已有分区。
 
-- 不双写源与目标。
-- 源在切换前保持权威，切换窗口短暂冻结该分区写入。
-- Append 使用同一 `event_id` 自动重试，不能重复追加。
-- cursor 使用稳定事件分区位置，不因 Shard 迁移失效。
-- group checkpoint 与高频 lease/progress 随事件分区存储，不能因迁移从 0 重扫。
+未来实现分区迁移时仍需满足：源目标不双写、旧 generation 被 fencing、cursor 不失效，
+并同时迁移 group checkpoint、lease 和 progress。这些是后续实现约束，不是当前可调用
+能力。
 
 混合版本集群中，旧 `EventStore` 继续工作；只有全部承载节点声明兼容 `AggregateStore` v1 时才允许创建事件集或挂载 FUSE。
 
 ## 9. FUSE 行为
 
-首期使用 `fuser 0.18.0` 稳定 `Filesystem` Interface，不启用 `experimental` 或 `libfuse*` feature。同步回调把拥有型 Reply 和工作投递到 Tokio runtime，RPC 完成后异步回复；必须先通过 Linux smoke spike 验证 deferred reply、poll wakeup 与取消。
+当前使用 `fuser 0.18.0` 的稳定 `Filesystem` Interface，不启用 `experimental`
+或 `libfuse*` feature。同步回调把拥有型 Reply 和工作投递到 Tokio runtime，RPC 完成后
+异步回复；真挂载测试覆盖 deferred reply、poll wakeup 与取消路径。
 
 支持的用户可见操作：
 
@@ -305,74 +306,49 @@ eventfs-fuse mount --config /etc/eventfs/fuse.toml /data/eventfs
 
 默认只有挂载用户可访问；`--allow-other` 必须显式开启，并把 fuser session ACL 切换为 `All`。整个挂载使用一套服务端 TLS 凭据，Unix UID/GID 只做本机访问控制，不映射成服务端主体。
 
-正常关闭停止新操作并在配置超时内等待打开句柄提交；超时句柄返回 `EIO`。强制卸载允许丢弃未提交缓冲，但必须记录路径和字节数。
+写入在 `fsync`、`flush` 或 `release` 时提交。强制终止进程或卸载可能丢弃尚未触发
+这些回调的缓冲，因此需要持久提交确认时应显式调用 `fsync`。
 
 ## 11. 管理与可观测性
 
-`esctl` 增加：
+`esctl` 当前提供：
 
 ```text
 aggregate capabilities
-aggregate event-set create/list/status
+aggregate create/list/get
+aggregate append/follow
+aggregate state list/get/put
 aggregate group create/update/delete/list
-aggregate partition list/move/rebalance
-aggregate state get
+aggregate group fetch/settle
+aggregate status
+aggregate partitions
 ```
 
-首期使用结构化 tracing 与 `GetAggregateStoreStatus`，暴露事件分区状态、generation、迁移阶段、Append 延迟、OCC 冲突、读取水位、降级状态、group lag、未确认与 parked 数、FUSE 打开句柄、缓冲字节、RPC 延迟和重连次数。禁止把 `aggregate_id` 作为常驻指标标签。
+服务端使用结构化 tracing。`GetAggregateStoreStatus` 当前返回 catalog revision，以及
+事件集总数、Creating 数和 Active 数；`ListAggregatePartitions` 返回物理放置、
+generation 和 pending move 信息。当前没有 Prometheus 指标，也不暴露 Append 延迟、
+group lag、FUSE 句柄数或 RPC 重连次数。
 
-## 12. 验证与验收
+## 12. 验证
 
 测试分层：
 
-- Interface 契约测试同时运行内存 Adapter 与 Raft/surrealkv Adapter。
-- 属性与模糊测试覆盖稳定 hash、key 排序、实例级 OCC、cursor、JSON 分块写入、路径解析、任意 Ack 顺序和 errno 映射。
-- 进程内多 Shard e2e 覆盖分区 fan-out、部分不可用、迁移 fencing、不同实例并发和同实例冲突。
-- Linux FUSE3 真挂载 e2e 覆盖 `mkdir`、`>`、`>>`、分块 write、重复 fsync、状态 CAS、poll、消费、Ack、进程崩溃和卸载。
-- 真实多进程套件必须独立串行运行；`leader_killed_re_elect_data_intact` 已改用事件可见性门禁并通过复验。
+- `es-core` 属性与模糊测试覆盖稳定 hash、实例级 OCC、消费者组结算顺序和 catalog 状态转换。
+- `es-storage` 测试覆盖 key 排序、分区 fencing、状态 CAS、消费者进度、重开与快照。
+- `es-server` e2e 覆盖 catalog、跨 Shard follow、状态、消费者组和内部 RPC。
+- `eventfs-fuse` 公共契约测试覆盖路径、严格 JSON codec、写句柄状态机和错误分类。
+- Linux FUSE3 真挂载 e2e 覆盖创建事件集、事件 `fsync`、`poll/read`、状态 CAS 和正常卸载。
 
-Release Action 在四个原生 runner 上运行默认 workspace 测试和 release 构建；覆盖率与
-Ubuntu/Debian 真挂载不混入发布 workflow，而是作为本轮独立验收。覆盖率必须同时满足
-行和分支各不低于 80%。本地构建使用临时 `CARGO_TARGET_DIR`，验收后清理中间产物。
-
-相对性能门槛：
-
-- AggregateStore gRPC 追加与读取吞吐不低于同环境旧 EventStore 基线的 80%。
-- FUSE 相对 AggregateStore gRPC 的 p95 额外延迟不超过 25%。
-- 类型读取不能为每个空事件分区产生一次串行 RPC 往返。
-- 迁移期间不丢、不双写，非迁移分区吞吐下降不超过 20%。
-
-实测结果同步写入 [benchmarks.md](benchmarks.md)。
+Release workflow 在四个原生 runner 上运行默认 workspace 测试和 release 构建。Linux
+真挂载需要 `/dev/fuse` 与 `fusermount3`，不属于普通 macOS 本地测试。
 
 当前可重复验证命令：
 
 ```bash
-# 任意平台：路径、codec、配置与句柄状态机
-cargo test -p eventfs-fuse
+# 任意平台：路径、codec、配置、句柄状态机与公共契约
+cargo test -p eventfs-fuse --locked
 
-# Linux：包含 fuser 适配和 MockBackend 契约测试
-cargo test -p eventfs-fuse
-
-# 专用 Linux FUSE runner：真实服务端、真实挂载、事件 poll/read 与状态 fsync
+# Linux 上默认命令还覆盖 fuser Adapter 与 GrpcBackend 操作；
+# 以下 ignored 用例进一步执行真实挂载、事件 poll/read 与状态 fsync
 cargo test -p eventfs-fuse --test mount_e2e_test -- --ignored --test-threads=1
 ```
-
-完整验收中的 17 项环境型用例由 14 项真实 `es-server` 多进程测试、2 项真实
-`esctl` 多进程测试和 1 项真 FUSE 挂载测试组成。前 16 项已在 macOS 独立串行通过；
-真挂载已在最小权限 Debian client 容器中通过，不能用 MockBackend 或仅编译替代。
-
-2026-08-16 macOS ARM64 默认 workspace 634 项通过、16 项忽略；覆盖率使用匹配的
-nightly LLVM 23 与 `cargo-llvm-cov 0.8.7` 重算，行覆盖 `90.98%`、分支覆盖
-`81.40%`。Linux 条件编译测试项数以同一提交的 Release Action 输出为准。
-
-## 13. 实施顺序
-
-1. Linux `fuser` smoke spike：deferred reply、poll wakeup、direct I/O、取消与卸载。
-2. `es-core` 领域模型、控制 catalog、存储 key、状态机与模糊测试。
-3. `es-proto`、`es-server` 深 Module、`es-client` Adapter 与 Interface 契约测试。
-4. 消费者组分区 progress、实例 lease、迁移与多 Shard 故障测试。
-5. `esctl aggregate` 管理面。
-6. `eventfs-fuse` 路径解析、句柄状态机、JSON codec 和 Linux 真挂载 e2e。
-7. CI、覆盖率、性能验收、systemd/config 示例和 README 同步。
-
-每一步都必须保持默认测试通过；复杂行为不能先提交语义不完整的占位实现。

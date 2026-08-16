@@ -182,7 +182,7 @@ pub struct GlobalArgs {
     #[arg(short, long, value_enum, default_value_t = Format::Simple)]
     pub write_out: Format,
 
-    /// 分片总数；缺省时自动探测（GetRaftState 扫描 0..N），探测失败回退默认 8
+    /// 分片总数；缺省时对各端点 ListShards 取并集，探测失败回退默认 8
     #[arg(long, value_parser = parse_shards)]
     pub shards: Option<u64>,
 }

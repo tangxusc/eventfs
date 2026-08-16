@@ -3,7 +3,7 @@
 分布式事件存储中间件。独立进程启动，多节点集群，基于 openraft 共识与 surrealkv 嵌入式存储，
 客户端与节点间通信统一使用 gRPC。
 
-- 文档版本：1.3（2026-08-12 显式放置表 + 流路由表 + 在线迁移）
+- 文档版本：1.4（2026-08-16 同步 AggregateStore、内部服务与当前部署拓扑）
 - 建立日期：2026-08-10
 - 状态：已实现；标注「已实现」的章节**以代码为准**
 
@@ -18,6 +18,7 @@
 | crate 结构 | 多 crate 拆分 | 边界清晰、可并行编译、可独立测试，客户端 SDK 可单独发布 |
 | 节点发现 | 静态配置 | 开发期 3 节点，节点数可配置 |
 | 数据分片 | multi-raft + Raft-backed Stream 归属（stream → shard） | 单 stream 完整落在一个 Raft group；控制 Shard 强一致提交归属，`routes.json` 仅为兼容投影 |
+| 聚合类型事件集 | 每个事件集固定 256 个虚拟事件分区，控制 Shard 保存放置与 generation | 实例级 OCC 不互相争用，同时隐藏物理 Shard；当前不提供分区数据迁移 |
 | 管理 API | 已实现（`RaftAdmin`：Initialize / AddLearner / ChangeMembership / GetRaftState / ListShards；`Migration`：路由表同步 + 迁移原语） | 组建双路径（自动按 peers 配置 / 手动 RaftAdmin），见 7.3；迁移见 7.5 |
 
 ## 2. 依赖验证证据
@@ -90,41 +91,36 @@ rustls 0.23）；rustls 直接依赖仅 es-proto 一处（`NoCertVerify` 内部�
 
 ## 3. 整体架构
 
-```
-                    ┌────────────────────────────────────────┐
-                    │                                        │
-                       ┌──────────────────────────┐           
-                       │EventStore / RaftRpc      │           
-                       │RaftAdmin / Migration     │           
-                       │四服务共用单端口            │           
-                       └────────────┬─────────────┘           
-                                                     ┌──────┐ 
-                                                     │Route │ 
-                                                     │Table │ 
-                                                     │Mgr   │ 
-                                                     └──┬───┘ 
-                    │               ▼                   ▼    │
-                    │               │                   │    │
-                       ┌──────────────────────────┐           
-                       │es-raft ShardManager      │           
-                       │  Raft[0] Raft[1] ...     │           
-                       └────────────┬─────────────┘           
-                    │               ▼                   │    │
-                    │               │                   │    │
-                       ┌──────────────────────────┐           
-                       │es-storage                │           
-                       │LogStorage + StateMachine │           
-                       └────────────┬─────────────┘           
-                    └───────────────┼───────────────────┼────┘
-                                    ▼                   ▼
-                      {data_dir}/shard-{id}/      {data_dir}/routes.json
-                      每 shard 一个独立           stream → shard 归属
-                      surrealkv LSM tree            （watcher 热更新 + 广播同步）
+```text
+客户端 / 运维工具
+        │
+        ▼
+公共 listen_addr
+  EventStore / PersistentSubscriptions / AggregateStore
+  RaftRpc / RaftAdmin / Migration
+        │
+        ├──────────────► RouteTableManager ──► {data_dir}/routes.json
+        ▼
+  es-raft ShardManager
+  Raft[0] / Raft[1] / ...
+        │
+        ▼
+  es-storage LogStorage + StateMachine
+        │
+        ▼
+  {data_dir}/shard-{id}/
+  每 Shard 一个 surrealkv LSM tree
+
+集群节点
+        │
+        ▼
+内部 internal_listen_addr
+  InternalSubscription / OwnershipInternal / AggregateStoreInternal
 ```
 
-客户端 API、Raft 节点间 RPC、RaftAdmin 与 Migration 共用公共 `listen_addr` 端口。
-跨节点聚合订阅的 `InternalSubscription` 只监听 `internal_listen_addr` 专用端口，
-该端口必须由网络策略限制为仅集群节点可访问，不能与客户端 API 共用。
+六个公共 service 共用 `listen_addr`。跨节点订阅、归属提交、AggregateStore catalog、
+分区读取与消费者组协调通过三个内部 service 使用 `internal_listen_addr`，该端口必须
+由网络策略限制为仅集群节点可访问，不能与客户端 API 共用。
 节点间通过 gRPC 交换 Raft 消息（Vote / AppendEntries / InstallSnapshot），
 每条消息携带 `shard_id` 用于路由到对应的 Raft 实例。
 
@@ -531,6 +527,17 @@ checkpoint 不回退。候选读取与 generation 对账共享同一个路由快
 当前长轮询每 50ms 做一次无锁重检；当前每组单 key 保证恢复简单但会产生大组写放大。
 事件通知唤醒与状态拆 key 是保持公开协议不变的后续性能优化。
 
+#### 7.4.2 AggregateStore
+
+`AggregateStore` 是独立公共 service，提供事件集 catalog、实例事件追加与跨 Shard
+follow、状态 revision CAS、消费者组以及分区放置查询。每个事件集固定 256 个虚拟分区；
+控制 Shard 保存 catalog，各数据 Shard 通过 generation fence 拒绝过期分区写入。
+
+`AggregateStoreInternal` 只注册在内部 listener，承载 catalog 提交、分区 fence、
+跨节点分区订阅、状态枚举和消费者组分区操作。当前公共协议只支持查询分区放置；
+领域模型已定义分区迁移的 prepare/complete 状态，但尚无分区数据复制、迁移或自动再平衡
+RPC。完整文件契约与边界见 [eventfs-fuse.md](eventfs-fuse.md)。
+
 ### 7.5 路由表同步与在线迁移 API（Migration 服务，节点间）
 
 承载路由表同步与在线迁移原语，不暴露给客户端：
@@ -557,8 +564,8 @@ checkpoint 不回退。候选读取与 generation 对账共享同一个路由快
 ```toml
 [node]
 id = 1
-listen_addr = "127.0.0.1:50051"   # 五个公共 gRPC 服务共用一个端口
-internal_listen_addr = "127.0.0.1:51051" # 节点间订阅与归属控制；多节点必填
+listen_addr = "127.0.0.1:50051"   # 六个公共 gRPC service 共用一个端口
+internal_listen_addr = "127.0.0.1:51051" # 三个内部 service；多节点必填
 
 # 集群节点列表（3 节点示例；非空即触发启动时自动组建，见 7.3）
 # 必须包含本节点，且所有节点配置完全一致；addr 可省略 http:// 前缀
@@ -591,8 +598,9 @@ primary = [0, 1]
 replica = [2, 3]
 ```
 
-客户端、持久化订阅、节点间、管理、迁移五类 gRPC 服务共用 `listen_addr` 单端口
-（`server.rs` 同一 `Server` 注册五个 service）。`node.peers` 在启动时由 `bootstrap` 消费：
+Stream、持久化订阅、AggregateStore、Raft、管理和迁移六个 gRPC service 共用
+`listen_addr`。三个跨节点 service 共用 `internal_listen_addr`。`node.peers` 在启动时
+由 `bootstrap` 消费：
 地址 normalize（补 `http://`）后随 `initialize` 写入 membership 的 `BasicNode.addr`，
 与网络层回连规则同源（`es_raft::normalize_endpoint`）。流路由表持久化为
 `{data_dir}/routes.json`（§6），由 watcher 热更新；配置文件本身同样被 watcher

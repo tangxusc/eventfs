@@ -18,7 +18,8 @@ CA:FALSE，`ca_file` 按节点数拼接全部证书实现互信）→ 生成 N �
 运行 `es-server/examples/perf_test.rs` 压测客户端（预热 append 自带重试，
 兜底选举收敛，不依赖固定等待）→ 结果 JSON 落盘 `target/perf-results/`；
 脚本 `trap EXIT` 统一清理节点进程与数据目录（含失败路径），结果文件在
-清理范围之外，中途失败也保留已完成规格。
+清理范围之外，中途失败也保留已完成规格。`target/` 被 Git 忽略，原始 JSON
+不会随仓库版本化；下表是保留在文档中的日期快照。
 
 ### 测试参数
 
@@ -30,7 +31,7 @@ CA:FALSE，`ca_file` 按节点数拼接全部证书实现互信）→ 生成 N �
 | 客户端 | es-client 单客户端顺序压测（基线值，非并发上限） |
 | 测量路径 | 单条 append 延迟抽测 200 次（独立流，不污染批量流）；批量 append 至总量；read_stream 全量分页读（断言读到全部事件，命中未追平 follower 自动重试）；subscribe 从 0 追平（同断言） |
 
-### 结果（2026-08-12 复测，压测工具修复后；原始 JSON 见 `target/perf-results/result-20260812-102146.json`，另一次运行见 `result-20260812-101642.json`）
+### 结果（2026-08-12 复测，压测工具修复后）
 
 | 事件大小 | 单条 append p50/p95/p99 (ms) | 批量写入 条/s | MB/s | 全量读 条/s | MB/s | 订阅追平 条/s | MB/s |
 |---|---|---|---|---|---|---|---|
@@ -60,9 +61,8 @@ surrealkv 默认 `Durability::Eventual`（commit 不 fsync）。根因是事件�
 且 JSON 序列化慢数倍。
 
 修复（es-storage `encode` 模块，存储值全量 bincode，快照文件头 meta 保留
-JSON）：优化后 3 节点 TLS 复测（2026-08-12，原始 JSON 见
-`target/perf-results/result-20260812-102146.json`；serde_json 基线为 2026-07
-历史记录，原始 JSON 已清理）：
+JSON）：优化后 3 节点 TLS 复测（2026-08-12；serde_json 基线为 2026-07
+历史记录，两轮原始 JSON 均未随仓库版本化）：
 
 | 事件大小 | 批量写入 MB/s | 提升 | 全量读 MB/s | 提升 | 单条 append p50/p99 (ms) |
 |---|---|---|---|---|---|
@@ -107,7 +107,7 @@ open target/criterion/report/index.html
 - 平台: darwin (Apple Silicon)
 - Rust: 1.94.1
 - 编译: `--release` (opt-level=3)
-- 存储: surrealkv 0.21.3 (LSM),数据在 tmpfs 临时目录
+- 存储: surrealkv 0.21.3 (LSM)，数据在系统临时目录
 
 ### 读取延迟
 

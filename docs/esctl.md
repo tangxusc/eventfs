@@ -2,7 +2,7 @@
 
 `esctl` 是参照 [etcdctl](https://etcd.io/docs/latest/etcdctl/) 的 EventStore 管理工具，
 独立二进制（workspace 成员 `es-ctl`），覆盖数据面读写、订阅、集群组建与管理、
-端点健康、在线迁移。
+端点健康、在线迁移、快照、持久化拉取订阅和 AggregateStore。
 
 ## 构建
 
@@ -240,7 +240,7 @@ esctl migrate (--stream <STREAM> | --shard <N>) --to <M>
 切换点（SetStreamShard）后客户端新写直达目标，收敛后校验失败自动回切路由。
 复制按「目标当前版本」读源补差（Exact 版本链写目标，幂等索引防重放），
 **断点续传天然成立，重复执行无害**。完成后建议 `esctl route recount` 校准流计数。
-完整设计见 [docs/migrate.md](migrate.md)。
+完整设计见 [migrate.md](migrate.md)。
 
 ## 输出格式
 
@@ -287,7 +287,7 @@ SHARD  NODE  STATE     TERM  LEADER  LAST_APPLIED  VOTER
 
 ```bash
 # 默认套件（单测 + 进程内 e2e + 在线迁移 e2e）
-cargo test -p es-ctl
+cargo test -p es-ctl --locked
 
 # 三节点真实进程组建（需先 cargo build --bin eventstored；串行）
 cargo test -p es-ctl --test multi_node_test -- --ignored --test-threads=1
@@ -296,5 +296,5 @@ cargo test -p es-ctl --test multi_node_test -- --ignored --test-threads=1
 覆盖率（行/分支 ≥80%）验收：
 
 ```bash
-cargo llvm-cov -p es-ctl
+cargo llvm-cov -p es-ctl --branch
 ```
